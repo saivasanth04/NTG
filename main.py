@@ -1,50 +1,161 @@
-"""Main CLI entry point for the OpenRouter Multi-Account Fallback Router."""
+"""NTG command-line interface."""
 
+from __future__ import annotations
+
+import asyncio
 import sys
+
 from ntg import (
     Account,
     DEFAULT_KEYS,
-    LITELLM_MODEL_NAME,
-    OPENROUTER_FREE_MODEL,
     OpenRouterFallbackRouter,
-    print_account_status,
 )
-from ntg.diagnostics import print_divider
+
+from ntg.config import (
+    LITELLM,
+    OPENROUTER,
+)
+
+from ntg.diagnostics import (
+    print_account_status,
+    print_divider,
+    print_pool_summary,
+)
 
 
-def main():
-    """Run interactive or argument-based OpenRouter multi-account router CLI."""
-    accounts = [
-        Account(name=f"account_{i+1}", api_key=key, order=i+1)
-        for i, key in enumerate(DEFAULT_KEYS)
+def build_accounts() -> list[Account]:
+
+    return [
+        Account(
+            name=f"account_{index}",
+            api_key=key,
+            order=index,
+            rpm_limit=(
+                OPENROUTER.requests_per_minute
+            ),
+            rpd_limit=(
+                OPENROUTER.free_requests_per_day
+            ),
+        )
+
+        for index, key
+        in enumerate(
+            DEFAULT_KEYS,
+            start=1,
+        )
     ]
-    router = OpenRouterFallbackRouter(accounts)
 
-    print_divider("LITELLM + OPENROUTER FREE ROUTER")
-    print(f"OpenRouter model   : {OPENROUTER_FREE_MODEL}")
-    print(f"LiteLLM model      : {LITELLM_MODEL_NAME}")
-    print(f"Configured accounts: {len(accounts)}")
-    print("Fallback strategy  : Priority failover with rate-limit classification\n")
 
-    print_account_status(accounts)
+async def run(
+    prompt: str | None = None,
+) -> None:
 
-    # Allow prompt from CLI args or interactive input
-    if len(sys.argv) > 1:
-        prompt = " ".join(sys.argv[1:]).strip()
-        print(f"\nEnter your prompt: {prompt}")
-    else:
-        try:
-            prompt = input("\nEnter your prompt: ").strip()
-        except (KeyboardInterrupt, EOFError):
-            print("\nOperation cancelled.")
-            return
+    accounts = build_accounts()
 
-    if not prompt:
-        print("No prompt supplied.")
+    router = OpenRouterFallbackRouter(
+        accounts
+    )
+
+    print_divider(
+        "NTG — OPENROUTER FREE MULTI-ACCOUNT GATEWAY"
+    )
+
+    print(
+        f"OpenRouter model   : "
+        f"{OPENROUTER.free_model}"
+    )
+
+    print(
+        f"LiteLLM model      : "
+        f"{LITELLM.model_name}"
+    )
+
+    print(
+        f"Routing strategy   : "
+        f"{LITELLM.routing_strategy}"
+    )
+
+    print(
+        f"Configured accounts: "
+        f"{len(accounts)}"
+    )
+
+    print(
+        "Account routing    : LiteLLM"
+    )
+
+    print(
+        "Model routing      : OpenRouter free router"
+    )
+
+    print(
+        "Automatic retries  : disabled"
+    )
+
+    print_pool_summary(
+        accounts
+    )
+
+    print_account_status(
+        accounts
+    )
+
+    if prompt is not None:
+
+        await router.aask(
+            prompt
+        )
+
+        print_account_status(
+            accounts
+        )
+
         return
 
-    router.ask(prompt)
-    print_account_status(accounts)
+    while True:
+
+        try:
+            value = input(
+                "\nNTG> "
+            ).strip()
+
+        except (
+            KeyboardInterrupt,
+            EOFError,
+        ):
+            print(
+                "\nExiting."
+            )
+            return
+
+        if value.lower() in {
+            "exit",
+            "quit",
+        }:
+            return
+
+        if not value:
+            continue
+
+        await router.aask(
+            value
+        )
+
+        print_account_status(
+            accounts
+        )
+
+
+def main() -> None:
+
+    prompt = (
+        " ".join(sys.argv[1:]).strip()
+        or None
+    )
+
+    asyncio.run(
+        run(prompt)
+    )
 
 
 if __name__ == "__main__":
