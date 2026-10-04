@@ -1,61 +1,19 @@
-"""OpenRouter metadata client."""
+"""OpenRouter provider metadata and response parsing helpers."""
 
-from __future__ import annotations
+from typing import Any, Dict, Optional
 
-from typing import Any
-
-import requests
-
-from ntg.config import OPENROUTER
-from ntg.models import Account
+from ntg.config import OPENROUTER_FREE_MODEL
 
 
-class OpenRouterClient:
-    """Read-only OpenRouter account metadata client."""
+def is_openrouter_free_model(model_name: str) -> bool:
+    """Checks if model identifier targets OpenRouter free router."""
+    return model_name == OPENROUTER_FREE_MODEL
 
-    def __init__(
-        self,
-        timeout: float | None = None,
-    ):
-        self.timeout = (
-            timeout
-            or OPENROUTER.http_timeout_seconds
-        )
 
-    def get_key_info(
-        self,
-        account: Account,
-    ) -> dict[str, Any] | None:
-        try:
-
-            response = requests.get(
-                OPENROUTER.key_url,
-                headers={
-                    "Authorization":
-                        f"Bearer {account.api_key}"
-                },
-                timeout=self.timeout,
-            )
-
-            if not response.ok:
-                return None
-
-            payload = response.json()
-
-            data = payload.get(
-                "data"
-            )
-
-            if isinstance(
-                data,
-                dict,
-            ):
-                return data
-
-        except (
-            requests.RequestException,
-            ValueError,
-        ):
-            return None
-
-        return None
+def parse_provider_metadata(response_headers: Dict[str, Any]) -> Dict[str, Any]:
+    """Parses OpenRouter specific rate-limit and provider headers."""
+    return {
+        "limit": response_headers.get("x-ratelimit-limit"),
+        "remaining": response_headers.get("x-ratelimit-remaining"),
+        "reset": response_headers.get("x-ratelimit-reset"),
+    }

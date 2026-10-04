@@ -1,161 +1,65 @@
-"""NTG command-line interface."""
+"""Main CLI entry point for the Capacity-Aware OpenRouter Gateway."""
 
-from __future__ import annotations
-
-import asyncio
 import sys
+
+# Ensure UTF-8 output encoding for Windows console (handles emojis cleanly)
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
 
 from ntg import (
     Account,
     DEFAULT_KEYS,
     OpenRouterFallbackRouter,
-)
-
-from ntg.config import (
-    LITELLM,
-    OPENROUTER,
-)
-
-from ntg.diagnostics import (
     print_account_status,
-    print_divider,
-    print_pool_summary,
+    print_banner,
 )
 
 
-def build_accounts() -> list[Account]:
-
-    return [
-        Account(
-            name=f"account_{index}",
-            api_key=key,
-            order=index,
-            rpm_limit=(
-                OPENROUTER.requests_per_minute
-            ),
-            rpd_limit=(
-                OPENROUTER.free_requests_per_day
-            ),
-        )
-
-        for index, key
-        in enumerate(
-            DEFAULT_KEYS,
-            start=1,
-        )
+def main():
+    """Run interactive or argument-based OpenRouter capacity-aware router CLI."""
+    accounts = [
+        Account(name=name, api_key=key, order=i+1)
+        for i, (name, key) in enumerate(DEFAULT_KEYS.items())
     ]
 
-
-async def run(
-    prompt: str | None = None,
-) -> None:
-
-    accounts = build_accounts()
-
-    router = OpenRouterFallbackRouter(
-        accounts
-    )
-
-    print_divider(
-        "NTG — OPENROUTER FREE MULTI-ACCOUNT GATEWAY"
-    )
-
-    print(
-        f"OpenRouter model   : "
-        f"{OPENROUTER.free_model}"
-    )
-
-    print(
-        f"LiteLLM model      : "
-        f"{LITELLM.model_name}"
-    )
-
-    print(
-        f"Routing strategy   : "
-        f"{LITELLM.routing_strategy}"
-    )
-
-    print(
-        f"Configured accounts: "
-        f"{len(accounts)}"
-    )
-
-    print(
-        "Account routing    : LiteLLM"
-    )
-
-    print(
-        "Model routing      : OpenRouter free router"
-    )
-
-    print(
-        "Automatic retries  : disabled"
-    )
-
-    print_pool_summary(
-        accounts
-    )
-
-    print_account_status(
-        accounts
-    )
-
-    if prompt is not None:
-
-        await router.aask(
-            prompt
+    # Ensure 5 account slots exist
+    while len(accounts) < 5:
+        idx = len(accounts) + 1
+        accounts.append(
+            Account(
+                name=f"account_{idx}",
+                api_key="",
+                order=idx,
+                available=False,
+                blocked_reason="No API key provided",
+            )
         )
 
-        print_account_status(
-            accounts
-        )
+    router = OpenRouterFallbackRouter(accounts)
 
+    print_banner(len(accounts))
+    print_account_status(accounts)
+
+    # Allow prompt from CLI args or interactive input
+    if len(sys.argv) > 1:
+        prompt = " ".join(sys.argv[1:]).strip()
+        print(f"\nEnter your prompt: {prompt}")
+    else:
+        try:
+            prompt = input("\nEnter your prompt: ").strip()
+        except (KeyboardInterrupt, EOFError):
+            print("\nOperation cancelled.")
+            return
+
+    if not prompt:
+        print("No prompt supplied.")
         return
 
-    while True:
-
-        try:
-            value = input(
-                "\nNTG> "
-            ).strip()
-
-        except (
-            KeyboardInterrupt,
-            EOFError,
-        ):
-            print(
-                "\nExiting."
-            )
-            return
-
-        if value.lower() in {
-            "exit",
-            "quit",
-        }:
-            return
-
-        if not value:
-            continue
-
-        await router.aask(
-            value
-        )
-
-        print_account_status(
-            accounts
-        )
-
-
-def main() -> None:
-
-    prompt = (
-        " ".join(sys.argv[1:]).strip()
-        or None
-    )
-
-    asyncio.run(
-        run(prompt)
-    )
+    router.ask(prompt)
+    print_account_status(accounts)
 
 
 if __name__ == "__main__":

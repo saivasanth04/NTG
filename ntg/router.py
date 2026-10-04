@@ -1,573 +1,171 @@
-"""NTG multi-account LiteLLM router.
-
-LiteLLM chooses the OpenRouter account deployment.
-OpenRouter's openrouter/free router chooses the actual free model/provider.
-NTG handles account state and OpenRouter-specific quota interpretation.
-"""
-
-from __future__ import annotations
+"""Core multi-account fallback router orchestrating capacity-aware LiteLLM requests."""
 
 import logging
-from typing import Any
+import time
+from typing import Any, List, Optional
 
 import litellm
 from litellm import Router
 
-from ntg.config import (
-    LITELLM,
-    LITELLM_MODEL_NAME,
-    OPENROUTER_FREE_MODEL,
-)
+from ntg.config import LITELLM_MODEL_NAME, OPENROUTER_FREE_MODEL
 from ntg.diagnostics import (
+    print_account_status,
     print_divider,
     print_rate_limit_details,
+    print_request_execution,
 )
 from ntg.exceptions import (
     CATEGORY_AUTH_ERROR,
     CATEGORY_DAILY_QUOTA,
     CATEGORY_PROVIDER_LIMIT,
-    CATEGORY_REQUEST_ERROR,
     CATEGORY_SERVER_ERROR,
-    CATEGORY_UNKNOWN_LIMIT,
     classify_openrouter_error,
 )
-from ntg.models import Account
+from ntg.models import Account, utc_string
+from ntg.persistence import (
+    clean_expired_timestamps,
+    load_history,
+    record_request_timestamp,
+    save_history,
+)
 
 
 class OpenRouterFallbackRouter:
-    """Final NTG pool-based router."""
+    """Capacity-aware multi-account fallback router built on LiteLLM Router."""
 
-    def __init__(
-        self,
-        accounts: list[Account],
-    ):
-        if not accounts:
-            raise ValueError(
-                "At least one OpenRouter account is required."
-            )
-
+    def __init__(self, accounts: List[Account]):
         self.accounts = accounts
 
+        # Configure LiteLLM logging
         litellm.suppress_debug_info = True
         litellm.set_verbose = False
+        logging.getLogger("LiteLLM").setLevel(logging.ERROR)
 
-        logging.getLogger(
-            "LiteLLM"
-        ).setLevel(logging.ERROR)
-
-        # IMPORTANT:
-        # All accounts stay in ONE LiteLLM model group.
-        #
-        # We do NOT replace the model list per request.
-        #
-        # This lets LiteLLM perform deployment selection.
+        # Register all account deployments with LiteLLM
+        all_deployments = [acc.to_deployment() for acc in accounts]
         self.router = Router(
-            model_list=[
-                account.to_deployment()
-                for account in accounts
-            ],
-            routing_strategy=(
-                LITELLM.routing_strategy
-            ),
-            num_retries=LITELLM.retries,
-            default_max_parallel_requests=(
-                LITELLM.max_parallel_requests
-            ),
-            cooldown_time=(
-                LITELLM.cooldown_time_seconds
-            ),
+            model_list=all_deployments,
+            num_retries=0,
         )
+        self.load_state()
 
-    def refresh(self) -> None:
-        for account in self.accounts:
-            account.refresh()
+    def load_state(self) -> None:
+        """Loads request timestamp history from persistence and cleans expired records."""
+        now = time.time()
+        history = load_history()
+        cleaned_history = clean_expired_timestamps(history, now=now)
+        if cleaned_history != history:
+            save_history(cleaned_history)
 
-    def _healthy_accounts(
-        self,
-    ) -> list[Account]:
-        self.refresh()
+        for acc in self.accounts:
+            acc.timestamps = cleaned_history.get(acc.name, [])
+            acc.refresh(now)
 
-        return [
-            account
-            for account in self.accounts
-            if account.can_route()
-        ]
+    def ask(self, prompt: str) -> Optional[Any]:
+        """Dispatches request using capacity-aware selection, recording timestamp before sending."""
+        self.load_state()
+        now = time.time()
 
-    def _account_from_response(
-        self,
-        response: Any,
-    ) -> Account | None:
-        """Resolve the serving account when LiteLLM exposes deployment ID."""
+        # Identify routeable accounts
+        routeable = [acc for acc in self.accounts if acc.is_routeable(now)]
 
-        hidden = (
-            getattr(
-                response,
-                "_hidden_params",
-                {},
-            )
-            or {}
-        )
+        if not routeable:
+            print_divider("NO AVAILABLE ACCOUNTS")
+            print("All configured OpenRouter accounts are currently exhausted or cooling down.")
+            
+            # Find earliest reset timestamp
+            resets = []
+            for acc in self.accounts:
+                rpm = acc.rpm_info(now)
+                rpd = acc.rpd_info(now)
+                if rpm["reset_seconds"] > 0:
+                    resets.append(rpm["reset_seconds"])
+                if rpd["reset_seconds"] > 0:
+                    resets.append(rpd["reset_seconds"])
+                if acc.blocked_until > now:
+                    resets.append(acc.blocked_until - now)
 
-        model_id = hidden.get(
-            "model_id"
-        )
-
-        if model_id:
-            model_id = str(model_id)
-
-            for account in self.accounts:
-                if model_id == (
-                    f"ntg-{account.name}"
-                ):
-                    return account
-
-        return None
-
-    async def aask(
-        self,
-        prompt: str,
-    ) -> Any:
-        return await self._request_async(
-            prompt
-        )
-
-    def ask(
-        self,
-        prompt: str,
-    ) -> Any:
-        return self._request_sync(
-            prompt
-        )
-
-    async def _request_async(
-        self,
-        prompt: str,
-    ) -> Any:
-
-        self._validate_prompt(prompt)
-
-        self.refresh()
-
-        if not self._healthy_accounts():
-            self._print_no_accounts()
+            if resets:
+                next_capacity = min(resets)
+                print(f"Next available capacity in: {next_capacity:.1f}s ({utc_string(now + next_capacity)})")
+            print_account_status(self.accounts)
             return None
 
-        print_divider(
-            "NEW REQUEST"
+        # Sort accounts by available capacity (RPM remaining, then RPD remaining)
+        routeable.sort(
+            key=lambda a: (
+                a.rpm_info(now)["remaining"],
+                a.rpd_info(now)["remaining"],
+                -a.attempts,
+                -a.order,
+            ),
+            reverse=True,
         )
 
-        print(
-            f"Model group        : "
-            f"{LITELLM_MODEL_NAME}"
-        )
+        selected_account = routeable[0]
 
-        print(
-            f"OpenRouter model   : "
-            f"{OPENROUTER_FREE_MODEL}"
-        )
+        # ----------------------------------------------------
+        # RECORD TIMESTAMP BEFORE SENDING REQUEST
+        # ----------------------------------------------------
+        ts = record_request_timestamp(selected_account.name, ts=now)
+        selected_account.timestamps.append(ts)
+        selected_account.attempts += 1
 
-        print(
-            f"Accounts in pool   : "
-            f"{len(self.accounts)}"
-        )
-
-        print(
-            "Account routing    : "
-            "LiteLLM"
-        )
-
-        print(
-            "Model routing      : "
-            "OpenRouter free router"
-        )
-
-        print(
-            "Automatic retries  : "
-            "DISABLED"
-        )
+        # Sync LiteLLM router deployment target
+        self.router.set_model_list([selected_account.to_deployment()])
 
         try:
-            response = (
-                await self.router.acompletion(
-                    model=LITELLM_MODEL_NAME,
-                    messages=[
-                        {
-                            "role": "user",
-                            "content": prompt,
-                        }
-                    ],
-                    num_retries=0,
-                )
+            response = self.router.completion(
+                model=LITELLM_MODEL_NAME,
+                messages=[{"role": "user", "content": prompt}],
+                num_retries=0,
             )
+            selected_account.successes += 1
 
-            account = (
-                self._account_from_response(
-                    response
-                )
-            )
+            # Extract response model name
+            resp_model = getattr(response, "model", None)
+            hidden = getattr(response, "_hidden_params", {})
+            if isinstance(hidden, dict) and hidden.get("response_model"):
+                resp_model = hidden["response_model"]
 
-            if account:
-                account.mark_attempt()
-                account.mark_success()
-
-            self._print_success(
-                response,
-                account,
-            )
-
+            print_request_execution(selected_account, response_model=resp_model)
+            print("\n" + str(response.choices[0].message.content))
             return response
 
         except Exception as error:
-            self._handle_error(error)
+            selected_account.failures += 1
+            info = classify_openrouter_error(error)
 
+            print_divider("REQUEST FAILED")
+            print(f"Selected account : {selected_account.name}")
+            print(f"Classification   : {info['category']}")
+            print(f"LiteLLM error    : {error}")
+            print_rate_limit_details(info)
+
+            category = info["category"]
+            if category == CATEGORY_DAILY_QUOTA:
+                selected_account.rate_limits += 1
+                print("\n>>> DEFINITIVE ACCOUNT-LEVEL LIMIT: Free daily quota exhausted.")
+                selected_account.block(
+                    "OpenRouter free daily quota exhausted",
+                    until=info.get("reset_timestamp"),
+                )
+                return None
+
+            if category == CATEGORY_AUTH_ERROR:
+                print("\n>>> Authentication failure on account. Cooling down for 1 hour.")
+                selected_account.block("Authentication/authorization failure", cooldown=3600.0)
+                return None
+
+            if category == CATEGORY_SERVER_ERROR:
+                print("\n>>> Upstream server error. Cooling down for 30s.")
+                selected_account.block("Temporary upstream server failure", cooldown=30.0)
+                return None
+
+            if category == CATEGORY_PROVIDER_LIMIT:
+                selected_account.rate_limits += 1
+                print("\n>>> Upstream PROVIDER-level 429. Will NOT burn secondary accounts.")
+                return None
+
+            print("\n>>> Unrecoverable or unknown error. Aborting without retry.")
             return None
-
-    def _request_sync(
-        self,
-        prompt: str,
-    ) -> Any:
-
-        self._validate_prompt(prompt)
-
-        self.refresh()
-
-        if not self._healthy_accounts():
-            self._print_no_accounts()
-            return None
-
-        print_divider(
-            "NEW REQUEST"
-        )
-
-        print(
-            f"Model group        : "
-            f"{LITELLM_MODEL_NAME}"
-        )
-
-        print(
-            f"OpenRouter model   : "
-            f"{OPENROUTER_FREE_MODEL}"
-        )
-
-        print(
-            f"Accounts in pool   : "
-            f"{len(self.accounts)}"
-        )
-
-        print(
-            "Account routing    : "
-            "LiteLLM"
-        )
-
-        print(
-            "Model routing      : "
-            "OpenRouter free router"
-        )
-
-        print(
-            "Automatic retries  : "
-            "DISABLED"
-        )
-
-        try:
-            response = (
-                self.router.completion(
-                    model=LITELLM_MODEL_NAME,
-                    messages=[
-                        {
-                            "role": "user",
-                            "content": prompt,
-                        }
-                    ],
-                    num_retries=0,
-                )
-            )
-
-            account = (
-                self._account_from_response(
-                    response
-                )
-            )
-
-            if account:
-                account.mark_attempt()
-                account.mark_success()
-
-            self._print_success(
-                response,
-                account,
-            )
-
-            return response
-
-        except Exception as error:
-            self._handle_error(error)
-
-            return None
-
-    @staticmethod
-    def _validate_prompt(
-        prompt: str,
-    ) -> None:
-
-        if (
-            not isinstance(prompt, str)
-            or not prompt.strip()
-        ):
-            raise ValueError(
-                "Prompt must not be empty."
-            )
-
-    def _handle_error(
-        self,
-        error: Exception,
-    ) -> None:
-
-        info = classify_openrouter_error(
-            error
-        )
-
-        print_divider(
-            "REQUEST FAILED"
-        )
-
-        print(
-            f"Classification    : "
-            f"{info['category']}"
-        )
-
-        print(
-            f"Status code       : "
-            f"{info['status_code']}"
-        )
-
-        print(
-            f"LiteLLM error     : "
-            f"{error}"
-        )
-
-        print_rate_limit_details(
-            info
-        )
-
-        category = info[
-            "category"
-        ]
-
-        # IMPORTANT:
-        # We do not guess the account if LiteLLM
-        # does not expose the selected deployment.
-        account = (
-            self._account_from_error(
-                error
-            )
-        )
-
-        if category == CATEGORY_DAILY_QUOTA:
-
-            if account:
-
-                account.mark_attempt()
-                account.mark_failure()
-                account.mark_rate_limit()
-
-                reset = info.get(
-                    "reset_timestamp"
-                )
-
-                account.block(
-                    "OpenRouter free daily "
-                    "quota exhausted",
-                    until=reset,
-                )
-
-            print(
-                "\n>>> Definitive OpenRouter "
-                "daily quota exhaustion."
-            )
-
-            print(
-                ">>> Only the affected "
-                "deployment should be removed."
-            )
-
-            return
-
-        if category == CATEGORY_PROVIDER_LIMIT:
-
-            if account:
-
-                account.mark_attempt()
-                account.mark_failure()
-                account.mark_rate_limit()
-
-            print(
-                "\n>>> Provider-level 429."
-            )
-
-            print(
-                ">>> This is NOT evidence "
-                "that the account's daily "
-                "quota is exhausted."
-            )
-
-            print(
-                ">>> No blind retry is performed."
-            )
-
-            return
-
-        if category == CATEGORY_UNKNOWN_LIMIT:
-
-            if account:
-
-                account.mark_attempt()
-                account.mark_failure()
-                account.mark_rate_limit()
-
-            print(
-                "\n>>> Unknown 429."
-            )
-
-            print(
-                ">>> No automatic retry to "
-                "avoid wasting free quota."
-            )
-
-            return
-
-        if category == CATEGORY_AUTH_ERROR:
-
-            if account:
-
-                account.mark_attempt()
-                account.mark_failure()
-
-                account.block(
-                    "Authentication failure",
-                    cooldown=3600,
-                )
-
-            print(
-                "\n>>> Authentication failure."
-            )
-
-            return
-
-        if category == CATEGORY_SERVER_ERROR:
-
-            if account:
-
-                account.mark_attempt()
-                account.mark_failure()
-
-                account.block(
-                    "Temporary upstream "
-                    "server failure",
-                    cooldown=(
-                        LITELLM.cooldown_time_seconds
-                    ),
-                )
-
-            print(
-                "\n>>> Temporary upstream "
-                "server failure."
-            )
-
-            return
-
-        if category == CATEGORY_REQUEST_ERROR:
-
-            if account:
-
-                account.mark_attempt()
-                account.mark_failure()
-
-            print(
-                "\n>>> Request-level error."
-            )
-
-            print(
-                ">>> Fix the request instead "
-                "of rotating accounts."
-            )
-
-            return
-
-        print(
-            "\n>>> Unknown error."
-        )
-
-        print(
-            ">>> No blind retry performed."
-        )
-
-    def _account_from_error(
-        self,
-        error: Exception,
-    ) -> Account | None:
-
-        response = getattr(
-            error,
-            "response",
-            None,
-        )
-
-        if response is None:
-            return None
-
-        return self._account_from_response(
-            response
-        )
-
-    @staticmethod
-    def _print_success(
-        response: Any,
-        account: Account | None,
-    ) -> None:
-
-        print_divider(
-            "REQUEST SUCCESSFUL"
-        )
-
-        print(
-            f"Account           : "
-            f"{account.name if account else 'unknown'}"
-        )
-
-        print(
-            f"Response model    : "
-            f"{getattr(response, 'model', None)}"
-        )
-
-        try:
-            content = (
-                response
-                .choices[0]
-                .message
-                .content
-            )
-
-        except (
-            AttributeError,
-            IndexError,
-            KeyError,
-        ):
-            content = None
-
-        print(
-            f"\n{content}"
-        )
-
-    @staticmethod
-    def _print_no_accounts() -> None:
-
-        print_divider(
-            "NO AVAILABLE ACCOUNTS"
-        )
-
-        print(
-            "All configured OpenRouter "
-            "accounts are locally exhausted "
-            "or unavailable."
-        )
