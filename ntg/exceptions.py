@@ -1,4 +1,4 @@
-"""OpenRouter/LiteLLM error extraction and classification."""
+"""OpenRouter/LiteLLM/Gemini error extraction and classification."""
 
 from __future__ import annotations
 
@@ -112,4 +112,55 @@ def classify_openrouter_error(error: Exception) -> dict[str, Any]:
         "remedy": metadata.get("remedy_hint"),
         "message": err_data.get("message"),
         "payload": payload,
+    }
+
+
+def classify_gemini_error(error: Exception) -> dict[str, Any]:
+    """Classify a Gemini exception based on status code or exception message."""
+    status_code = getattr(error, "status_code", None)
+    if status_code is None:
+        response = getattr(error, "response", None)
+        status_code = getattr(response, "status_code", None)
+
+    err_str = str(error)
+    err_lower = err_str.lower()
+
+    if (
+        status_code == 429
+        or "429" in err_lower
+        or "resource_exhausted" in err_lower
+        or "quota" in err_lower
+        or "rate_limit" in err_lower
+        or "ratelimit" in err_lower
+        or "too many requests" in err_lower
+    ):
+        category = CATEGORY_PROVIDER_LIMIT
+    elif (
+        status_code in (401, 403)
+        or "401" in err_lower
+        or "403" in err_lower
+        or "unauthorized" in err_lower
+        or "permission_denied" in err_lower
+        or "api_key_invalid" in err_lower
+        or "invalid api key" in err_lower
+    ):
+        category = CATEGORY_AUTH_ERROR
+    elif (
+        status_code in (500, 502, 503, 504)
+        or "500" in err_lower
+        or "503" in err_lower
+        or "internal" in err_lower
+        or "unavailable" in err_lower
+        or "service unavailable" in err_lower
+    ):
+        category = CATEGORY_SERVER_ERROR
+    elif status_code in (400, 404) or "invalid_argument" in err_lower or "not found" in err_lower:
+        category = CATEGORY_REQUEST_ERROR
+    else:
+        category = CATEGORY_UNKNOWN_ERROR
+
+    return {
+        "category": category,
+        "status_code": status_code,
+        "message": err_str,
     }

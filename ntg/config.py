@@ -27,9 +27,9 @@ def _load_env_file(filepath: str = ".env") -> None:
 # Load environment variables if present
 _load_env_file()
 
-# OpenRouter and LiteLLM model parameters
+# OpenRouter, Gemini, and LiteLLM model parameters
 OPENROUTER_FREE_MODEL: str = "openrouter/openrouter/free"
-LITELLM_MODEL_NAME: str = "openrouter-free"
+LITELLM_MODEL_NAME: str = "ntg-auto"
 
 # Retrieve up to 5 OpenRouter API keys from environment
 DEFAULT_KEYS: Dict[str, str] = {}
@@ -38,3 +38,6 @@ for i in range(1, 6):
     env_val = os.getenv(f"OPENROUTER_API_KEY_{i}", "")
     if env_val:
         DEFAULT_KEYS[key_name] = env_val
+
+# Gemini API key
+GEMINI_API_KEY: str = os.getenv("Gemini_API_KEY_1") or os.getenv("GEMINI_API_KEY_1", "")

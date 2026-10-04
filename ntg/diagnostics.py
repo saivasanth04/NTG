@@ -2,7 +2,8 @@
 
 from typing import Any, Dict, List, Optional
 
-from ntg.models import Account, utc_string
+from ntg.config import LITELLM_MODEL_NAME
+from ntg.models import Deployment, utc_string
 
 
 def print_divider(title: Optional[str] = None, width: int = 70) -> None:
@@ -13,57 +14,59 @@ def print_divider(title: Optional[str] = None, width: int = 70) -> None:
         print("=" * width)
 
 
-def print_banner(accounts_count: int = 5) -> None:
+def print_banner(openrouter_count: int = 5, gemini_count: int = 0) -> None:
     """Print application banner."""
-    print_divider("NTG — DYNAMIC OPENROUTER FALLBACK ROUTER")
-    print(f"Deployments  : {accounts_count} OpenRouter accounts")
-    print("Logical Model: openrouter-free (LiteLLM managed)")
+    total = openrouter_count + gemini_count
+    print_divider("NTG — UNIFIED OPENROUTER + GEMINI SMART ROUTER")
+    print(f"Deployments  : {total} total ({openrouter_count} OpenRouter accounts, {gemini_count} Gemini models)")
+    print(f"Logical Model: {LITELLM_MODEL_NAME} (LiteLLM managed)")
     print("Routing      : LiteLLM deployment selection & dynamic failover")
-    print("Quota Mode   : Reactive real OpenRouter error handling")
+    print("Quota Mode   : Reactive real provider error handling")
     print("State        : Dynamic runtime self-adapting\n")
 
 
-def print_account_status(accounts: List[Account]) -> None:
-    """Displays formatted status table of all configured accounts."""
-    for acc in accounts:
-        acc.refresh()
+def print_account_status(deployments: List[Deployment]) -> None:
+    """Displays formatted status table of all configured deployments (OpenRouter & Gemini)."""
+    for dep in deployments:
+        dep.refresh()
 
-    print_divider("ACCOUNT STATUS")
-    for acc in accounts:
-        if not acc.api_key or not acc.api_key.strip():
+    print_divider("DEPLOYMENT STATUS")
+    for dep in deployments:
+        if not dep.api_key or not dep.api_key.strip():
             status_str = "NO KEY"
-        elif acc.is_available():
+        elif dep.is_available():
             status_str = "ACTIVE"
         else:
             status_str = "COOLING DOWN"
 
-        print(f"\n{acc.name} (Order: {acc.order})")
+        print(f"\n{dep.display_name} (Provider: {dep.provider.title()}, Order: {dep.order})")
         print(f"  Status          : {status_str}")
-        print(f"  Attempts        : {acc.attempts}")
-        print(f"  Successes       : {acc.successes}")
-        print(f"  Failures        : {acc.failures}")
-        print(f"  Rate Limits     : {acc.rate_limits}")
-        if acc.remaining_cooldown > 0:
-            print(f"  Block remaining : {acc.remaining_cooldown:.1f}s")
-        if acc.blocked_reason:
-            print(f"  Block reason    : {acc.blocked_reason}")
+        print(f"  Attempts        : {dep.attempts}")
+        print(f"  Successes       : {dep.successes}")
+        print(f"  Failures        : {dep.failures}")
+        print(f"  Rate Limits     : {dep.rate_limits}")
+        if dep.remaining_cooldown > 0:
+            print(f"  Block remaining : {dep.remaining_cooldown:.1f}s")
+        if dep.blocked_reason:
+            print(f"  Block reason    : {dep.blocked_reason}")
 
 
 def print_request_execution(
-    account: Account,
+    deployment: Deployment,
     response_model: Optional[str] = None,
 ) -> None:
     """Prints execution summary after a request."""
-    print(f"\nFulfilling account : {account.name}")
-    print(f"Total attempts     : {account.attempts}")
-    print(f"Account successes  : {account.successes}")
+    print(f"\nFulfilling deployment: {deployment.display_name}")
+    print(f"Provider             : {deployment.provider.title()}")
+    print(f"Total attempts       : {deployment.attempts}")
+    print(f"Deployment successes : {deployment.successes}")
     if response_model:
-        print(f"Response model     : {response_model}")
+        print(f"Response model       : {response_model}")
 
 
 def print_rate_limit_details(info: Dict[str, Any]) -> None:
-    """Prints diagnostic rate-limit information extracted from response headers."""
-    print_divider("OPENROUTER RATE LIMIT INFORMATION")
+    """Prints diagnostic rate-limit information extracted from response metadata."""
+    print_divider("RATE LIMIT / DIAGNOSTIC DETAILS")
     fields = [
         ("category", "Classification"),
         ("limit_source", "Limit source"),
@@ -73,7 +76,9 @@ def print_rate_limit_details(info: Dict[str, Any]) -> None:
         ("reset", "Reset"),
     ]
     for key, label in fields:
-        print(f"{label:<16}: {info.get(key)}")
+        val = info.get(key)
+        if val is not None:
+            print(f"{label:<16}: {val}")
     if info.get("reset_timestamp"):
         print(f"{'Reset UTC':<16}: {utc_string(info['reset_timestamp'])}")
     if info.get("remedy"):

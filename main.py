@@ -1,4 +1,4 @@
-"""Main CLI entry point for the Dynamic OpenRouter Fallback Router."""
+"""Main CLI entry point for the Unified OpenRouter + Gemini NTG Router."""
 
 import sys
 
@@ -12,12 +12,13 @@ if hasattr(sys.stdout, "reconfigure"):
 from ntg import (
     Account,
     DEFAULT_KEYS,
-    OpenRouterFallbackRouter,
+    UnifiedNTGRouter,
+    print_banner,
 )
 
 
 def main():
-    """Run interactive or argument-based OpenRouter fallback router CLI."""
+    """Run interactive or argument-based Unified OpenRouter + Gemini router CLI."""
     accounts = [
         Account(name=name, api_key=key, order=i + 1)
         for i, (name, key) in enumerate(DEFAULT_KEYS.items())
@@ -35,7 +36,11 @@ def main():
             )
         )
 
-    router = OpenRouterFallbackRouter(accounts)
+    router = UnifiedNTGRouter(accounts=accounts)
+
+    openrouter_count = len([d for d in router.deployments if d.provider == "openrouter"])
+    gemini_count = len([d for d in router.deployments if d.provider == "gemini"])
+    print_banner(openrouter_count=openrouter_count, gemini_count=gemini_count)
 
     # Allow prompt from CLI args or interactive input
     if len(sys.argv) > 1:
