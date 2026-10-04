@@ -1,4 +1,4 @@
-"""Main CLI entry point for the Capacity-Aware OpenRouter Gateway."""
+"""Main CLI entry point for the Dynamic OpenRouter Fallback Router."""
 
 import sys
 
@@ -13,15 +13,13 @@ from ntg import (
     Account,
     DEFAULT_KEYS,
     OpenRouterFallbackRouter,
-    print_account_status,
-    print_banner,
 )
 
 
 def main():
-    """Run interactive or argument-based OpenRouter capacity-aware router CLI."""
+    """Run interactive or argument-based OpenRouter fallback router CLI."""
     accounts = [
-        Account(name=name, api_key=key, order=i+1)
+        Account(name=name, api_key=key, order=i + 1)
         for i, (name, key) in enumerate(DEFAULT_KEYS.items())
     ]
 
@@ -34,22 +32,17 @@ def main():
                 api_key="",
                 order=idx,
                 available=False,
-                blocked_reason="No API key provided",
             )
         )
 
     router = OpenRouterFallbackRouter(accounts)
 
-    print_banner(len(accounts))
-    print_account_status(accounts)
-
     # Allow prompt from CLI args or interactive input
     if len(sys.argv) > 1:
         prompt = " ".join(sys.argv[1:]).strip()
-        print(f"\nEnter your prompt: {prompt}")
     else:
         try:
-            prompt = input("\nEnter your prompt: ").strip()
+            prompt = input("Enter your prompt: ").strip()
         except (KeyboardInterrupt, EOFError):
             print("\nOperation cancelled.")
             return
@@ -59,7 +52,6 @@ def main():
         return
 
     router.ask(prompt)
-    print_account_status(accounts)
 
 
 if __name__ == "__main__":

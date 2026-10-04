@@ -15,13 +15,12 @@ def print_divider(title: Optional[str] = None, width: int = 70) -> None:
 
 def print_banner(accounts_count: int = 5) -> None:
     """Print application banner."""
-    print_divider("NTG — OPENROUTER FREE GATEWAY")
-    print(f"Accounts : {accounts_count}")
-    print("RPM      : 100 configured")
-    print("RPD      : 250 configured")
-    print("Routing  : capacity-aware")
-    print("Retries  : disabled")
-    print("State    : persistent\n")
+    print_divider("NTG — DYNAMIC OPENROUTER FALLBACK ROUTER")
+    print(f"Deployments  : {accounts_count} OpenRouter accounts")
+    print("Logical Model: openrouter-free (LiteLLM managed)")
+    print("Routing      : LiteLLM deployment selection & dynamic failover")
+    print("Quota Mode   : Reactive real OpenRouter error handling")
+    print("State        : Dynamic runtime self-adapting\n")
 
 
 def print_account_status(accounts: List[Account]) -> None:
@@ -31,15 +30,19 @@ def print_account_status(accounts: List[Account]) -> None:
 
     print_divider("ACCOUNT STATUS")
     for acc in accounts:
-        rpm = acc.rpm_info()
-        rpd = acc.rpd_info()
+        if not acc.api_key or not acc.api_key.strip():
+            status_str = "NO KEY"
+        elif acc.is_available():
+            status_str = "ACTIVE"
+        else:
+            status_str = "COOLING DOWN"
 
-        print(f"\n{acc.name}")
-        print(f"  Available       : {acc.available}")
-        print(f"  RPM             : {int(rpm['used'])}/{int(rpm['max'])}")
-        print(f"  RPM remaining   : {int(rpm['remaining'])}")
-        print(f"  RPD             : {int(rpd['used'])}/{int(rpd['max'])}")
-        print(f"  RPD remaining   : {int(rpd['remaining'])}")
+        print(f"\n{acc.name} (Order: {acc.order})")
+        print(f"  Status          : {status_str}")
+        print(f"  Attempts        : {acc.attempts}")
+        print(f"  Successes       : {acc.successes}")
+        print(f"  Failures        : {acc.failures}")
+        print(f"  Rate Limits     : {acc.rate_limits}")
         if acc.remaining_cooldown > 0:
             print(f"  Block remaining : {acc.remaining_cooldown:.1f}s")
         if acc.blocked_reason:
@@ -50,17 +53,12 @@ def print_request_execution(
     account: Account,
     response_model: Optional[str] = None,
 ) -> None:
-    """Prints request selection and quota details during a request."""
-    rpm = account.rpm_info()
-    rpd = account.rpd_info()
-
-    print(f"\nSelected account : {account.name}")
-    print(f"RPM              : {int(rpm['used'])}/{int(rpm['max'])}")
-    print(f"RPD              : {int(rpd['used'])}/{int(rpd['max'])}")
-    print(f"RPM remaining    : {int(rpm['remaining'])}")
-    print(f"RPD remaining    : {int(rpd['remaining'])}")
+    """Prints execution summary after a request."""
+    print(f"\nFulfilling account : {account.name}")
+    print(f"Total attempts     : {account.attempts}")
+    print(f"Account successes  : {account.successes}")
     if response_model:
-        print(f"\nResponse model   : {response_model}")
+        print(f"Response model     : {response_model}")
 
 
 def print_rate_limit_details(info: Dict[str, Any]) -> None:

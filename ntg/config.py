@@ -30,15 +30,6 @@ _load_env_file()
 # OpenRouter and LiteLLM model parameters
 OPENROUTER_FREE_MODEL: str = "openrouter/openrouter/free"
 LITELLM_MODEL_NAME: str = "openrouter-free"
-OPENROUTER_KEY_URL: str = "https://openrouter.ai/api/v1/key"
-
-# Account limit parameters
-ACCOUNT_MAX_RPM: int = 20
-ACCOUNT_MAX_RPD: int = 50
-
-# Persistence directory and file
-NTG_DIR: str = ".ntg"
-HISTORY_FILE_PATH: str = os.path.join(NTG_DIR, "request_history.json")
 
 # Retrieve up to 5 OpenRouter API keys from environment
 DEFAULT_KEYS: Dict[str, str] = {}

@@ -1,12 +1,11 @@
 """Data models and account state management."""
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 from ntg.config import LITELLM_MODEL_NAME, OPENROUTER_FREE_MODEL
-from ntg.quota import calculate_rpd, calculate_rpm
 
 
 def utc_string(timestamp: Optional[float] = None) -> str:
@@ -17,7 +16,7 @@ def utc_string(timestamp: Optional[float] = None) -> str:
 
 @dataclass
 class Account:
-    """Represents an OpenRouter account with persistent request timestamps and cooldown state."""
+    """Represents an OpenRouter account deployment with runtime health state."""
 
     name: str
     api_key: str
@@ -29,7 +28,6 @@ class Account:
     successes: int = 0
     failures: int = 0
     rate_limits: int = 0
-    timestamps: List[float] = field(default_factory=list)
 
     def refresh(self, now: Optional[float] = None) -> bool:
         """Restores availability if the cooldown timer has elapsed."""
@@ -39,7 +37,7 @@ class Account:
             self.available = True
             self.blocked_until = 0.0
             self.blocked_reason = None
-        return self.available
+        return self.available and bool(self.api_key and self.api_key.strip())
 
     def block(
         self,
@@ -60,33 +58,19 @@ class Account:
         """Returns the number of seconds remaining in explicit cooldown."""
         return max(0.0, self.blocked_until - time.time()) if self.blocked_until > 0 else 0.0
 
-    def rpm_info(self, now: Optional[float] = None) -> Dict[str, float]:
-        """Returns RPM usage and reset metrics."""
-        return calculate_rpm(self.timestamps, now=now)
-
-    def rpd_info(self, now: Optional[float] = None) -> Dict[str, float]:
-        """Returns RPD usage and reset metrics."""
-        return calculate_rpd(self.timestamps, now=now)
-
-    def is_routeable(self, now: Optional[float] = None) -> bool:
-        """Account is routeable when available, no cooldown, and remaining RPM & RPD > 0."""
+    def is_available(self, now: Optional[float] = None) -> bool:
+        """Account is available when API key is provided and not in cooldown."""
         current_time = now if now is not None else time.time()
-        self.refresh(current_time)
-        if not self.available:
-            return False
-        if current_time < self.blocked_until:
-            return False
-        rpm = self.rpm_info(current_time)
-        rpd = self.rpd_info(current_time)
-        return rpm["remaining"] > 0 and rpd["remaining"] > 0
+        return self.refresh(current_time)
 
     def to_deployment(self) -> Dict[str, Any]:
-        """Converts account into LiteLLM deployment dictionary."""
+        """Converts account into LiteLLM deployment dictionary for LiteLLM Router."""
         return {
             "model_name": LITELLM_MODEL_NAME,
             "litellm_params": {
                 "model": OPENROUTER_FREE_MODEL,
                 "api_key": self.api_key,
+                "metadata": {"account_name": self.name},
             },
             "model_info": {
                 "account": self.name,

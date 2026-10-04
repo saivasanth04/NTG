@@ -1,25 +1,24 @@
-# NTG: Resilient OpenRouter Multi-Account Fallback Router
+# NTG: Dynamic OpenRouter Fallback Router
 
-A high-reliability, multi-account fallback routing system for OpenRouter free models using LiteLLM.
+A lightweight, dynamic, self-adapting fallback router for OpenRouter models built on LiteLLM.
 
-## Architecture & Features
+## Architecture & Philosophy
 
-- **Multi-Account Cooldown & Quota Management**: Tracks rate limits, daily quotas, and automatic cooldown recovery per account.
-- **Granular Error Classification**: Distinguishes between:
-  - Account daily quotas (`openrouter_free_tier_daily`)
-  - Upstream provider-level throttles
-  - Authentication errors (401/403)
-  - Upstream server errors (500/502/503/504)
-- **Zero-Waste Fallback Routing**: Prevents burning secondary accounts on upstream provider throttles, while smoothly failing over on account-specific quota exhaustion.
-- **Fast $O(N)$ JSON Payload Extraction**: Robust parsing of structured error responses from LiteLLM exceptions without performance bottlenecks.
+- **Five OpenRouter Deployments Behind One LiteLLM Logical Model**: All configured OpenRouter account API keys act as deployments registered under a single logical model (`openrouter-free`). LiteLLM handles deployment selection and retry management.
+- **Reactive Real Error Failover**: Instead of predicting or maintaining model quotas locally, NTG reacts directly to real HTTP errors returned by OpenRouter:
+  - Account daily quotas (`openrouter_free_tier_daily` / 429) -> Block account until reset
+  - Authentication errors (401/403) -> 1-hour cooldown
+  - Upstream server errors (500/502/503/504) -> 30-second cooldown
+  - Upstream provider throttles -> 60-second cooldown
+- **Dynamic Self-Adapting Router**: Small, clean codebase without complex local quota prediction counters or timestamp persistence.
+- **Fast JSON Error Extraction**: Robust parsing of structured error responses from LiteLLM exceptions.
 - **Modular Project Structure**:
   - `ntg/config.py`: Centralized model and API key configuration.
   - `ntg/models.py`: Strongly-typed `Account` data model.
-  - `ntg/exceptions.py`: Error parsing and rate-limit classification.
+  - `ntg/exceptions.py`: Real error classification engine.
   - `ntg/diagnostics.py`: Status tables and rate-limit diagnostics.
-  - `ntg/router.py`: Priority failover engine built on LiteLLM Router.
-  - `main.py`: Command-line interface.
-  - `test.py`: Backwards-compatible testing module.
+  - `ntg/router.py`: LiteLLM Router integration with reactive failure callbacks.
+  - `main.py`: Interactive CLI entry point.
 
 ## Installation
 
