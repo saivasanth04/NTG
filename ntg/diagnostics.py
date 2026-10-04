@@ -14,11 +14,15 @@ def print_divider(title: Optional[str] = None, width: int = 70) -> None:
         print("=" * width)
 
 
-def print_banner(openrouter_count: int = 5, gemini_count: int = 0) -> None:
+def print_banner(openrouter_count: int = 5, gemini_count: int = 0, gemini_accounts_count: int = 0) -> None:
     """Print application banner."""
     total = openrouter_count + gemini_count
+    gemini_info = f", {gemini_count} Gemini deployments" if gemini_count > 0 else ""
+    if gemini_accounts_count > 0:
+        gemini_info += f" across {gemini_accounts_count} accounts"
+
     print_divider("NTG — UNIFIED OPENROUTER + GEMINI SMART ROUTER")
-    print(f"Deployments  : {total} total ({openrouter_count} OpenRouter accounts, {gemini_count} Gemini models)")
+    print(f"Deployments  : {total} total ({openrouter_count} OpenRouter accounts{gemini_info})")
     print(f"Logical Model: {LITELLM_MODEL_NAME} (LiteLLM managed)")
     print("Routing      : LiteLLM deployment selection & dynamic failover")
     print("Quota Mode   : Reactive real provider error handling")

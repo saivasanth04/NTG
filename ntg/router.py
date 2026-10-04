@@ -7,7 +7,7 @@ from typing import Any, Dict, List, Optional
 
 import litellm
 
-from ntg.config import DEFAULT_KEYS, GEMINI_API_KEY, LITELLM_MODEL_NAME
+from ntg.config import DEFAULT_GEMINI_KEYS, DEFAULT_KEYS, GEMINI_API_KEY, LITELLM_MODEL_NAME
 from ntg.diagnostics import (
     print_account_status,
     print_divider,
@@ -32,6 +32,7 @@ class UnifiedNTGRouter:
         self,
         accounts: Optional[List[Deployment]] = None,
         gemini_api_key: Optional[str] = None,
+        gemini_keys: Optional[Dict[str, str]] = None,
     ):
         self.deployments: List[Deployment] = []
 
@@ -56,12 +57,20 @@ class UnifiedNTGRouter:
 
         self.deployments.extend(openrouter_deps)
 
-        # 2. Discover and add Gemini deployments dynamically
-        key = gemini_api_key or GEMINI_API_KEY
-        if key and key != "YOUR_NEW_GOOGLE_API_KEY":
+        # 2. Discover and add Gemini deployments dynamically across all configured Gemini keys
+        keys_to_use = gemini_keys
+        if keys_to_use is None:
+            if gemini_api_key and gemini_api_key != "YOUR_NEW_GOOGLE_API_KEY":
+                keys_to_use = {"account_1": gemini_api_key}
+            else:
+                keys_to_use = DEFAULT_GEMINI_KEYS
+                if not keys_to_use and GEMINI_API_KEY and GEMINI_API_KEY != "YOUR_NEW_GOOGLE_API_KEY":
+                    keys_to_use = {"account_1": GEMINI_API_KEY}
+
+        if keys_to_use:
             try:
                 from gemini import build_gemini_deployments
-                gemini_deps = build_gemini_deployments(key)
+                gemini_deps = build_gemini_deployments(keys_to_use)
                 for i, gdep in enumerate(gemini_deps):
                     gdep.order = len(openrouter_deps) + i + 1
                 self.deployments.extend(gemini_deps)
@@ -151,7 +160,7 @@ class UnifiedNTGRouter:
                     metadata={
                         "deployment_id": deployment.id,
                         "provider": deployment.provider,
-                        "account_name": deployment.name,
+                        "account_name": deployment.account_name or deployment.name,
                         "deployment_name": deployment.name,
                     },
                     num_retries=0,

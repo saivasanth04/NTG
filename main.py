@@ -39,8 +39,15 @@ def main():
     router = UnifiedNTGRouter(accounts=accounts)
 
     openrouter_count = len([d for d in router.deployments if d.provider == "openrouter"])
-    gemini_count = len([d for d in router.deployments if d.provider == "gemini"])
-    print_banner(openrouter_count=openrouter_count, gemini_count=gemini_count)
+    gemini_deps = [d for d in router.deployments if d.provider == "gemini"]
+    gemini_count = len(gemini_deps)
+    gemini_accounts_count = len({d.account_name for d in gemini_deps})
+
+    print_banner(
+        openrouter_count=openrouter_count,
+        gemini_count=gemini_count,
+        gemini_accounts_count=gemini_accounts_count,
+    )
 
     # Allow prompt from CLI args or interactive input
     if len(sys.argv) > 1:

@@ -16,13 +16,14 @@ def utc_string(timestamp: Optional[float] = None) -> str:
 
 @dataclass
 class Deployment:
-    """Represents a router deployment (OpenRouter account or Gemini model) with runtime health state."""
+    """Represents a router deployment (OpenRouter account or Gemini account+model) with runtime health state."""
 
     id: str
     provider: str
     name: str
     litellm_model: str
     api_key: str
+    account_name: str = ""
     order: int = 1
     available: bool = True
     blocked_until: float = 0.0
@@ -37,7 +38,8 @@ class Deployment:
         """Formatted human-readable deployment label without API keys."""
         if self.provider == "openrouter":
             return f"OpenRouter {self.name}"
-        return f"Gemini {self.name}"
+        acc_label = self.account_name if self.account_name else "account_1"
+        return f"Gemini {acc_label} ({self.name})"
 
     def refresh(self, now: Optional[float] = None) -> bool:
         """Restores availability if the cooldown timer has elapsed."""
@@ -83,14 +85,14 @@ class Deployment:
                 "metadata": {
                     "deployment_id": self.id,
                     "provider": self.provider,
-                    "account_name": self.name,
+                    "account_name": self.account_name or self.name,
                     "deployment_name": self.name,
                 },
             },
             "model_info": {
                 "id": self.id,
                 "provider": self.provider,
-                "account": self.name,
+                "account": self.account_name or self.name,
                 "name": self.name,
                 "order": self.order,
             },
@@ -98,7 +100,7 @@ class Deployment:
 
 
 class Account(Deployment):
-    """Represents an OpenRouter account deployment (subclass of Deployment for backwards compatibility)."""
+    """Represents an OpenRouter account deployment."""
 
     def __init__(
         self,
@@ -117,6 +119,7 @@ class Account(Deployment):
             id=f"openrouter-{name}",
             provider="openrouter",
             name=name,
+            account_name=name,
             litellm_model=OPENROUTER_FREE_MODEL,
             api_key=api_key,
             order=order,
@@ -131,12 +134,13 @@ class Account(Deployment):
 
 
 class GeminiDeployment(Deployment):
-    """Represents a dynamically discovered Gemini model deployment."""
+    """Represents a dynamically discovered Gemini model deployment tied to a specific Gemini account."""
 
     def __init__(
         self,
         model_name: str,
         api_key: str,
+        account_name: str = "account_1",
         order: int = 1,
         available: bool = True,
         blocked_until: float = 0.0,
@@ -147,9 +151,10 @@ class GeminiDeployment(Deployment):
         rate_limits: int = 0,
     ):
         super().__init__(
-            id=f"gemini-{model_name}",
+            id=f"gemini-{account_name}-{model_name}",
             provider="gemini",
             name=model_name,
+            account_name=account_name,
             litellm_model=f"gemini/{model_name}",
             api_key=api_key,
             order=order,

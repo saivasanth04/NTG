@@ -1,6 +1,7 @@
 """NTG - Unified OpenRouter + Gemini Smart Router."""
 
 from ntg.config import (
+    DEFAULT_GEMINI_KEYS,
     DEFAULT_KEYS,
     GEMINI_API_KEY,
     LITELLM_MODEL_NAME,
@@ -24,6 +25,7 @@ __all__ = [
     "OPENROUTER_FREE_MODEL",
     "LITELLM_MODEL_NAME",
     "DEFAULT_KEYS",
+    "DEFAULT_GEMINI_KEYS",
     "GEMINI_API_KEY",
     "extract_error_payload",
     "classify_openrouter_error",

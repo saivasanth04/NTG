@@ -1,4 +1,4 @@
-"""Configuration settings for OpenRouter multi-account router."""
+"""Configuration settings for OpenRouter and Gemini multi-account router."""
 
 import os
 from typing import Dict
@@ -39,5 +39,13 @@ for i in range(1, 6):
     if env_val:
         DEFAULT_KEYS[key_name] = env_val
 
-# Gemini API key
+# Retrieve up to 4 Gemini API keys from environment
+DEFAULT_GEMINI_KEYS: Dict[str, str] = {}
+for i in range(1, 5):
+    key_name = f"account_{i}"
+    env_val = os.getenv(f"Gemini_API_KEY_{i}") or os.getenv(f"GEMINI_API_KEY_{i}", "")
+    if env_val:
+        DEFAULT_GEMINI_KEYS[key_name] = env_val
+
+# Backward-compatible single Gemini API key reference
 GEMINI_API_KEY: str = os.getenv("Gemini_API_KEY_1") or os.getenv("GEMINI_API_KEY_1", "")

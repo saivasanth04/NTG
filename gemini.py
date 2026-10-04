@@ -1,10 +1,10 @@
 """Gemini dynamic model discovery and deployment builder."""
 
 import os
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 from google import genai
 
-from ntg.config import _load_env_file, GEMINI_API_KEY
+from ntg.config import _load_env_file, DEFAULT_GEMINI_KEYS, GEMINI_API_KEY
 from ntg.models import GeminiDeployment
 
 _load_env_file()
@@ -82,42 +82,48 @@ def supports_generate_content(model: Dict[str, Any]) -> bool:
     return False
 
 
-def build_gemini_deployments(api_key: Optional[str] = None) -> List[GeminiDeployment]:
-    """Dynamically discover compatible Gemini models and build GeminiDeployment objects."""
-    key = api_key or GEMINI_API_KEY or os.getenv("Gemini_API_KEY_1") or os.getenv("GEMINI_API_KEY_1", "")
-    if not key or key == "YOUR_NEW_GOOGLE_API_KEY":
-        return []
+def build_gemini_deployments(
+    keys_input: Optional[Union[str, Dict[str, str]]] = None
+) -> List[GeminiDeployment]:
+    """Dynamically discover compatible Gemini models for EACH configured Gemini API key."""
+    gemini_keys: Dict[str, str] = {}
 
-    discovered = discover_models(key)
-    deployments = []
-    seen = set()
+    if isinstance(keys_input, str):
+        if keys_input and keys_input != "YOUR_NEW_GOOGLE_API_KEY":
+            gemini_keys = {"account_1": keys_input}
+    elif isinstance(keys_input, dict):
+        gemini_keys = keys_input
+    else:
+        gemini_keys = DEFAULT_GEMINI_KEYS
+        if not gemini_keys and GEMINI_API_KEY and GEMINI_API_KEY != "YOUR_NEW_GOOGLE_API_KEY":
+            gemini_keys = {"account_1": GEMINI_API_KEY}
 
+    deployments: List[GeminiDeployment] = []
     order = 1
-    for model in discovered:
-        if not supports_generate_content(model):
+
+    for acc_name, key in gemini_keys.items():
+        if not key or key == "YOUR_NEW_GOOGLE_API_KEY":
             continue
 
-        model_name = model["name"]
-        if model_name in seen:
-            continue
-        seen.add(model_name)
+        discovered = discover_models(key)
+        seen_models = set()
 
-        deployment = GeminiDeployment(
-            model_name=model_name,
-            api_key=key,
-            order=order,
-        )
-        deployments.append(deployment)
-        order += 1
+        for model in discovered:
+            if not supports_generate_content(model):
+                continue
+
+            model_name = model["name"]
+            if model_name in seen_models:
+                continue
+            seen_models.add(model_name)
+
+            deployment = GeminiDeployment(
+                account_name=acc_name,
+                model_name=model_name,
+                api_key=key,
+                order=order,
+            )
+            deployments.append(deployment)
+            order += 1
 
     return deployments
-
-
-def main():
-    """CLI entry point delegating to main unified router."""
-    from main import main as run_unified_main
-    run_unified_main()
-
-
-if __name__ == "__main__":
-    main()
