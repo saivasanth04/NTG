@@ -1,11 +1,11 @@
-"""Dynamic fallback router placing multiple OpenRouter and Gemini deployments behind one unified LiteLLM logical model."""
+"""Dynamic fallback router placing multiple OpenRouter and Gemini deployments in one deterministic global pool."""
 
 import logging
+import random
 import time
 from typing import Any, Dict, List, Optional
 
 import litellm
-from litellm import Router
 
 from ntg.config import DEFAULT_KEYS, GEMINI_API_KEY, LITELLM_MODEL_NAME
 from ntg.diagnostics import (
@@ -26,7 +26,7 @@ from ntg.models import Account, Deployment, utc_string
 
 
 class UnifiedNTGRouter:
-    """Unified OpenRouter + Gemini Smart Router reacting to real provider errors."""
+    """Unified OpenRouter + Gemini Smart Router with explicit NTG-owned global fallback loop."""
 
     def __init__(
         self,
@@ -69,125 +69,62 @@ class UnifiedNTGRouter:
                 print(f"[Router Warning] Could not dynamically discover Gemini models: {err}")
 
         self.deployment_map: Dict[str, Deployment] = {dep.id: dep for dep in self.deployments}
-        self._last_success_deployment: Optional[Deployment] = None
 
         # Configure LiteLLM logging
         litellm.suppress_debug_info = True
         litellm.set_verbose = False
         logging.getLogger("LiteLLM").setLevel(logging.ERROR)
 
-        # Register LiteLLM callbacks
-        litellm.failure_callback = [self._handle_litellm_failure]
-        litellm.success_callback = [self._handle_litellm_success]
+    def _handle_deployment_failure(self, deployment: Deployment, error: Exception) -> None:
+        """Process failure for a specific deployment, classifying error and applying isolated cooldown."""
+        deployment.attempts += 1
+        deployment.failures += 1
 
-        # Initial LiteLLM Router setup
-        valid_deployments = [dep.to_deployment() for dep in self.deployments if dep.api_key and dep.api_key.strip()]
-        self.router = Router(
-            model_list=valid_deployments if valid_deployments else [],
-            routing_strategy="simple-shuffle",
-            allowed_fails=0,
-            cooldown_time=60,
-        )
+        if deployment.provider == "gemini":
+            info = classify_gemini_error(error)
+        else:
+            info = classify_openrouter_error(error)
 
-    def _get_deployment_from_kwargs(self, kwargs: Dict[str, Any]) -> Optional[Deployment]:
-        """Extracts Deployment instance from callback kwargs metadata or model_info."""
-        lp = kwargs.get("litellm_params", {})
-        if not isinstance(lp, dict):
-            lp = {}
+        category = info.get("category", "UNKNOWN_ERROR")
+        print_divider("DEPLOYMENT FAILED (REACTIVE ERROR)")
+        print(f"Failed Deployment: {deployment.display_name} ({deployment.provider.title()})")
+        print(f"Classification   : {category}")
+        print(f"Error            : {error}")
+        if info:
+            print_rate_limit_details(info)
 
-        meta = lp.get("metadata", {})
-        if not isinstance(meta, dict):
-            meta = {}
+        # Apply cooldown/block ONLY to the failed deployment
+        if category == CATEGORY_DAILY_QUOTA:
+            deployment.rate_limits += 1
+            reset_ts = info.get("reset_timestamp")
+            print(f"\n>>> REAL ERROR REACT: Daily quota exhausted on {deployment.display_name}. Blocking deployment.")
+            deployment.block("Daily quota exhausted", until=reset_ts, cooldown=86400.0)
 
-        mi = meta.get("model_info", {})
-        if not mi:
-            mi = lp.get("model_info", {})
-        if not isinstance(mi, dict):
-            mi = {}
+        elif category == CATEGORY_AUTH_ERROR:
+            print(f"\n>>> REAL ERROR REACT: Authentication failure on {deployment.display_name}. Cooling down 1 hour.")
+            deployment.block("Authentication failure", cooldown=3600.0)
 
-        dep_id = mi.get("id") or meta.get("deployment_id")
-        if dep_id and dep_id in self.deployment_map:
-            return self.deployment_map[dep_id]
+        elif category == CATEGORY_SERVER_ERROR:
+            print(f"\n>>> REAL ERROR REACT: Upstream server error on {deployment.display_name}. Cooling down 30 seconds.")
+            deployment.block("Upstream server error", cooldown=30.0)
 
-        acc_name = mi.get("account") or meta.get("account_name")
-        if acc_name:
-            target_id = f"openrouter-{acc_name}"
-            if target_id in self.deployment_map:
-                return self.deployment_map[target_id]
+        elif category == CATEGORY_PROVIDER_LIMIT:
+            deployment.rate_limits += 1
+            print(f"\n>>> REAL ERROR REACT: Provider rate limit (429) on {deployment.display_name}. Cooling down 60 seconds.")
+            deployment.block("Provider rate limit (429)", cooldown=60.0)
 
-        api_key = lp.get("api_key")
-        if api_key:
-            for dep in self.deployments:
-                if dep.api_key == api_key:
-                    return dep
-
-        return None
-
-    def _handle_litellm_failure(
-        self, kwargs: Dict[str, Any], exception: Exception, start_time: float, end_time: float
-    ) -> None:
-        """Reactive callback executed when a deployment fails during LiteLLM router execution."""
-        deployment = self._get_deployment_from_kwargs(kwargs)
-        exc = kwargs.get("exception") or exception
-
-        if deployment:
-            deployment.attempts += 1
-            deployment.failures += 1
-
-            if deployment.provider == "gemini":
-                info = classify_gemini_error(exc) if exc else {}
-            else:
-                info = classify_openrouter_error(exc) if exc else {}
-
-            category = info.get("category", "UNKNOWN_ERROR")
-            print_divider("DEPLOYMENT FAILED (REACTIVE ERROR)")
-            print(f"Failed Deployment: {deployment.display_name} ({deployment.provider.title()})")
-            print(f"Classification   : {category}")
-            print(f"Error            : {exc}")
-            if info:
-                print_rate_limit_details(info)
-
-            # Apply cooldown/block ONLY to the failed deployment
-            if category == CATEGORY_DAILY_QUOTA:
-                deployment.rate_limits += 1
-                reset_ts = info.get("reset_timestamp")
-                print(f"\n>>> REAL ERROR REACT: Daily quota exhausted on {deployment.display_name}. Blocking deployment.")
-                deployment.block("Daily quota exhausted", until=reset_ts, cooldown=86400.0)
-
-            elif category == CATEGORY_AUTH_ERROR:
-                print(f"\n>>> REAL ERROR REACT: Authentication failure on {deployment.display_name}. Cooling down 1 hour.")
-                deployment.block("Authentication failure", cooldown=3600.0)
-
-            elif category == CATEGORY_SERVER_ERROR:
-                print(f"\n>>> REAL ERROR REACT: Upstream server error on {deployment.display_name}. Cooling down 30 seconds.")
-                deployment.block("Upstream server error", cooldown=30.0)
-
-            elif category == CATEGORY_PROVIDER_LIMIT:
-                deployment.rate_limits += 1
-                print(f"\n>>> REAL ERROR REACT: Provider rate limit (429) on {deployment.display_name}. Cooling down 60 seconds.")
-                deployment.block("Provider rate limit (429)", cooldown=60.0)
-
-            else:
-                deployment.rate_limits += 1
-                print(f"\n>>> REAL ERROR REACT: Request failure on {deployment.display_name}. Cooling down 60 seconds.")
-                deployment.block(f"Request failure: {category}", cooldown=60.0)
-
-    def _handle_litellm_success(
-        self, kwargs: Dict[str, Any], response: Any, start_time: float, end_time: float
-    ) -> None:
-        """Callback executed when a deployment succeeds."""
-        deployment = self._get_deployment_from_kwargs(kwargs)
-        if deployment:
-            deployment.attempts += 1
-            deployment.successes += 1
-            self._last_success_deployment = deployment
+        else:
+            deployment.rate_limits += 1
+            print(f"\n>>> REAL ERROR REACT: Request failure on {deployment.display_name}. Cooling down 60 seconds.")
+            deployment.block(f"Request failure: {category}", cooldown=60.0)
 
     def ask(self, prompt: str) -> Optional[Any]:
-        """Dispatches request via unified LiteLLM router across all healthy OpenRouter & Gemini deployments."""
+        """Explicit NTG-owned fallback loop across all healthy peer deployments in the global pool."""
         now = time.time()
-        available_deployments = [dep for dep in self.deployments if dep.is_available(now)]
+        # Build candidate pool of currently healthy deployments for this request
+        candidate_pool = [dep for dep in self.deployments if dep.is_available(now)]
 
-        if not available_deployments:
+        if not candidate_pool:
             print_divider("NO AVAILABLE DEPLOYMENTS")
             print("All configured OpenRouter accounts and Gemini models are currently cooling down or missing API keys.")
             resets = [dep.remaining_cooldown for dep in self.deployments if dep.remaining_cooldown > 0]
@@ -197,39 +134,50 @@ class UnifiedNTGRouter:
             print_account_status(self.deployments)
             return None
 
-        # Update LiteLLM Router model list with currently healthy deployments
-        active_litellm_deps = [dep.to_deployment() for dep in available_deployments]
-        self.router.set_model_list(active_litellm_deps)
+        # Shuffle candidate pool so traffic is fairly distributed among healthy peer deployments
+        random.shuffle(candidate_pool)
 
-        num_retries = max(0, len(active_litellm_deps) - 1)
-        self._last_success_deployment = None
+        # Single NTG-controlled fallback loop over the candidate pool
+        while candidate_pool:
+            # Select one deployment and immediately remove it from candidate pool to guarantee no retry during current request
+            deployment = candidate_pool.pop(0)
 
-        try:
-            response = self.router.completion(
-                model=LITELLM_MODEL_NAME,
-                messages=[{"role": "user", "content": prompt}],
-                num_retries=num_retries,
-            )
+            try:
+                # Attempt single request with the chosen deployment (LiteLLM num_retries=0)
+                response = litellm.completion(
+                    model=deployment.litellm_model,
+                    api_key=deployment.api_key,
+                    messages=[{"role": "user", "content": prompt}],
+                    metadata={
+                        "deployment_id": deployment.id,
+                        "provider": deployment.provider,
+                        "account_name": deployment.name,
+                        "deployment_name": deployment.name,
+                    },
+                    num_retries=0,
+                )
 
-            # Identify fulfilling deployment
-            fulfilling_dep = self._last_success_deployment
-            resp_model = getattr(response, "model", None)
+                # SUCCESS: Record state and return immediately
+                deployment.attempts += 1
+                deployment.successes += 1
+                resp_model = getattr(response, "model", None)
 
-            # Output response content
-            if hasattr(response, "choices") and response.choices:
-                print("\n" + str(response.choices[0].message.content))
+                if hasattr(response, "choices") and response.choices:
+                    print("\n" + str(response.choices[0].message.content))
 
-            if fulfilling_dep:
-                print_request_execution(fulfilling_dep, resp_model)
+                print_request_execution(deployment, resp_model)
+                return response
 
-            return response
+            except Exception as error:
+                # FAILURE: Reliably process failure for the specific deployment and block ONLY it
+                self._handle_deployment_failure(deployment, error)
+                # Continue loop to try another healthy deployment from candidate_pool
 
-        except Exception as error:
-            print_divider("ALL DEPLOYMENTS EXHAUSTED")
-            print(f"Unified logical model '{LITELLM_MODEL_NAME}' failed on all available deployments.")
-            print(f"Final exception: {error}")
-            print_account_status(self.deployments)
-            return None
+        # Total exhaustion of candidate pool
+        print_divider("ALL DEPLOYMENTS EXHAUSTED")
+        print(f"Unified logical model '{LITELLM_MODEL_NAME}' failed on all candidate deployments.")
+        print_account_status(self.deployments)
+        return None
 
 
 # Maintain backwards compatibility
