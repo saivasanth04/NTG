@@ -10,6 +10,7 @@ venv/
 
 # NTG Persistent State
 .ntg/
+.ntg_state.json
 
 # Environment Variables & Secrets
 .env

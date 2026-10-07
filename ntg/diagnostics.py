@@ -1,9 +1,12 @@
 """Diagnostic console tables and status formatting."""
 
+from __future__ import annotations
+
+import time
 from typing import Any, Dict, List, Optional
 
 from ntg.config import DEFAULT_LOGICAL_MODEL
-from ntg.models import Deployment, utc_string
+from ntg.models import CircuitState, Deployment, utc_string
 
 
 def print_divider(title: Optional[str] = None, width: int = 70) -> None:
@@ -57,39 +60,55 @@ def print_banner(
     print_divider("NTG — MULTI-PROVIDER LITELLM SMART ROUTER")
     print(f"Deployments   : {total} total ({breakdown})")
     print(f"Default Model : {default_model}")
-    print("Routing Engine: LiteLLM Router (load-balancing & dynamic failover)")
-    print("Isolation     : Per-deployment health state & cooldown")
+    print("Architecture  : NTG (capabilities, quotas, state) + LiteLLM (routing & failover)")
+    print("Routing Engine: LiteLLM Router (simple-shuffle & bounded failover)")
+    print("Reliability   : Circuit Breaker (HEALTHY -> OPEN -> HALF_OPEN -> HEALTHY)")
     print("Security      : Zero secrets in console diagnostics\n")
 
 
 def print_account_status(deployments: List[Deployment]) -> None:
     """Displays formatted status table of all configured deployments across providers."""
+    now = time.time()
     for dep in deployments:
-        dep.refresh()
+        dep.refresh(now)
 
     print_divider("DEPLOYMENT STATUS")
     for dep in deployments:
         if not dep.api_key or not dep.api_key.strip():
             status_str = "NO KEY"
-        elif dep.is_available():
-            status_str = "ACTIVE"
+        elif dep.circuit_state == CircuitState.QUARANTINED:
+            status_str = "QUARANTINED (AUTH)"
+        elif dep.circuit_state == CircuitState.OPEN:
+            status_str = f"OPEN (COOLING DOWN, {dep.remaining_cooldown:.1f}s)"
+        elif dep.circuit_state == CircuitState.HALF_OPEN:
+            status_str = "HALF_OPEN (PROBING)"
         else:
-            status_str = "COOLING DOWN"
+            status_str = "HEALTHY (ACTIVE)"
+
+        caps_tags = ", ".join(dep.capabilities.to_tags()) or "general"
 
         print(f"\n{dep.display_name}")
         print(f"  Provider        : {dep.provider.title()}")
         print(f"  Logical Model   : {dep.logical_model}")
         print(f"  Underlying Model: {dep.model}")
         print(f"  Account         : {dep.account}")
-        print(f"  Status          : {status_str}")
-        print(f"  Attempts        : {dep.attempts}")
-        print(f"  Successes       : {dep.successes}")
-        print(f"  Failures        : {dep.failures}")
-        print(f"  Rate Limits     : {dep.rate_limits}")
+        print(f"  Circuit State   : {status_str}")
+        print(f"  Capabilities    : {caps_tags} (context: {dep.capabilities.context_window:,})")
+        print(
+            f"  Telemetry       : User reqs: {dep.metrics.user_requests} | Upstream attempts: {dep.metrics.upstream_attempts} | Success: {dep.metrics.successes} | Fail: {dep.metrics.failures}"
+        )
+        if dep.metrics.rate_limits > 0 or dep.metrics.auth_errors > 0:
+            print(
+                f"  Errors Breakdown: Rate Limits: {dep.metrics.rate_limits} | Auth Errors: {dep.metrics.auth_errors}"
+            )
+        if dep.quota.quota_scope:
+            print(
+                f"  Quota Scope     : {dep.quota.quota_scope} (limit type: {dep.quota.limit_type or 'unspecified'})"
+            )
         if dep.remaining_cooldown > 0:
-            print(f"  Block remaining : {dep.remaining_cooldown:.1f}s")
+            print(f"  Cooldown left   : {dep.remaining_cooldown:.1f}s")
         if dep.blocked_reason:
-            print(f"  Block reason    : {dep.blocked_reason}")
+            print(f"  Last reason     : {dep.blocked_reason}")
 
 
 def print_request_execution(
@@ -102,8 +121,10 @@ def print_request_execution(
     print(f"Logical model        : {deployment.logical_model}")
     print(f"Underlying model     : {deployment.model}")
     print(f"Account              : {deployment.account}")
-    print(f"Total attempts       : {deployment.attempts}")
-    print(f"Deployment successes : {deployment.successes}")
+    print(f"Circuit State        : {deployment.circuit_state.value}")
+    print(
+        f"Telemetry            : User reqs: {deployment.metrics.user_requests} | Upstream attempts: {deployment.metrics.upstream_attempts} | Success: {deployment.metrics.successes}"
+    )
     if response_model:
         print(f"Response model       : {response_model}")
 
@@ -115,6 +136,8 @@ def print_rate_limit_details(info: Dict[str, Any]) -> None:
         ("category", "Classification"),
         ("limit_source", "Limit source"),
         ("provider_name", "Provider"),
+        ("limit_type", "Limit type"),
+        ("quota_scope", "Quota scope"),
         ("limit", "Limit"),
         ("remaining", "Remaining"),
         ("reset", "Reset"),

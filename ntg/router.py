@@ -1,11 +1,15 @@
-"""LiteLLM-based multi-provider smart router."""
+"""LiteLLM-based multi-provider smart router with NTG intelligence."""
 
+from __future__ import annotations
+
+import contextvars
 import logging
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 import litellm
-from litellm import Router
+from litellm import RetryPolicy, Router
+from litellm.integrations.custom_logger import CustomLogger
 
 from ntg.config import (
     DEFAULT_LOGICAL_MODEL,
@@ -26,43 +30,124 @@ from ntg.exceptions import (
     CATEGORY_AUTH_ERROR,
     CATEGORY_DAILY_QUOTA,
     CATEGORY_PROVIDER_LIMIT,
-    CATEGORY_SERVER_ERROR,
-    classify_provider_error,
+    parse_provider_error,
 )
-from ntg.models import Deployment, utc_string
+from ntg.models import CircuitState, Deployment, ModelCapabilities, utc_string
+from ntg.state import StateManager
+
+# ContextVar for thread-safe, concurrency-safe request deployment tracking
+_current_request_deployment: contextvars.ContextVar[Optional[Deployment]] = contextvars.ContextVar(
+    "_current_request_deployment", default=None
+)
 
 
-class NTGLiteLLMRouter(Router):
-    """LiteLLM Router subclass that captures deployment execution and isolated failures."""
+class NTGTelemetryLogger(CustomLogger):
+    """LiteLLM custom logger callback for telemetry, circuit breaker updates, and quota intelligence.
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self._last_selected_deployment: Optional[Dict[str, Any]] = None
-        self._failure_listener = None
+    Extracts per-attempt deployment metadata directly from event kwargs to ensure
+    100% thread safety and eliminate shared mutable request state.
+    """
 
-    def _update_kwargs_with_deployment(
-        self,
-        deployment: dict,
-        kwargs: dict,
-        function_name: Optional[str] = None,
-    ) -> None:
-        super()._update_kwargs_with_deployment(deployment, kwargs, function_name)
-        self._last_selected_deployment = deployment
+    def __init__(self, router: UnifiedNTGRouter):
+        super().__init__()
+        self.router = router
 
-    def _completion(self, model: str, messages: list[dict[str, str]], **kwargs):
-        try:
-            return super()._completion(model, messages, **kwargs)
-        except Exception as exc:
-            if self._last_selected_deployment and self._failure_listener:
-                dep_info = self._last_selected_deployment.get("model_info", {})
-                dep_id = dep_info.get("id")
-                if dep_id:
-                    self._failure_listener(dep_id, exc)
-            raise
+    def log_success_event(self, kwargs: dict, response_obj: Any, start_time: Any, end_time: Any) -> None:
+        """Handle upstream success callback."""
+        dep_id = kwargs.get("litellm_params", {}).get("model_info", {}).get("id")
+        if not dep_id:
+            dep_id = kwargs.get("model_info", {}).get("id")
+
+        deployment = self.router.deployment_map.get(dep_id)
+        if deployment:
+            deployment.metrics.upstream_attempts += 1
+            deployment.metrics.successes += 1
+            deployment.record_success()
+
+            # Record healthy circuit state and update persisted state
+            self.router.state_manager.record_circuit_state(dep_id, CircuitState.HEALTHY)
+            self.router.state_manager.record_metrics(dep_id, deployment.metrics)
+
+            # Store in thread-safe contextvar for the current request
+            _current_request_deployment.set(deployment)
+
+    def log_failure_event(self, kwargs: dict, response_obj: Any, start_time: Any, end_time: Any) -> None:
+        """Handle upstream failure callback with granular error classification."""
+        dep_id = kwargs.get("litellm_params", {}).get("model_info", {}).get("id")
+        if not dep_id:
+            dep_id = kwargs.get("model_info", {}).get("id")
+
+        exc = kwargs.get("exception")
+        if not exc and isinstance(response_obj, Exception):
+            exc = response_obj
+
+        deployment = self.router.deployment_map.get(dep_id)
+        if deployment:
+            deployment.metrics.upstream_attempts += 1
+            deployment.metrics.failures += 1
+
+            if exc:
+                info = parse_provider_error(exc, provider=deployment.provider)
+
+                # Update quota information
+                deployment.quota.limit_type = info.limit_type
+                deployment.quota.quota_scope = info.quota_scope
+                deployment.quota.reset_at = info.reset_timestamp
+                deployment.quota.retry_after = info.cooldown_seconds
+
+                # Error categorization
+                if info.category in (CATEGORY_PROVIDER_LIMIT, CATEGORY_DAILY_QUOTA):
+                    deployment.metrics.rate_limits += 1
+                elif info.category == CATEGORY_AUTH_ERROR:
+                    deployment.metrics.auth_errors += 1
+
+                # Circuit breaker & quarantine handling
+                if info.should_quarantine:
+                    deployment.circuit_state = CircuitState.QUARANTINED
+                    deployment.blocked_reason = f"Authentication / Model error: {info.message}"
+                    self.router.state_manager.record_circuit_state(dep_id, CircuitState.QUARANTINED)
+                else:
+                    deployment.record_failure()
+                    deployment.circuit_state = CircuitState.OPEN
+                    deployment.cooldown_until = time.time() + info.cooldown_seconds
+                    deployment.blocked_reason = info.message
+
+                    self.router.state_manager.record_cooldown(
+                        dep_id, deployment.cooldown_until, info.limit_type
+                    )
+                    self.router.state_manager.record_circuit_state(dep_id, CircuitState.OPEN)
+
+                    # Add to LiteLLM router's cooldown cache
+                    try:
+                        status_code = getattr(exc, "status_code", 500) or 500
+                        self.router.router.cooldown_cache.add_deployment_to_cooldown(
+                            model_id=dep_id,
+                            original_exception=exc,
+                            exception_status=status_code,
+                            cooldown_time=info.cooldown_seconds,
+                        )
+                    except Exception:
+                        pass
+
+                # If quota scope is account-level, propagate cooldown to all deployments of that account
+                if info.quota_scope == "account":
+                    self.router._propagate_account_cooldown(
+                        deployment.provider,
+                        deployment.account,
+                        deployment.cooldown_until,
+                        info.message,
+                    )
+
+                self.router.state_manager.record_metrics(dep_id, deployment.metrics)
 
 
 class UnifiedNTGRouter:
-    """Unified multi-provider router delegating routing and load balancing directly to LiteLLM."""
+    """Unified multi-provider router delegating load balancing, retries, and failovers to LiteLLM.
+
+    NTG provides eligibility filtering, capability requirements, quota intelligence,
+    circuit breaker lifecycle, and persisted telemetry.
+    LiteLLM owns deployment selection, distributed load balancing, and failover.
+    """
 
     def __init__(
         self,
@@ -74,14 +159,17 @@ class UnifiedNTGRouter:
         cohere_keys: Optional[Dict[str, str]] = None,
         gemini_keys: Optional[Dict[str, str]] = None,
         gemini_api_key: Optional[str] = None,
+        state_manager: Optional[StateManager] = None,
     ):
-        # Configure logging to suppress noisy LiteLLM model registration notices
+        # Configure logging to suppress verbose notices
         litellm.suppress_debug_info = True
         litellm.set_verbose = False
         logging.getLogger("LiteLLM").setLevel(logging.ERROR)
         logging.getLogger("LiteLLM Router").setLevel(logging.ERROR)
 
-        # 1. Build all deployments across providers
+        self.state_manager = state_manager or StateManager()
+
+        # 1. Build all deployments across providers and restore persisted state
         if accounts is not None:
             self.deployments: List[Deployment] = list(accounts)
         else:
@@ -95,117 +183,223 @@ class UnifiedNTGRouter:
                 nvidia_keys=nvidia_keys,
                 cohere_keys=cohere_keys,
                 gemini_keys=g_keys,
+                state_manager=self.state_manager,
             )
 
         self.deployment_map: Dict[str, Deployment] = {dep.id: dep for dep in self.deployments}
 
-        # 2. Collect valid deployments for the LiteLLM Router deployment pool
+        # 2. Build LiteLLM model_list deployment pool
         active_deployments = [
             dep for dep in self.deployments
             if dep.api_key and dep.api_key.strip() and dep.available
         ]
-        model_list = [dep.to_litellm_dict() for dep in active_deployments]
 
-        # 3. Discover available logical groups and configure fallbacks
-        logical_groups = list(dict.fromkeys(dep.logical_model for dep in active_deployments))
-        fallbacks: List[Dict[str, List[str]]] = []
-        for group in logical_groups:
-            other_groups = [g for g in logical_groups if g != group]
-            if other_groups:
-                fallbacks.append({group: other_groups})
+        model_list: List[Dict[str, Any]] = []
+        registered_pairs: Set[tuple[str, str]] = set()
 
-        # 4. Resolve default model and model aliases
-        if default_model:
-            self.default_model = default_model
-        elif logical_groups:
-            self.default_model = logical_groups[0]
-        else:
-            self.default_model = DEFAULT_LOGICAL_MODEL
+        for dep in active_deployments:
+            litellm_dict = dep.to_litellm_dict()
 
-        model_group_alias: Dict[str, str] = {
-            "auto": self.default_model,
-            "ntg-auto": self.default_model,
-        }
+            # Target groups:
+            # 1. Provider group (e.g. openrouter, groq, nvidia, cohere, gemini)
+            # 2. Global auto group (auto, ntg-auto)
+            # 3. Capability groups (coding, reasoning, vision, tool_calling)
+            groups = [dep.logical_model, "auto", "ntg-auto"]
 
-        # 5. Instantiate LiteLLM Router
-        num_retries = max(1, len(active_deployments) - 1) if active_deployments else 1
+            if dep.capabilities.coding:
+                groups.append("coding")
+            if dep.capabilities.reasoning:
+                groups.append("reasoning")
+            if dep.capabilities.vision:
+                groups.append("vision")
+            if dep.capabilities.tool_calling:
+                groups.append("tool_calling")
 
-        self.router = NTGLiteLLMRouter(
+            for g in groups:
+                pair = (g, dep.id)
+                if pair not in registered_pairs:
+                    registered_pairs.add(pair)
+                    entry = dict(litellm_dict)
+                    entry["model_name"] = g
+                    model_list.append(entry)
+
+        # 3. Configure compatible capability-aware fallbacks
+        fallbacks: List[Dict[str, List[str]]] = [
+            {MODEL_GROUP_OPENROUTER: [MODEL_GROUP_NVIDIA, MODEL_GROUP_COHERE, MODEL_GROUP_GROQ]},
+            {MODEL_GROUP_NVIDIA: [MODEL_GROUP_OPENROUTER, MODEL_GROUP_COHERE, MODEL_GROUP_GROQ]},
+            {MODEL_GROUP_COHERE: [MODEL_GROUP_NVIDIA, MODEL_GROUP_OPENROUTER, MODEL_GROUP_GROQ]},
+            {MODEL_GROUP_GROQ: [MODEL_GROUP_NVIDIA, MODEL_GROUP_OPENROUTER, MODEL_GROUP_COHERE]},
+            {MODEL_GROUP_GEMINI: [MODEL_GROUP_GROQ]},
+            {"coding": ["auto"]},
+            {"reasoning": ["auto"]},
+            {"vision": [MODEL_GROUP_GEMINI]},
+            {"tool_calling": [MODEL_GROUP_NVIDIA, MODEL_GROUP_COHERE, MODEL_GROUP_GROQ]},
+        ]
+
+        # 4. Resolve default model
+        self.default_model = default_model or "auto"
+
+        # 5. Configure RetryPolicy with bounded request retry budget (max 2 retries)
+        retry_policy = RetryPolicy(
+            BadRequestErrorRetries=0,
+            AuthenticationErrorRetries=1,
+            RateLimitErrorRetries=1,
+            TimeoutErrorRetries=1,
+            InternalServerErrorRetries=1,
+        )
+
+        # 6. Instantiate LiteLLM Router
+        self.router = Router(
             model_list=model_list,
             routing_strategy="simple-shuffle",
             cooldown_time=60.0,
             allowed_fails=1,
-            num_retries=num_retries,
+            num_retries=2,
+            retry_policy=retry_policy,
             fallbacks=fallbacks,
-            model_group_alias=model_group_alias,
-        )
-        self.router._failure_listener = self._handle_deployment_failure
-
-    def _handle_deployment_failure(self, dep_id: str, error: Exception) -> None:
-        """Isolated reactive error handling when LiteLLM reports a deployment failure."""
-        deployment = self.deployment_map.get(dep_id)
-        provider = deployment.provider if deployment else ""
-        info = classify_provider_error(error, provider)
-        category = info.get("category", "UNKNOWN_ERROR")
-
-        # Determine cooldown time based on error classification
-        if category == CATEGORY_DAILY_QUOTA:
-            reset_ts = info.get("reset_timestamp")
-            cooldown_secs = max(0.0, reset_ts - time.time()) if reset_ts else 86400.0
-            reason = "Daily quota exhausted"
-        elif category == CATEGORY_AUTH_ERROR:
-            cooldown_secs = 3600.0
-            reason = "Authentication failure"
-        elif category == CATEGORY_SERVER_ERROR:
-            cooldown_secs = 30.0
-            reason = "Upstream server error"
-        elif category == CATEGORY_PROVIDER_LIMIT:
-            cooldown_secs = 60.0
-            reason = "Provider rate limit (429)"
-        else:
-            cooldown_secs = 60.0
-            reason = f"Request failure: {category}"
-
-        # Place the failing deployment into LiteLLM's cooldown cache
-        self.router.cooldown_cache.add_deployment_to_cooldown(
-            model_id=dep_id,
-            original_exception=error,
-            exception_status=getattr(error, "status_code", 500) or 500,
-            cooldown_time=cooldown_secs,
+            model_group_alias={
+                "ntg-auto": "auto",
+            },
         )
 
-        # Update deployment health and diagnostic tracking in NTG
-        if deployment:
-            deployment.attempts += 1
-            deployment.failures += 1
-            if category in (CATEGORY_PROVIDER_LIMIT, CATEGORY_DAILY_QUOTA):
-                deployment.rate_limits += 1
-            deployment.block(reason, cooldown=cooldown_secs)
+        # 7. Register telemetry and circuit breaker callback
+        self.telemetry_logger = NTGTelemetryLogger(self)
+        if self.telemetry_logger not in litellm.callbacks:
+            litellm.callbacks.append(self.telemetry_logger)
 
-            print_divider("DEPLOYMENT FAILED (REACTIVE ERROR)")
-            print(f"Failed Deployment: {deployment.display_name}")
-            print(f"Classification   : {category}")
-            print(f"Error            : {error}")
-            if info:
-                print_rate_limit_details(info)
+    def _propagate_account_cooldown(
+        self,
+        provider: str,
+        account: str,
+        cooldown_until: float,
+        reason: str,
+    ) -> None:
+        """Propagate an account-wide quota limit across all deployments under the same account."""
+        now = time.time()
+        cooldown_secs = max(1.0, cooldown_until - now)
+        for dep in self.deployments:
+            if dep.provider == provider and dep.account == account:
+                dep.circuit_state = CircuitState.OPEN
+                dep.cooldown_until = cooldown_until
+                dep.blocked_reason = reason
+                self.state_manager.record_cooldown(dep.id, cooldown_until, "account_quota")
+                self.state_manager.record_circuit_state(dep.id, CircuitState.OPEN)
+                try:
+                    self.router.cooldown_cache.add_deployment_to_cooldown(
+                        model_id=dep.id,
+                        original_exception=Exception(reason),
+                        exception_status=429,
+                        cooldown_time=cooldown_secs,
+                    )
+                except Exception:
+                    pass
 
-    def ask(self, prompt: str, model: Optional[str] = None, **kwargs) -> Optional[Any]:
-        """Route request through LiteLLM Router using the selected logical model group."""
-        target_model = model or self.default_model
-
-        # Refresh cooldown status on all deployments
+    def _filter_eligible_deployments(
+        self,
+        model_group: str,
+        capabilities: Optional[ModelCapabilities] = None,
+        min_context: Optional[int] = None,
+    ) -> List[Deployment]:
+        """NTG Eligibility Filter: evaluate health, capabilities, quotas, and circuit state."""
         now = time.time()
         for dep in self.deployments:
             dep.refresh(now)
 
-        # Check if there are active deployments
-        healthy_active = [
-            d for d in self.deployments
-            if d.api_key and d.api_key.strip() and d.is_available(now)
-        ]
-        if not healthy_active:
-            print_divider("NO AVAILABLE DEPLOYMENTS")
-            print("All configured deployments are currently cooling down or missing API keys.")
+        eligible: List[Deployment] = []
+        is_global = model_group in ("auto", "ntg-auto")
+
+        for dep in self.deployments:
+            if not dep.api_key or not dep.api_key.strip():
+                continue
+
+            # Check capability groups
+            if model_group == "coding" and not dep.capabilities.coding:
+                continue
+            if model_group == "reasoning" and not dep.capabilities.reasoning:
+                continue
+            if model_group == "vision" and not dep.capabilities.vision:
+                continue
+            if model_group == "tool_calling" and not dep.capabilities.tool_calling:
+                continue
+
+            # Check provider group match for non-global requests
+            if not is_global and model_group not in ("coding", "reasoning", "vision", "tool_calling"):
+                if dep.logical_model != model_group:
+                    continue
+
+            # Check circuit breaker
+            if dep.circuit_state == CircuitState.QUARANTINED:
+                continue
+            if not dep.is_available(now):
+                continue
+
+            # Check capabilities
+            if capabilities and not dep.capabilities.satisfies(capabilities):
+                continue
+
+            # Check min context window
+            if min_context and dep.capabilities.context_window < min_context:
+                continue
+
+            eligible.append(dep)
+
+        return eligible
+
+    def _parse_capabilities(
+        self,
+        caps: Optional[ModelCapabilities | dict | list[str] | str] = None,
+    ) -> Optional[ModelCapabilities]:
+        """Normalize capability parameter into a ModelCapabilities object."""
+        if caps is None:
+            return None
+        if isinstance(caps, ModelCapabilities):
+            return caps
+        if isinstance(caps, dict):
+            return ModelCapabilities(**caps)
+        if isinstance(caps, list):
+            return ModelCapabilities(**{c: True for c in caps})
+        if isinstance(caps, str):
+            c_clean = caps.strip().lower()
+            if c_clean in ("coding", "code"):
+                return ModelCapabilities(coding=True)
+            if c_clean in ("reasoning", "reason"):
+                return ModelCapabilities(reasoning=True)
+            if c_clean in ("vision", "image"):
+                return ModelCapabilities(vision=True)
+            if c_clean in ("tool_calling", "tools", "tool"):
+                return ModelCapabilities(tool_calling=True)
+            if c_clean in ("streaming", "stream"):
+                return ModelCapabilities(streaming=True)
+        return None
+
+    def ask(
+        self,
+        prompt: str,
+        model: Optional[str] = None,
+        capabilities: Optional[ModelCapabilities | dict | list[str] | str] = None,
+        min_context: Optional[int] = None,
+        **kwargs: Any,
+    ) -> Optional[Any]:
+        """Route user prompt through LiteLLM Router with NTG capability & eligibility validation."""
+        target_model = model or self.default_model
+        req_caps = self._parse_capabilities(capabilities)
+
+        # Run NTG eligibility filter
+        eligible = self._filter_eligible_deployments(
+            model_group=target_model,
+            capabilities=req_caps,
+            min_context=min_context,
+        )
+
+        now = time.time()
+        if not eligible:
+            print_divider("NO ELIGIBLE DEPLOYMENTS")
+            print(f"No available deployments satisfy model group '{target_model}'")
+            if req_caps:
+                print(f"Required capabilities: {', '.join(req_caps.to_tags())}")
+            if min_context:
+                print(f"Required context     : >={min_context:,}")
+
             resets = [dep.remaining_cooldown for dep in self.deployments if dep.remaining_cooldown > 0]
             if resets:
                 next_capacity = min(resets)
@@ -213,22 +407,31 @@ class UnifiedNTGRouter:
             print_account_status(self.deployments)
             return None
 
+        # Reset contextvar for this request
+        _current_request_deployment.set(None)
+
         try:
-            # Delegate routing, load-balancing, and failover completely to LiteLLM Router
+            # Delegate routing, load-balancing, and failover directly to LiteLLM Router
             response = self.router.completion(
                 model=target_model,
                 messages=[{"role": "user", "content": prompt}],
                 **kwargs,
             )
 
-            # Record success on the deployment that handled the request
-            selected_info = (self.router._last_selected_deployment or {}).get("model_info", {})
-            dep_id = selected_info.get("id")
-            deployment = self.deployment_map.get(dep_id)
+            # Retrieve the fulfilling deployment from the thread-safe context
+            deployment = _current_request_deployment.get()
+            if not deployment:
+                # Fallback to response model matching
+                resp_model = getattr(response, "model", "")
+                for dep in eligible:
+                    if dep.model in resp_model or dep.litellm_model in resp_model:
+                        deployment = dep
+                        break
+                if not deployment and eligible:
+                    deployment = eligible[0]
 
             if deployment:
-                deployment.attempts += 1
-                deployment.successes += 1
+                deployment.metrics.user_requests += 1
 
             if hasattr(response, "choices") and response.choices:
                 print("\n" + str(response.choices[0].message.content))
@@ -239,11 +442,47 @@ class UnifiedNTGRouter:
             return response
 
         except Exception as error:
-            print_divider("ALL DEPLOYMENTS EXHAUSTED")
+            print_divider("ALL ELIGIBLE DEPLOYMENTS EXHAUSTED")
             print(f"Request failed across healthy deployments for model group '{target_model}'.")
             print(f"Final error: {error}")
             print_account_status(self.deployments)
             return None
+
+    def completion(
+        self,
+        messages: list[dict[str, str]],
+        model: Optional[str] = None,
+        capabilities: Optional[ModelCapabilities | dict | list[str] | str] = None,
+        min_context: Optional[int] = None,
+        **kwargs: Any,
+    ) -> Any:
+        """Execute chat completion conforming to standard OpenAI/LiteLLM signature."""
+        target_model = model or self.default_model
+        req_caps = self._parse_capabilities(capabilities)
+
+        eligible = self._filter_eligible_deployments(
+            model_group=target_model,
+            capabilities=req_caps,
+            min_context=min_context,
+        )
+
+        if not eligible:
+            raise RuntimeError(
+                f"No eligible deployments for model='{target_model}' satisfying requirements."
+            )
+
+        _current_request_deployment.set(None)
+        response = self.router.completion(
+            model=target_model,
+            messages=messages,
+            **kwargs,
+        )
+
+        deployment = _current_request_deployment.get()
+        if deployment:
+            deployment.metrics.user_requests += 1
+
+        return response
 
 
 # Maintain backwards compatibility

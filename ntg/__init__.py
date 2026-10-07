@@ -35,18 +35,36 @@ from ntg.discovery import (
     discover_groq_models,
 )
 from ntg.exceptions import (
+    ParsedErrorInfo,
     classify_gemini_error,
     classify_openrouter_error,
     classify_provider_error,
     extract_error_payload,
+    parse_provider_error,
 )
-from ntg.models import Account, Deployment, GeminiDeployment, utc_string
+from ntg.models import (
+    Account,
+    CircuitState,
+    Deployment,
+    DeploymentMetrics,
+    GeminiDeployment,
+    ModelCapabilities,
+    QuotaInfo,
+    utc_string,
+)
 from ntg.router import OpenRouterFallbackRouter, UnifiedNTGRouter
+from ntg.state import StateManager
 
 __all__ = [
     "Deployment",
     "Account",
     "GeminiDeployment",
+    "CircuitState",
+    "ModelCapabilities",
+    "QuotaInfo",
+    "DeploymentMetrics",
+    "StateManager",
+    "ParsedErrorInfo",
     "UnifiedNTGRouter",
     "OpenRouterFallbackRouter",
     "OPENROUTER_ACTUAL_MODEL",
@@ -82,6 +100,7 @@ __all__ = [
     "classify_openrouter_error",
     "classify_gemini_error",
     "classify_provider_error",
+    "parse_provider_error",
     "print_account_status",
     "print_banner",
     "print_request_execution",
