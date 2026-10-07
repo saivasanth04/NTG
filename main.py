@@ -1,4 +1,4 @@
-"""Main CLI entry point for the Unified OpenRouter + Gemini NTG Router."""
+"""Main CLI entry point for the Multi-Provider LiteLLM NTG Router."""
 
 import sys
 
@@ -9,49 +9,30 @@ if hasattr(sys.stdout, "reconfigure"):
     except Exception:
         pass
 
-from ntg import (
-    Account,
-    DEFAULT_KEYS,
-    UnifiedNTGRouter,
-    print_banner,
-)
+from ntg import UnifiedNTGRouter, print_banner
 
 
 def main():
-    """Run interactive or argument-based Unified OpenRouter + Gemini router CLI."""
-    accounts = [
-        Account(name=name, api_key=key, order=i + 1)
-        for i, (name, key) in enumerate(DEFAULT_KEYS.items())
-    ]
-
-    # Ensure 5 account slots exist
-    while len(accounts) < 5:
-        idx = len(accounts) + 1
-        accounts.append(
-            Account(
-                name=f"account_{idx}",
-                api_key="",
-                order=idx,
-                available=False,
-            )
-        )
-
-    router = UnifiedNTGRouter(accounts=accounts)
-
-    openrouter_count = len([d for d in router.deployments if d.provider == "openrouter"])
-    gemini_deps = [d for d in router.deployments if d.provider == "gemini"]
-    gemini_count = len(gemini_deps)
-    gemini_accounts_count = len({d.account_name for d in gemini_deps})
+    """Run interactive or argument-based multi-provider router CLI."""
+    router = UnifiedNTGRouter()
 
     print_banner(
-        openrouter_count=openrouter_count,
-        gemini_count=gemini_count,
-        gemini_accounts_count=gemini_accounts_count,
+        deployments=router.deployments,
+        default_model=router.default_model,
     )
 
+    args = sys.argv[1:]
+    selected_model = None
+
+    if "--model" in args:
+        idx = args.index("--model")
+        if idx + 1 < len(args):
+            selected_model = args[idx + 1]
+            args = args[:idx] + args[idx + 2:]
+
     # Allow prompt from CLI args or interactive input
-    if len(sys.argv) > 1:
-        prompt = " ".join(sys.argv[1:]).strip()
+    if args:
+        prompt = " ".join(args).strip()
     else:
         try:
             prompt = input("Enter your prompt: ").strip()
@@ -63,7 +44,7 @@ def main():
         print("No prompt supplied.")
         return
 
-    router.ask(prompt)
+    router.ask(prompt, model=selected_model)
 
 
 if __name__ == "__main__":

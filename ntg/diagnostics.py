@@ -2,7 +2,7 @@
 
 from typing import Any, Dict, List, Optional
 
-from ntg.config import LITELLM_MODEL_NAME
+from ntg.config import DEFAULT_LOGICAL_MODEL
 from ntg.models import Deployment, utc_string
 
 
@@ -14,23 +14,56 @@ def print_divider(title: Optional[str] = None, width: int = 70) -> None:
         print("=" * width)
 
 
-def print_banner(openrouter_count: int = 5, gemini_count: int = 0, gemini_accounts_count: int = 0) -> None:
-    """Print application banner."""
-    total = openrouter_count + gemini_count
-    gemini_info = f", {gemini_count} Gemini deployments" if gemini_count > 0 else ""
-    if gemini_accounts_count > 0:
-        gemini_info += f" across {gemini_accounts_count} accounts"
+def print_banner(
+    deployments: Optional[List[Deployment]] = None,
+    openrouter_count: int = 0,
+    groq_count: int = 0,
+    nvidia_count: int = 0,
+    cohere_count: int = 0,
+    gemini_count: int = 0,
+    gemini_accounts_count: int = 0,
+    default_model: str = DEFAULT_LOGICAL_MODEL,
+) -> None:
+    """Print application banner with multi-provider summary."""
+    if deployments is not None:
+        openrouter_count = len([d for d in deployments if d.provider == "openrouter"])
+        groq_count = len([d for d in deployments if d.provider == "groq"])
+        nvidia_count = len([d for d in deployments if d.provider == "nvidia"])
+        cohere_count = len([d for d in deployments if d.provider == "cohere"])
+        gemini_deps = [d for d in deployments if d.provider == "gemini"]
+        gemini_count = len(gemini_deps)
+        gemini_accounts_count = len({d.account for d in gemini_deps})
+        total = len(deployments)
+    else:
+        total = openrouter_count + groq_count + nvidia_count + cohere_count + gemini_count
 
-    print_divider("NTG — UNIFIED OPENROUTER + GEMINI SMART ROUTER")
-    print(f"Deployments  : {total} total ({openrouter_count} OpenRouter accounts{gemini_info})")
-    print(f"Logical Model: {LITELLM_MODEL_NAME} (LiteLLM managed)")
-    print("Routing      : LiteLLM deployment selection & dynamic failover")
-    print("Quota Mode   : Reactive real provider error handling")
-    print("State        : Dynamic runtime self-adapting\n")
+    parts = []
+    if openrouter_count > 0:
+        parts.append(f"{openrouter_count} OpenRouter")
+    if groq_count > 0:
+        parts.append(f"{groq_count} Groq")
+    if nvidia_count > 0:
+        parts.append(f"{nvidia_count} NVIDIA")
+    if cohere_count > 0:
+        parts.append(f"{cohere_count} Cohere")
+    if gemini_count > 0:
+        gemini_label = f"{gemini_count} Gemini"
+        if gemini_accounts_count > 0:
+            gemini_label += f" across {gemini_accounts_count} accounts"
+        parts.append(gemini_label)
+
+    breakdown = ", ".join(parts) if parts else "No active providers"
+
+    print_divider("NTG — MULTI-PROVIDER LITELLM SMART ROUTER")
+    print(f"Deployments   : {total} total ({breakdown})")
+    print(f"Default Model : {default_model}")
+    print("Routing Engine: LiteLLM Router (load-balancing & dynamic failover)")
+    print("Isolation     : Per-deployment health state & cooldown")
+    print("Security      : Zero secrets in console diagnostics\n")
 
 
 def print_account_status(deployments: List[Deployment]) -> None:
-    """Displays formatted status table of all configured deployments (OpenRouter & Gemini)."""
+    """Displays formatted status table of all configured deployments across providers."""
     for dep in deployments:
         dep.refresh()
 
@@ -43,7 +76,11 @@ def print_account_status(deployments: List[Deployment]) -> None:
         else:
             status_str = "COOLING DOWN"
 
-        print(f"\n{dep.display_name} (Provider: {dep.provider.title()}, Order: {dep.order})")
+        print(f"\n{dep.display_name}")
+        print(f"  Provider        : {dep.provider.title()}")
+        print(f"  Logical Model   : {dep.logical_model}")
+        print(f"  Underlying Model: {dep.model}")
+        print(f"  Account         : {dep.account}")
         print(f"  Status          : {status_str}")
         print(f"  Attempts        : {dep.attempts}")
         print(f"  Successes       : {dep.successes}")
@@ -62,6 +99,9 @@ def print_request_execution(
     """Prints execution summary after a request."""
     print(f"\nFulfilling deployment: {deployment.display_name}")
     print(f"Provider             : {deployment.provider.title()}")
+    print(f"Logical model        : {deployment.logical_model}")
+    print(f"Underlying model     : {deployment.model}")
+    print(f"Account              : {deployment.account}")
     print(f"Total attempts       : {deployment.attempts}")
     print(f"Deployment successes : {deployment.successes}")
     if response_model:

@@ -5,7 +5,12 @@ from datetime import datetime, timezone
 import time
 from typing import Any, Dict, Optional
 
-from ntg.config import LITELLM_MODEL_NAME, OPENROUTER_FREE_MODEL
+from ntg.config import (
+    MODEL_GROUP_GEMINI,
+    MODEL_GROUP_OPENROUTER,
+    OPENROUTER_ACTUAL_MODEL,
+    OPENROUTER_LITELLM_MODEL,
+)
 
 
 def utc_string(timestamp: Optional[float] = None) -> str:
@@ -16,15 +21,15 @@ def utc_string(timestamp: Optional[float] = None) -> str:
 
 @dataclass
 class Deployment:
-    """Represents a router deployment (OpenRouter account or Gemini account+model) with runtime health state."""
+    """Provider-neutral deployment representation with metadata and health state."""
 
     id: str
     provider: str
-    name: str
+    account: str
+    model: str
+    logical_model: str
     litellm_model: str
     api_key: str
-    account_name: str = ""
-    order: int = 1
     available: bool = True
     blocked_until: float = 0.0
     blocked_reason: Optional[str] = None
@@ -34,12 +39,29 @@ class Deployment:
     rate_limits: int = 0
 
     @property
+    def deployment_id(self) -> str:
+        """Alias for id."""
+        return self.id
+
+    @property
+    def name(self) -> str:
+        """Alias for model name (backward compatibility)."""
+        return self.model
+
+    @property
+    def account_name(self) -> str:
+        """Alias for account (backward compatibility)."""
+        return self.account
+
+    @property
+    def order(self) -> int:
+        """Legacy order attribute."""
+        return 1
+
+    @property
     def display_name(self) -> str:
-        """Formatted human-readable deployment label without API keys."""
-        if self.provider == "openrouter":
-            return f"OpenRouter {self.name}"
-        acc_label = self.account_name if self.account_name else "account_1"
-        return f"Gemini {acc_label} ({self.name})"
+        """Formatted human-readable deployment label without exposing secrets."""
+        return f"{self.provider.title()} {self.account} ({self.model})"
 
     def refresh(self, now: Optional[float] = None) -> bool:
         """Restores availability if the cooldown timer has elapsed."""
@@ -75,32 +97,37 @@ class Deployment:
         current_time = now if now is not None else time.time()
         return self.refresh(current_time)
 
-    def to_deployment(self) -> Dict[str, Any]:
+    def to_litellm_dict(self) -> Dict[str, Any]:
         """Converts deployment into LiteLLM router dictionary format."""
         return {
-            "model_name": LITELLM_MODEL_NAME,
+            "model_name": self.logical_model,
             "litellm_params": {
                 "model": self.litellm_model,
                 "api_key": self.api_key,
                 "metadata": {
                     "deployment_id": self.id,
                     "provider": self.provider,
-                    "account_name": self.account_name or self.name,
-                    "deployment_name": self.name,
+                    "account": self.account,
+                    "model": self.model,
+                    "logical_model": self.logical_model,
                 },
             },
             "model_info": {
                 "id": self.id,
                 "provider": self.provider,
-                "account": self.account_name or self.name,
-                "name": self.name,
-                "order": self.order,
+                "account": self.account,
+                "model": self.model,
+                "logical_model": self.logical_model,
             },
         }
 
+    def to_deployment(self) -> Dict[str, Any]:
+        """Backward-compatible alias for to_litellm_dict."""
+        return self.to_litellm_dict()
+
 
 class Account(Deployment):
-    """Represents an OpenRouter account deployment."""
+    """Backwards-compatible OpenRouter account deployment."""
 
     def __init__(
         self,
@@ -117,13 +144,13 @@ class Account(Deployment):
     ):
         super().__init__(
             id=f"openrouter-{name}",
-            provider="openrouter",
-            name=name,
-            account_name=name,
-            litellm_model=OPENROUTER_FREE_MODEL,
+            provider=MODEL_GROUP_OPENROUTER,
+            account=name,
+            model=OPENROUTER_ACTUAL_MODEL,
+            logical_model=MODEL_GROUP_OPENROUTER,
+            litellm_model=OPENROUTER_LITELLM_MODEL,
             api_key=api_key,
-            order=order,
-            available=available,
+            available=available and bool(api_key and api_key.strip()),
             blocked_until=blocked_until,
             blocked_reason=blocked_reason,
             attempts=attempts,
@@ -134,7 +161,7 @@ class Account(Deployment):
 
 
 class GeminiDeployment(Deployment):
-    """Represents a dynamically discovered Gemini model deployment tied to a specific Gemini account."""
+    """Backwards-compatible Gemini account/model deployment."""
 
     def __init__(
         self,
@@ -152,13 +179,13 @@ class GeminiDeployment(Deployment):
     ):
         super().__init__(
             id=f"gemini-{account_name}-{model_name}",
-            provider="gemini",
-            name=model_name,
-            account_name=account_name,
+            provider=MODEL_GROUP_GEMINI,
+            account=account_name,
+            model=model_name,
+            logical_model=MODEL_GROUP_GEMINI,
             litellm_model=f"gemini/{model_name}",
             api_key=api_key,
-            order=order,
-            available=available,
+            available=available and bool(api_key and api_key.strip()),
             blocked_until=blocked_until,
             blocked_reason=blocked_reason,
             attempts=attempts,
