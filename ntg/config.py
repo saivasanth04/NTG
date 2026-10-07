@@ -39,14 +39,16 @@ def _get_env_key(key_candidates: List[str]) -> str:
 
 
 # Logical model group identifiers
+MODEL_GROUP_AUTO: str = "auto"
+MODEL_GROUP_NTG_AUTO: str = "ntg-auto"
 MODEL_GROUP_OPENROUTER: str = "openrouter"
 MODEL_GROUP_GROQ: str = "groq"
 MODEL_GROUP_NVIDIA: str = "nvidia"
 MODEL_GROUP_COHERE: str = "cohere"
 MODEL_GROUP_GEMINI: str = "gemini"
 
-# Default logical model for requests when none is specified
-DEFAULT_LOGICAL_MODEL: str = MODEL_GROUP_OPENROUTER
+# Default logical model for requests when none is specified (global multi-provider pool)
+DEFAULT_LOGICAL_MODEL: str = MODEL_GROUP_AUTO
 
 # OpenRouter configuration
 OPENROUTER_ACTUAL_MODEL: str = "nvidia/nemotron-3-ultra-550b-a55b:free"

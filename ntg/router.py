@@ -13,9 +13,11 @@ from litellm.integrations.custom_logger import CustomLogger
 
 from ntg.config import (
     DEFAULT_LOGICAL_MODEL,
+    MODEL_GROUP_AUTO,
     MODEL_GROUP_COHERE,
     MODEL_GROUP_GEMINI,
     MODEL_GROUP_GROQ,
+    MODEL_GROUP_NTG_AUTO,
     MODEL_GROUP_NVIDIA,
     MODEL_GROUP_OPENROUTER,
 )
@@ -202,9 +204,9 @@ class UnifiedNTGRouter:
 
             # Target groups:
             # 1. Provider group (e.g. openrouter, groq, nvidia, cohere, gemini)
-            # 2. Global auto group (auto, ntg-auto)
+            # 2. Global auto group (auto)
             # 3. Capability groups (coding, reasoning, vision, tool_calling)
-            groups = [dep.logical_model, "auto", "ntg-auto"]
+            groups = [dep.logical_model, MODEL_GROUP_AUTO]
 
             if dep.capabilities.coding:
                 groups.append("coding")
@@ -230,14 +232,14 @@ class UnifiedNTGRouter:
             {MODEL_GROUP_COHERE: [MODEL_GROUP_NVIDIA, MODEL_GROUP_OPENROUTER, MODEL_GROUP_GROQ]},
             {MODEL_GROUP_GROQ: [MODEL_GROUP_NVIDIA, MODEL_GROUP_OPENROUTER, MODEL_GROUP_COHERE]},
             {MODEL_GROUP_GEMINI: [MODEL_GROUP_GROQ]},
-            {"coding": ["auto"]},
-            {"reasoning": ["auto"]},
+            {"coding": [MODEL_GROUP_AUTO]},
+            {"reasoning": [MODEL_GROUP_AUTO]},
             {"vision": [MODEL_GROUP_GEMINI]},
             {"tool_calling": [MODEL_GROUP_NVIDIA, MODEL_GROUP_COHERE, MODEL_GROUP_GROQ]},
         ]
 
         # 4. Resolve default model
-        self.default_model = default_model or "auto"
+        self.default_model = default_model or DEFAULT_LOGICAL_MODEL
 
         # 5. Configure RetryPolicy with bounded request retry budget (max 2 retries)
         retry_policy = RetryPolicy(
@@ -258,7 +260,7 @@ class UnifiedNTGRouter:
             retry_policy=retry_policy,
             fallbacks=fallbacks,
             model_group_alias={
-                "ntg-auto": "auto",
+                MODEL_GROUP_NTG_AUTO: MODEL_GROUP_AUTO,
             },
         )
 
@@ -294,24 +296,64 @@ class UnifiedNTGRouter:
                 except Exception:
                     pass
 
+    def get_global_pool(self, now: Optional[float] = None) -> List[Deployment]:
+        """Return all active, eligible deployments across all configured providers.
+
+        This forms the authoritative base global deployment pool for 'auto' / 'ntg-auto'.
+        Every configured provider (OpenRouter, Groq, NVIDIA, Cohere, Gemini) with valid
+        credentials and a healthy/recovering circuit is included.
+        """
+        ts = now if now is not None else time.time()
+        pool: List[Deployment] = []
+        for dep in self.deployments:
+            dep.refresh(ts)
+            if not dep.api_key or not dep.api_key.strip():
+                continue
+            if dep.circuit_state == CircuitState.QUARANTINED:
+                continue
+            if not dep.is_available(ts):
+                continue
+            pool.append(dep)
+        return pool
+
+    def get_eligible_deployments(
+        self,
+        model_group: str = DEFAULT_LOGICAL_MODEL,
+        capabilities: Optional[ModelCapabilities | dict | list[str] | str] = None,
+        min_context: Optional[int] = None,
+        now: Optional[float] = None,
+    ) -> List[Deployment]:
+        """Public helper to inspect eligible deployments for any model group or capabilities."""
+        req_caps = self._parse_capabilities(capabilities)
+        return self._filter_eligible_deployments(
+            model_group=model_group,
+            capabilities=req_caps,
+            min_context=min_context,
+            now=now,
+        )
+
     def _filter_eligible_deployments(
         self,
         model_group: str,
         capabilities: Optional[ModelCapabilities] = None,
         min_context: Optional[int] = None,
+        now: Optional[float] = None,
     ) -> List[Deployment]:
         """NTG Eligibility Filter: evaluate health, capabilities, quotas, and circuit state."""
-        now = time.time()
+        ts = now if now is not None else time.time()
         for dep in self.deployments:
-            dep.refresh(now)
+            dep.refresh(ts)
+
+        is_global = model_group in (MODEL_GROUP_AUTO, MODEL_GROUP_NTG_AUTO, "auto", "ntg-auto")
+
+        candidates = self.get_global_pool(ts) if is_global else [
+            d
+            for d in self.deployments
+            if d.api_key and d.api_key.strip() and d.circuit_state != CircuitState.QUARANTINED and d.is_available(ts)
+        ]
 
         eligible: List[Deployment] = []
-        is_global = model_group in ("auto", "ntg-auto")
-
-        for dep in self.deployments:
-            if not dep.api_key or not dep.api_key.strip():
-                continue
-
+        for dep in candidates:
             # Check capability groups
             if model_group == "coding" and not dep.capabilities.coding:
                 continue
@@ -326,12 +368,6 @@ class UnifiedNTGRouter:
             if not is_global and model_group not in ("coding", "reasoning", "vision", "tool_calling"):
                 if dep.logical_model != model_group:
                     continue
-
-            # Check circuit breaker
-            if dep.circuit_state == CircuitState.QUARANTINED:
-                continue
-            if not dep.is_available(now):
-                continue
 
             # Check capabilities
             if capabilities and not dep.capabilities.satisfies(capabilities):
@@ -382,6 +418,8 @@ class UnifiedNTGRouter:
     ) -> Optional[Any]:
         """Route user prompt through LiteLLM Router with NTG capability & eligibility validation."""
         target_model = model or self.default_model
+        if target_model in ("ntg-auto", MODEL_GROUP_NTG_AUTO):
+            target_model = MODEL_GROUP_AUTO
         req_caps = self._parse_capabilities(capabilities)
 
         # Run NTG eligibility filter
@@ -458,6 +496,8 @@ class UnifiedNTGRouter:
     ) -> Any:
         """Execute chat completion conforming to standard OpenAI/LiteLLM signature."""
         target_model = model or self.default_model
+        if target_model in ("ntg-auto", MODEL_GROUP_NTG_AUTO):
+            target_model = MODEL_GROUP_AUTO
         req_caps = self._parse_capabilities(capabilities)
 
         eligible = self._filter_eligible_deployments(
