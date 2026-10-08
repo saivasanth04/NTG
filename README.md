@@ -9,24 +9,24 @@ A clean, production-grade, highly resilient multi-provider AI model router that 
 NTG cleanly divides responsibilities between infrastructure routing and domain intelligence:
 
 ```
-┌────────────────────────────────────────────────────────┐
-│                          NTG                           │
-│  - Capability Filtering (coding, reasoning, vision...)  │
-│  - Eligibility & Context Window Verification           │
-│  - Circuit Breaker (HEALTHY ↔ OPEN ↔ HALF_OPEN)        │
-│  - Quota Intelligence (RPM/RPD, account scopes)        │
-│  - Atomic State Persistence (.ntg/state.json)          │
-│  - Telemetry & Diagnostics (user vs upstream metrics)  │
-└──────────────────────────┬─────────────────────────────┘
-                           │ Dispatches eligible requests
-┌──────────────────────────▼─────────────────────────────┐
-│                     LiteLLM Router                     │
-│  - Distributed Routing (simple-shuffle & weights)      │
-│  - Bounded Retries (RetryPolicy, max 2 retries)        │
-│  - Upstream Cooldown Cache                             │
-│  - Compatible Fallback Chains                          │
-└────────────────────────────────────────────────────────┘
+USER REQUEST
+    ↓
+REQUEST REQUIREMENTS (tools, structured output, vision, streaming, coding, reasoning)
+    ↓
+NTG ELIGIBILITY FILTER (capability + quota + auth quarantine + circuit state + availability)
+    ↓
+ELIGIBLE DEPLOYMENT POOL (ordered with compatibility-aware fallbacks)
+    ↓
+LITELLM ROUTER (simple-shuffle load balancing + bounded retry + temporary failover)
+    ↓
+UPSTREAM PROVIDER / ACCOUNT / MODEL
+    ↓
+RESPONSE
+    ↓
+NTG TELEMETRY & PERSISTENT STATE (.ntg/state.json)
 ```
+
+LiteLLM is the **sole routing authority** (load balancing, retries, and failovers). NTG serves as the **eligibility, quota intelligence, circuit state, and telemetry layer** with zero duplicate routing loops.
 
 ---
 
@@ -39,21 +39,23 @@ NTG cleanly divides responsibilities between infrastructure routing and domain i
    - `reasoning`: Deep reasoning/thinking models (e.g., Nemotron, R1).
    - `vision`: Multimodal image processing models.
    - `tool_calling`: Function calling / tool execution support.
+   - `structured_output`: JSON Schema / structured output support.
+   - `streaming`: Server-sent event token streaming.
    - `context_window`: Verified token capacity.
 4. **Resilient Circuit Breaker**:
    - `HEALTHY`: Serving traffic normally.
    - `OPEN`: Paused after failure or rate limits (authoritative `Retry-After` / reset duration).
    - `HALF_OPEN`: Controlled single-request probing before returning to `HEALTHY`.
-   - `QUARANTINED`: Suspended on authentication (401/403) or missing model (404) errors.
+   - `AUTH_FAILED / QUARANTINED`: Suspended on authentication failure (401/403) or missing model (404) errors with backoff revalidation.
 5. **Accurate Quota & Error Handling**:
    - Parses HTTP `Retry-After` (seconds and RFC 2822 dates) and `X-RateLimit-*` headers.
    - Distinguishes RPM, RPD (daily free tier resets at 00:00 UTC), and upstream limits.
    - Propagates account-level limits to peer deployments sharing the same provider account.
-   - 400 Bad Request errors are never retried.
-6. **Thread-Safe Concurrency**: Zero shared mutable request state. Uses Python `contextvars` and event callbacks to guarantee atomic deployment attribution under high concurrency.
-7. **Local State Persistence**: Circuit breaker status, cooldown expirations, and discovery caches are atomically persisted to `.ntg/state.json` across process restarts without external database dependencies.
-8. **Dynamic Discovery with Caching**: Groq and Gemini models are discovered dynamically; discovery failures fall back to last-known-good cached models without disabling providers.
-9. **Zero Secret Exposure**: API keys are never printed, logged, or exposed in diagnostics.
+   - Client request errors (400) and capability mismatches never trip the circuit breaker.
+6. **Thread-Safe Concurrency**: Zero shared mutable request state. Uses response-level deployment metadata and LiteLLM attempt callbacks to guarantee atomic deployment attribution under high concurrency.
+7. **Local State Persistence**: Circuit breaker status, cooldown expirations, quota metadata, and discovery caches are atomically persisted to `.ntg/state.json` across process restarts without external database dependencies. API keys and secrets are NEVER persisted.
+8. **Dynamic Discovery with Resilient Caching**: Groq and Gemini models are discovered dynamically; discovery failures preserve last-known-good cached models as stale rather than dropping deployments.
+9. **Zero Secret Exposure**: API keys are never printed, logged, persisted, or exposed in diagnostics.
 
 ---
 

@@ -6,7 +6,7 @@ import time
 from typing import Any, Dict, List, Optional
 
 from ntg.config import DEFAULT_LOGICAL_MODEL
-from ntg.models import CircuitState, Deployment, utc_string
+from ntg.models import CircuitState, Deployment, sanitize_secret, utc_string
 
 
 def print_divider(title: Optional[str] = None, width: int = 70) -> None:
@@ -76,6 +76,8 @@ def print_account_status(deployments: List[Deployment]) -> None:
     for dep in deployments:
         if not dep.api_key or not dep.api_key.strip():
             status_str = "NO KEY"
+        elif dep.circuit_state == CircuitState.AUTH_FAILED:
+            status_str = "AUTH_FAILED (QUARANTINED)"
         elif dep.circuit_state == CircuitState.QUARANTINED:
             status_str = "QUARANTINED (AUTH)"
         elif dep.circuit_state == CircuitState.OPEN:
@@ -84,6 +86,9 @@ def print_account_status(deployments: List[Deployment]) -> None:
             status_str = "HALF_OPEN (PROBING)"
         else:
             status_str = "HEALTHY (ACTIVE)"
+
+        if dep.is_stale:
+            status_str += f" [STALE: {dep.stale_reason or 'Cached'}]"
 
         caps_tags = ", ".join(dep.capabilities.to_tags()) or "general"
 
@@ -97,18 +102,31 @@ def print_account_status(deployments: List[Deployment]) -> None:
         print(
             f"  Telemetry       : User reqs: {dep.metrics.user_requests} | Upstream attempts: {dep.metrics.upstream_attempts} | Success: {dep.metrics.successes} | Fail: {dep.metrics.failures}"
         )
-        if dep.metrics.rate_limits > 0 or dep.metrics.auth_errors > 0:
-            print(
-                f"  Errors Breakdown: Rate Limits: {dep.metrics.rate_limits} | Auth Errors: {dep.metrics.auth_errors}"
-            )
+        print(
+            f"  Errors Breakdown: Rate Limits: {dep.metrics.rate_limits} | Auth Failures: {dep.metrics.auth_failures}"
+        )
         if dep.quota.quota_scope:
-            print(
-                f"  Quota Scope     : {dep.quota.quota_scope} (limit type: {dep.quota.limit_type or 'unspecified'})"
-            )
+            scope_str = f"  Quota Scope     : {dep.quota.quota_scope}"
+            if dep.quota.limit_type:
+                scope_str += f" (limit type: {dep.quota.limit_type})"
+            print(scope_str)
+
+        quota_parts = []
+        if dep.rpm_limit is not None or dep.rpm_remaining is not None:
+            rem = dep.rpm_remaining if dep.rpm_remaining is not None else "?"
+            lim = dep.rpm_limit if dep.rpm_limit is not None else "?"
+            quota_parts.append(f"RPM: {rem}/{lim}")
+        if dep.rpd_limit is not None or dep.rpd_remaining is not None:
+            rem = dep.rpd_remaining if dep.rpd_remaining is not None else "?"
+            lim = dep.rpd_limit if dep.rpd_limit is not None else "?"
+            quota_parts.append(f"RPD: {rem}/{lim}")
+        if quota_parts:
+            print(f"  Quota Status    : {', '.join(quota_parts)}")
+
         if dep.remaining_cooldown > 0:
             print(f"  Cooldown left   : {dep.remaining_cooldown:.1f}s")
         if dep.blocked_reason:
-            print(f"  Last reason     : {dep.blocked_reason}")
+            print(f"  Last reason     : {sanitize_secret(dep.blocked_reason, dep.api_key)}")
 
 
 def print_request_execution(
@@ -123,7 +141,7 @@ def print_request_execution(
     print(f"Account              : {deployment.account}")
     print(f"Circuit State        : {deployment.circuit_state.value}")
     print(
-        f"Telemetry            : User reqs: {deployment.metrics.user_requests} | Upstream attempts: {deployment.metrics.upstream_attempts} | Success: {deployment.metrics.successes}"
+        f"Telemetry            : User reqs: {deployment.metrics.user_requests} | Upstream attempts: {deployment.metrics.upstream_attempts} | Success: {deployment.metrics.successes} | Fail: {deployment.metrics.failures}"
     )
     if response_model:
         print(f"Response model       : {response_model}")

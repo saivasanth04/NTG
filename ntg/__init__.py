@@ -7,10 +7,12 @@ from ntg.config import (
     DEFAULT_GEMINI_KEYS,
     DEFAULT_KEYS,
     DEFAULT_LOGICAL_MODEL,
+    DEFAULT_NUM_RETRIES,
     GEMINI_API_KEY,
     GEMINI_KEYS,
     GROQ_KEYS,
     LITELLM_MODEL_NAME,
+    MAX_RETRY_BUDGET,
     MODEL_GROUP_AUTO,
     MODEL_GROUP_COHERE,
     MODEL_GROUP_GEMINI,
@@ -25,6 +27,7 @@ from ntg.config import (
     OPENROUTER_FREE_MODEL,
     OPENROUTER_KEYS,
     OPENROUTER_LITELLM_MODEL,
+    PROVIDER_FALLBACKS,
 )
 from ntg.diagnostics import print_account_status, print_banner, print_request_execution
 from ntg.discovery import (
@@ -52,9 +55,16 @@ from ntg.models import (
     GeminiDeployment,
     ModelCapabilities,
     QuotaInfo,
+    QuotaScope,
     utc_string,
 )
-from ntg.router import OpenRouterFallbackRouter, UnifiedNTGRouter
+from ntg.router import (
+    NoEligibleDeploymentsError,
+    OpenRouterFallbackRouter,
+    RequestRequirements,
+    UnifiedNTGRouter,
+    extract_request_requirements,
+)
 from ntg.state import StateManager
 
 __all__ = [
@@ -64,9 +74,13 @@ __all__ = [
     "CircuitState",
     "ModelCapabilities",
     "QuotaInfo",
+    "QuotaScope",
     "DeploymentMetrics",
     "StateManager",
     "ParsedErrorInfo",
+    "NoEligibleDeploymentsError",
+    "RequestRequirements",
+    "extract_request_requirements",
     "UnifiedNTGRouter",
     "OpenRouterFallbackRouter",
     "OPENROUTER_ACTUAL_MODEL",
@@ -78,6 +92,9 @@ __all__ = [
     "COHERE_LITELLM_MODEL",
     "LITELLM_MODEL_NAME",
     "DEFAULT_LOGICAL_MODEL",
+    "DEFAULT_NUM_RETRIES",
+    "MAX_RETRY_BUDGET",
+    "PROVIDER_FALLBACKS",
     "MODEL_GROUP_AUTO",
     "MODEL_GROUP_NTG_AUTO",
     "MODEL_GROUP_OPENROUTER",

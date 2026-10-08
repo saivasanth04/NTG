@@ -50,6 +50,19 @@ MODEL_GROUP_GEMINI: str = "gemini"
 # Default logical model for requests when none is specified (global multi-provider pool)
 DEFAULT_LOGICAL_MODEL: str = MODEL_GROUP_AUTO
 
+# Bounded retry budget configuration (never derived from deployment count)
+DEFAULT_NUM_RETRIES: int = 1
+MAX_RETRY_BUDGET: int = 2
+
+# Simple deployment circuit breaker configuration
+CIRCUIT_BREAKER_MAX_FAILURES: int = int(os.getenv("NTG_CIRCUIT_BREAKER_MAX_FAILURES", "3"))
+CIRCUIT_BREAKER_RECOVERY_TIME: float = float(os.getenv("NTG_CIRCUIT_BREAKER_RECOVERY_TIME", "30.0"))
+CIRCUIT_BREAKER_HALF_OPEN_PROBES: int = 1
+
+# Explicit cross-provider fallback mappings (empty by default so provider-specific
+# requests never jump to unrelated providers unless explicitly configured)
+PROVIDER_FALLBACKS: Dict[str, List[str]] = {}
+
 # OpenRouter configuration
 OPENROUTER_ACTUAL_MODEL: str = "nvidia/nemotron-3-ultra-550b-a55b:free"
 OPENROUTER_LITELLM_MODEL: str = f"openrouter/{OPENROUTER_ACTUAL_MODEL}"

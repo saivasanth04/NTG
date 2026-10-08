@@ -28,10 +28,34 @@ def main() -> None:
 
     router = UnifiedNTGRouter()
 
+    # Check for help flag
+    if "--help" in args or "-h" in args:
+        print_banner(deployments=router.deployments, default_model=router.default_model)
+        print("Usage: python main.py [OPTIONS] [PROMPT]\n")
+        print("Options:")
+        print("  --model <name>          Route to specific model group (auto, groq, openrouter, gemini, etc.)")
+        print("  --capability <caps>     Filter by comma-separated capabilities (coding, vision, reasoning, etc.)")
+        print("  --status                Display detailed status table of all deployments and quotas")
+        print("  --rediscover            Force authoritative discovery of models across provider accounts")
+        print("  --reset-state           Reset persisted routing state, circuit breakers, and metrics")
+        print("  -h, --help              Show this help message and exit\n")
+        return
+
     # Check for status flag
     if "--status" in args:
         print_banner(deployments=router.deployments, default_model=router.default_model)
         print_account_status(router.deployments)
+        return
+
+    # Check for rediscover flag
+    if "--rediscover" in args:
+        print("Re-probing models via provider APIs...")
+        res = router.rediscover_models(force=True)
+        print("Rediscovery completed:")
+        for k, v in res.get("success", {}).items():
+            print(f"  + {k}: {v} models discovered")
+        for k, v in res.get("failed", {}).items():
+            print(f"  ! {k}: {v}")
         return
 
     selected_model = None

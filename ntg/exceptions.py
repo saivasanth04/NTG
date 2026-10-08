@@ -10,6 +10,8 @@ from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from typing import Any
 
+from ntg.models import QuotaScope, parse_duration_string, parse_reset_header, sanitize_secret
+
 CATEGORY_DAILY_QUOTA = "ACCOUNT_DAILY_QUOTA_EXHAUSTED"
 CATEGORY_PROVIDER_LIMIT = "UPSTREAM_PROVIDER_RATE_LIMIT"
 CATEGORY_UNKNOWN_LIMIT = "UNKNOWN_RATE_LIMIT"
@@ -31,18 +33,25 @@ class ParsedErrorInfo:
     cooldown_seconds: float
     reset_timestamp: float | None
     limit_type: str | None  # "rpm", "rpd", "tpm", "quota", "auth", "server", "bad_request", "not_found"
-    quota_scope: str  # "deployment", "account", "provider"
+    quota_scope: str  # "provider", "account", "model", "account_model", "unknown"
     provider_name: str | None
     message: str
     limit: str | None = None
     remaining: str | None = None
     remedy: str | None = None
     raw_payload: dict[str, Any] | None = None
+    rpm_limit: int | None = None
+    rpm_remaining: int | None = None
+    rpd_limit: int | None = None
+    rpd_remaining: int | None = None
+    reset_source: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dict representation for backward compatibility."""
         res = asdict(self)
         res["payload"] = self.raw_payload
+        res["reset_at"] = self.reset_timestamp
+        res["retry_after"] = self.cooldown_seconds
         return res
 
 
@@ -100,87 +109,91 @@ def _header(headers: Any, name: str) -> Any:
     return None
 
 
-def parse_duration_string(val: str) -> float | None:
-    """Parse duration strings like '6m0s', '12s', '250ms', '1.5s', '1h30m' into seconds."""
-    if not val or not isinstance(val, str):
-        return None
-    val = val.strip().lower()
+def resolve_rate_limit_reset(
+    headers: dict[str, Any],
+    metadata: dict[str, Any],
+    error: Exception | None = None,
+    err_lower: str = "",
+    is_daily: bool = False,
+) -> tuple[float, float, str]:
+    """Resolve (reset_timestamp, cooldown_seconds, priority_source) using strict priority:
 
-    # Try pure float first
-    try:
-        return max(1.0, float(val))
-    except ValueError:
-        pass
-
-    # Milliseconds e.g. "250ms"
-    ms_match = re.fullmatch(r"(\d+(?:\.\d+)?)\s*ms", val)
-    if ms_match:
-        return max(0.5, float(ms_match.group(1)) / 1000.0)
-
-    # Complex duration e.g. "1h2m3.5s" or "6m0s"
-    pattern = r"^(?:(\d+(?:\.\d+)?)\s*h)?\s*(?:(\d+(?:\.\d+)?)\s*m)?\s*(?:(\d+(?:\.\d+)?)\s*s)?$"
-    m = re.match(pattern, val)
-    if m and (m.group(1) or m.group(2) or m.group(3)):
-        hours = float(m.group(1) or 0)
-        minutes = float(m.group(2) or 0)
-        seconds = float(m.group(3) or 0)
-        total = hours * 3600.0 + minutes * 60.0 + seconds
-        return max(1.0, total)
-
-    return None
-
-
-def parse_reset_header(raw: Any) -> tuple[float | None, float | None]:
-    """Parse a reset header into (reset_timestamp, cooldown_seconds).
-
-    Supports:
-    - Numeric epoch milliseconds (> 1e11)
-    - Numeric epoch seconds (> 1e9)
-    - Relative seconds (< 1e7)
-    - Duration strings ('6m0s', '250ms')
-    - HTTP date format (RFC 2822)
+    Priority 1: Retry-After header
+    Priority 2: Authoritative reset timestamp header (x-ratelimit-reset, ratelimit-reset)
+    Priority 3: Provider-specific rate-limit headers (x-ratelimit-reset-requests, x-ratelimit-reset-tokens, etc.)
+    Priority 4: Structured LiteLLM/provider metadata & error text duration
+    Priority 5: Conservative fallback cooldown only when no authoritative information exists.
     """
-    if raw is None:
-        return None, None
-
     now = time.time()
-    raw_str = str(raw).strip()
 
-    # Check for duration string first (e.g. 6m0s or 500ms)
-    duration = parse_duration_string(raw_str)
-    if duration is not None and not raw_str.replace(".", "", 1).isdigit():
-        return now + duration, duration
+    # Priority 1: Retry-After header
+    retry_after_raw = _header(headers, "retry-after")
+    if retry_after_raw is not None:
+        ts, cd = parse_reset_header(retry_after_raw)
+        if cd is not None and ts is not None:
+            return ts, max(0.5, cd), "retry_after_header"
 
-    # Check numeric values
-    try:
-        num = float(raw_str)
-        if num > 1e11:
-            # Epoch milliseconds
-            ts = num / 1000.0
-            cd = max(1.0, ts - now)
-            return ts, cd
-        elif num > 1e9:
-            # Epoch seconds
-            ts = num
-            cd = max(1.0, ts - now)
-            return ts, cd
-        else:
-            # Relative seconds
-            cd = max(1.0, num)
-            return now + cd, cd
-    except ValueError:
-        pass
+    # Priority 2: Authoritative reset timestamp header
+    for h_name in ("x-ratelimit-reset", "ratelimit-reset"):
+        raw_val = _header(headers, h_name)
+        if raw_val is not None:
+            ts, cd = parse_reset_header(raw_val)
+            if cd is not None and ts is not None:
+                return ts, max(0.5, cd), f"reset_timestamp_header:{h_name}"
 
-    # Check HTTP date format (e.g., 'Wed, 21 Oct 2026 07:28:00 GMT')
-    try:
-        dt = parsedate_to_datetime(raw_str)
-        ts = dt.timestamp()
-        cd = max(1.0, ts - now)
-        return ts, cd
-    except Exception:
-        pass
+    # Priority 3: Provider-specific rate-limit headers
+    for h_name in (
+        "x-ratelimit-reset-requests",
+        "x-ratelimit-reset-tokens",
+        "x-ratelimit-reset-requests-day",
+        "x-ratelimit-reset-day",
+        "x-goog-ratelimit-reset",
+        "anthropic-ratelimit-requests-reset",
+        "anthropic-ratelimit-tokens-reset",
+        "openai-ratelimit-reset-requests",
+        "openai-ratelimit-reset-tokens",
+    ):
+        raw_val = _header(headers, h_name)
+        if raw_val is not None:
+            ts, cd = parse_reset_header(raw_val)
+            if cd is not None and ts is not None:
+                return ts, max(0.5, cd), f"provider_header:{h_name}"
 
-    return None, None
+    # Priority 4: Structured LiteLLM / provider metadata & error text duration
+    # 4a. Exception attributes and metadata dict
+    meta_candidates: list[Any] = []
+    if error is not None:
+        for attr in ("retry_after", "reset_at", "reset_timestamp", "retry_after_seconds"):
+            val = getattr(error, attr, None)
+            if val is not None:
+                meta_candidates.append(val)
+    if isinstance(metadata, dict):
+        for key in ("retry_after", "retry_after_seconds", "reset_at", "reset_timestamp", "reset", "reset_seconds"):
+            val = metadata.get(key)
+            if val is not None:
+                meta_candidates.append(val)
+
+    for meta_val in meta_candidates:
+        ts, cd = parse_reset_header(meta_val)
+        if cd is not None and ts is not None:
+            return ts, max(0.5, cd), "structured_metadata"
+
+    # 4b. Error text duration (e.g. "try again in 6m0s", "resets in 45s", "wait 12.5s")
+    if err_lower:
+        retry_match = re.search(r"(?:try again in|resets? in|wait)\s+([0-9a-z.]+)", err_lower)
+        if retry_match:
+            dur = parse_duration_string(retry_match.group(1))
+            if dur is not None:
+                return now + dur, max(0.5, dur), "error_text_duration"
+
+    # Priority 5: Conservative fallback cooldown only when no authoritative info exists
+    if is_daily:
+        cd = seconds_until_utc_midnight()
+        return now + cd, cd, "fallback_utc_midnight"
+
+    # Conservative short fallback for RPM / unknown limits (default 60s)
+    cd = 60.0
+    return now + cd, cd, "fallback_conservative_short"
 
 
 def seconds_until_utc_midnight() -> float:
@@ -199,20 +212,25 @@ def parse_provider_error(error: Exception, provider: str = "") -> ParsedErrorInf
     metadata = err_data.get("metadata") if isinstance(err_data.get("metadata"), dict) else {}
     headers = metadata.get("headers") if isinstance(metadata.get("headers"), dict) else {}
 
-    # Check if error has response headers directly
-    resp = getattr(error, "response", None)
-    if resp is not None and hasattr(resp, "headers"):
-        resp_headers = getattr(resp, "headers")
-        if isinstance(resp_headers, dict) or hasattr(resp_headers, "items"):
-            # Merge with response headers
+    # Collect all available headers from exception and response objects
+    for h_src in [
+        getattr(error, "headers", None),
+        getattr(error, "response_headers", None),
+        payload.get("headers"),
+        metadata.get("headers"),
+        getattr(getattr(error, "response", None), "headers", None),
+        getattr(getattr(error, "raw_response", None), "headers", None),
+    ]:
+        if h_src and (isinstance(h_src, dict) or hasattr(h_src, "items")):
             try:
-                for k, v in dict(resp_headers).items():
+                for k, v in dict(h_src).items():
                     if k not in headers:
                         headers[k] = v
             except Exception:
                 pass
 
     status_code = getattr(error, "status_code", None)
+    resp = getattr(error, "response", None) or getattr(error, "raw_response", None)
     if status_code is None and resp is not None:
         status_code = getattr(resp, "status_code", None)
 
@@ -234,6 +252,28 @@ def parse_provider_error(error: Exception, provider: str = "") -> ParsedErrorInf
     limit_val = _header(headers, "x-ratelimit-limit") or _header(headers, "x-ratelimit-limit-requests")
     rem_val = _header(headers, "x-ratelimit-remaining") or _header(headers, "x-ratelimit-remaining-requests")
 
+    # Header-level numerical quota values
+    rpm_limit = None
+    rpm_remaining = None
+    rpd_limit = None
+    rpd_remaining = None
+
+    raw_req_lim = _header(headers, "x-ratelimit-limit-requests")
+    if raw_req_lim and str(raw_req_lim).isdigit():
+        rpm_limit = int(raw_req_lim)
+
+    raw_req_rem = _header(headers, "x-ratelimit-remaining-requests")
+    if raw_req_rem and str(raw_req_rem).isdigit():
+        rpm_remaining = int(raw_req_rem)
+
+    raw_rpd_lim = _header(headers, "x-ratelimit-limit-requests-day") or _header(headers, "x-ratelimit-limit-day")
+    if raw_rpd_lim and str(raw_rpd_lim).isdigit():
+        rpd_limit = int(raw_rpd_lim)
+
+    raw_rpd_rem = _header(headers, "x-ratelimit-remaining-requests-day") or _header(headers, "x-ratelimit-remaining-day")
+    if raw_rpd_rem and str(raw_rpd_rem).isdigit():
+        rpd_remaining = int(raw_rpd_rem)
+
     # Determine reset timestamp and cooldown
     reset_ts = None
     cooldown = None
@@ -254,7 +294,7 @@ def parse_provider_error(error: Exception, provider: str = "") -> ParsedErrorInf
             cooldown_seconds=0.0,
             reset_timestamp=None,
             limit_type="bad_request",
-            quota_scope="deployment",
+            quota_scope=QuotaScope.UNKNOWN,
             provider_name=provider_name,
             message=msg,
             raw_payload=payload,
@@ -270,7 +310,7 @@ def parse_provider_error(error: Exception, provider: str = "") -> ParsedErrorInf
             cooldown_seconds=86400.0,
             reset_timestamp=None,
             limit_type="not_found",
-            quota_scope="deployment",
+            quota_scope=QuotaScope.MODEL,
             provider_name=provider_name,
             message=msg,
             raw_payload=payload,
@@ -287,18 +327,20 @@ def parse_provider_error(error: Exception, provider: str = "") -> ParsedErrorInf
         or "permission_denied" in err_lower
         or "authentication" in err_lower
     ):
+        safe_msg = sanitize_secret(msg)
         return ParsedErrorInfo(
             category=CATEGORY_AUTH_ERROR,
             status_code=status_code or 401,
-            is_retryable=True,
+            is_retryable=False,
             should_quarantine=True,
-            cooldown_seconds=86400.0,
+            cooldown_seconds=0.0,
             reset_timestamp=None,
             limit_type="auth",
-            quota_scope="account",
+            quota_scope=QuotaScope.ACCOUNT,
             provider_name=provider_name,
-            message=msg,
+            message=safe_msg,
             raw_payload=payload,
+            reset_source="auth_quarantine",
         )
 
     # 4. Status 429 Rate Limit / Quota Exhaustion
@@ -319,45 +361,72 @@ def parse_provider_error(error: Exception, provider: str = "") -> ParsedErrorInf
             or "per day" in err_lower
             or "rpd" in err_lower
             or "free tier limit" in err_lower
+            or "requests/day" in err_lower
+            or (rpd_remaining is not None and rpd_remaining == 0)
         )
         is_rpm = "per minute" in err_lower or "rpm" in err_lower
         is_tpm = "token" in err_lower or "tpm" in err_lower
 
+        # Extract limits/used from error text if present (e.g. Groq "Limit 30, Used 30")
+        limit_match = re.search(r"limit\s+(\d+)", err_lower)
+        used_match = re.search(r"used\s+(\d+)", err_lower)
+        parsed_text_limit = int(limit_match.group(1)) if limit_match else None
+        parsed_text_used = int(used_match.group(1)) if used_match else None
+        parsed_text_rem = max(0, parsed_text_limit - parsed_text_used) if (parsed_text_limit is not None and parsed_text_used is not None) else None
+
+        # 1. Distinguish Category, limit_type, and quota_scope
         if is_daily:
             category = CATEGORY_DAILY_QUOTA
             limit_type = "rpd"
-            quota_scope = "account"
-            if cooldown is None:
-                cooldown = seconds_until_utc_midnight()
-                reset_ts = time.time() + cooldown
-        elif is_rpm:
+            rpd_remaining = 0
+            day_match = re.search(r"(\d+)\s*requests/day", err_lower)
+            if day_match:
+                rpd_limit = rpd_limit or int(day_match.group(1))
+            rpd_limit = rpd_limit or parsed_text_limit
+
+            if p_lower == "groq" or "groq" in err_lower:
+                quota_scope = QuotaScope.ACCOUNT_MODEL
+            elif p_lower in ("openrouter", "gemini", "cohere", "nvidia"):
+                quota_scope = QuotaScope.ACCOUNT
+            else:
+                quota_scope = QuotaScope.ACCOUNT if provider_name else QuotaScope.UNKNOWN
+
+        elif is_rpm or is_tpm or p_lower in ("groq", "gemini", "openrouter", "cohere", "nvidia"):
             category = CATEGORY_PROVIDER_LIMIT
-            limit_type = "rpm"
-            quota_scope = "deployment"
-            if cooldown is None:
-                cooldown = 60.0
-                reset_ts = time.time() + cooldown
-        elif is_tpm:
-            category = CATEGORY_PROVIDER_LIMIT
-            limit_type = "tpm"
-            quota_scope = "deployment"
-            if cooldown is None:
-                cooldown = 30.0
-                reset_ts = time.time() + cooldown
+            limit_type = "tpm" if is_tpm else "rpm"
+            rpm_limit = rpm_limit or parsed_text_limit
+            rpm_remaining = rpm_remaining if rpm_remaining is not None else (parsed_text_rem if parsed_text_rem is not None else 0)
+
+            if p_lower == "groq" or "groq" in err_lower or "model `" in err_lower:
+                quota_scope = QuotaScope.ACCOUNT_MODEL
+            elif p_lower == "gemini" or "generativelanguage" in err_lower:
+                quota_scope = QuotaScope.ACCOUNT_MODEL
+            elif p_lower in ("openrouter", "cohere", "nvidia"):
+                quota_scope = QuotaScope.ACCOUNT
+            else:
+                quota_scope = QuotaScope.PROVIDER if provider_name else QuotaScope.UNKNOWN
+
         else:
-            category = CATEGORY_PROVIDER_LIMIT if provider_name else CATEGORY_UNKNOWN_LIMIT
+            # Unknown 429
+            category = CATEGORY_UNKNOWN_LIMIT
             limit_type = "quota"
-            quota_scope = "deployment"
-            if cooldown is None:
-                cooldown = 60.0
-                reset_ts = time.time() + cooldown
+            quota_scope = QuotaScope.UNKNOWN
+
+        # 2. Resolve reset timestamp and cooldown via strict 5-level priority
+        reset_ts, cooldown, reset_source = resolve_rate_limit_reset(
+            headers=headers,
+            metadata=metadata,
+            error=error,
+            err_lower=err_lower,
+            is_daily=is_daily,
+        )
 
         return ParsedErrorInfo(
             category=category,
             status_code=429,
             is_retryable=True,
             should_quarantine=False,
-            cooldown_seconds=max(1.0, cooldown),
+            cooldown_seconds=cooldown,
             reset_timestamp=reset_ts,
             limit_type=limit_type,
             quota_scope=quota_scope,
@@ -367,6 +436,11 @@ def parse_provider_error(error: Exception, provider: str = "") -> ParsedErrorInf
             remaining=rem_val,
             remedy=remedy,
             raw_payload=payload,
+            rpm_limit=rpm_limit,
+            rpm_remaining=rpm_remaining,
+            rpd_limit=rpd_limit,
+            rpd_remaining=rpd_remaining,
+            reset_source=reset_source,
         )
 
     # 5. Status 500 / 502 / 503 / 504 / Timeout Upstream Server Error
@@ -425,3 +499,7 @@ def classify_gemini_error(error: Exception) -> dict[str, Any]:
 def classify_provider_error(error: Exception, provider: str = "") -> dict[str, Any]:
     """Unified error classifier across all providers (returns dict for backward compat)."""
     return parse_provider_error(error, provider=provider).to_dict()
+
+
+# Alias for convenience
+classify_exception = parse_provider_error
