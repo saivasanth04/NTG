@@ -101,58 +101,18 @@ def classify_discovery_error(
 
 
 def infer_groq_capabilities(model_id: str, context_window: int = 8192) -> ModelCapabilities:
-    """Infer normalized ModelCapabilities for a Groq model using provider metadata and model characteristics."""
-    m_lower = model_id.lower()
+    """Infer normalized ModelCapabilities for a Groq model using provider metadata.
 
-    # Tool calling support on Groq: supported on Llama 3.1/3.3, Mixtral; disabled on DeepSeek R1 distill
-    if any(kw in m_lower for kw in ("r1", "deepseek-r1")):
-        tool_calling: Optional[bool] = False
-    elif any(kw in m_lower for kw in ("tool", "llama-3.3", "llama-3.1", "mixtral-8x7b", "qwen-2.5")):
-        tool_calling = True
-    elif "guard" in m_lower or "whisper" in m_lower:
-        tool_calling = False
-    else:
-        tool_calling = None
-
-    # Coding capabilities
-    if any(kw in m_lower for kw in ("coder", "code", "llama-3.3", "llama-3.1-70b", "deepseek", "qwen-2.5")):
-        coding: Optional[bool] = True
-    elif any(kw in m_lower for kw in ("llama-3.1", "gemma", "mistral", "mixtral")):
-        coding = True
-    elif "guard" in m_lower or "whisper" in m_lower:
-        coding = False
-    else:
-        coding = None
-
-    # Reasoning / thinking capabilities
-    if any(kw in m_lower for kw in ("r1", "reasoning", "thinking")):
-        reasoning: Optional[bool] = True
-    elif any(kw in m_lower for kw in ("llama-3.3-70b", "llama-3.1-70b", "deepseek")):
-        reasoning = True
-    elif "guard" in m_lower or "whisper" in m_lower or "8b" in m_lower:
-        reasoning = False
-    else:
-        reasoning = None
-
-    # Vision capabilities
-    if any(kw in m_lower for kw in ("vision", "llava", "scenecap")):
-        vision: Optional[bool] = True
-    else:
-        vision = False
-
-    # Structured output (Groq chat API supports json_object / json_schema for standard chat models)
-    structured_output: Optional[bool] = False if ("guard" in m_lower or "whisper" in m_lower) else True
-
-    # Streaming
-    streaming: Optional[bool] = True
-
+    Per Rule 3 (Evidence-based capabilities), values are NOT inferred from model name substrings.
+    Streaming and context window are authoritative from Groq API / HTTP SSE.
+    """
     return ModelCapabilities(
-        coding=coding,
-        reasoning=reasoning,
-        vision=vision,
-        tool_calling=tool_calling,
-        structured_output=structured_output,
-        streaming=streaming,
+        coding=None,
+        reasoning=None,
+        vision=None,
+        tool_calling=None,
+        structured_output=None,
+        streaming=True,
         context_window=context_window,
     )
 
@@ -347,7 +307,10 @@ def infer_openrouter_capabilities(
     model_id: str = OPENROUTER_ACTUAL_MODEL,
     state_manager: Optional[StateManager] = None,
 ) -> ModelCapabilities:
-    """Infer capabilities for an OpenRouter model using authoritative metadata from OpenRouter API or cache."""
+    """Infer capabilities for an OpenRouter model using authoritative metadata from OpenRouter API or cache.
+
+    Per Rule 3 (Evidence-based capabilities), uses verified parameters and architecture modalities.
+    """
     cache_key = f"openrouter_model_{model_id.replace('/', '_').replace(':', '_')}"
     model_meta = None
     if state_manager:
@@ -378,25 +341,26 @@ def infer_openrouter_capabilities(
                 state_manager.mark_discovery_stale(cache_key, reason=detail, error_type=cat.value)
 
     if isinstance(model_meta, dict):
-        context_window = int(model_meta.get("context_length") or 1000000)
-        arch = model_meta.get("architecture", {}) or {}
+        context_window = int(model_meta.get("context_length") or 4096)
+        arch = model_meta.get("architecture") or {}
         input_mods = arch.get("input_modalities", [])
-        vision: Optional[bool] = ("image" in input_mods) if input_mods else False
-        params = model_meta.get("supported_parameters", []) or []
-        tool_calling: Optional[bool] = ("tools" in params) if params else True
-        reasoning: Optional[bool] = (
-            ("reasoning" in params or "include_reasoning" in params or bool(model_meta.get("reasoning")))
-            if params
-            else True
-        )
-        structured_output: Optional[bool] = (
-            ("structured_outputs" in params or "response_format" in params)
-            if params
-            else True
-        )
-        coding: Optional[bool] = True
+        modality = str(arch.get("modality", ""))
+        vision: Optional[bool] = ("image" in input_mods or "image" in modality) if (input_mods or modality) else None
+        params = model_meta.get("supported_parameters")
+        if isinstance(params, list):
+            tool_calling: Optional[bool] = ("tools" in params)
+            reasoning: Optional[bool] = (
+                True if ("reasoning" in params or "include_reasoning" in params or bool(model_meta.get("reasoning")))
+                else None
+            )
+            structured_output: Optional[bool] = ("structured_outputs" in params or "response_format" in params)
+        else:
+            tool_calling = None
+            reasoning = None
+            structured_output = None
+
         return ModelCapabilities(
-            coding=coding,
+            coding=None,
             reasoning=reasoning,
             vision=vision,
             tool_calling=tool_calling,
@@ -405,15 +369,14 @@ def infer_openrouter_capabilities(
             context_window=context_window,
         )
 
-    # Authoritative known specs for default Nemotron 3 Ultra
     return ModelCapabilities(
-        coding=True,
-        reasoning=True,
-        vision=False,
-        tool_calling=True,
-        structured_output=True,
+        coding=None,
+        reasoning=None,
+        vision=None,
+        tool_calling=None,
+        structured_output=None,
         streaming=True,
-        context_window=1000000,
+        context_window=4096,
     )
 
 
@@ -517,25 +480,18 @@ def build_groq_deployments(
 
 
 def infer_nvidia_capabilities(model_id: str = NVIDIA_ACTUAL_MODEL) -> ModelCapabilities:
-    """Infer normalized ModelCapabilities for an NVIDIA NIM model."""
-    m_lower = model_id.lower()
+    """Infer normalized ModelCapabilities for an NVIDIA NIM model.
 
-    coding: Optional[bool] = True if ("nemotron" in m_lower or "llama" in m_lower or "code" in m_lower) else None
-    reasoning: Optional[bool] = True if ("nemotron" in m_lower or "reason" in m_lower or "r1" in m_lower) else None
-    vision: Optional[bool] = True if ("vision" in m_lower or "multimodal" in m_lower or "fuyu" in m_lower) else False
-    tool_calling: Optional[bool] = True if ("nemotron" in m_lower or "llama" in m_lower) else None
-    structured_output: Optional[bool] = True
-    streaming: Optional[bool] = True
-    context_window = 262144 if "nemotron-3.5" in m_lower else 131072
-
+    Per Rule 3 (Evidence-based capabilities), values are NOT inferred from model name substrings.
+    """
     return ModelCapabilities(
-        coding=coding,
-        reasoning=reasoning,
-        vision=vision,
-        tool_calling=tool_calling,
-        structured_output=structured_output,
-        streaming=streaming,
-        context_window=context_window,
+        coding=None,
+        reasoning=None,
+        vision=None,
+        tool_calling=None,
+        structured_output=None,
+        streaming=True,
+        context_window=131072,
     )
 
 
@@ -574,25 +530,18 @@ def build_nvidia_deployments(
 
 
 def infer_cohere_capabilities(model_id: str = COHERE_ACTUAL_MODEL) -> ModelCapabilities:
-    """Infer normalized ModelCapabilities for a Cohere model."""
-    m_lower = model_id.lower()
+    """Infer normalized ModelCapabilities for a Cohere model.
 
-    coding: Optional[bool] = True if ("code" in m_lower or "command" in m_lower) else None
-    reasoning: Optional[bool] = True if ("code" in m_lower or "command-r" in m_lower or "reason" in m_lower) else None
-    vision: Optional[bool] = True if "vision" in m_lower else False
-    tool_calling: Optional[bool] = True if ("command" in m_lower or "code" in m_lower) else None
-    structured_output: Optional[bool] = True
-    streaming: Optional[bool] = True
-    context_window = 128000
-
+    Per Rule 3 (Evidence-based capabilities), values are NOT inferred from model name substrings.
+    """
     return ModelCapabilities(
-        coding=coding,
-        reasoning=reasoning,
-        vision=vision,
-        tool_calling=tool_calling,
-        structured_output=structured_output,
-        streaming=streaming,
-        context_window=context_window,
+        coding=None,
+        reasoning=None,
+        vision=None,
+        tool_calling=None,
+        structured_output=None,
+        streaming=True,
+        context_window=128000,
     )
 
 
@@ -646,11 +595,6 @@ def build_gemini_deployments(
         deployments: List[Deployment] = []
         for gdep in raw_deps:
             caps = getattr(gdep, "capabilities", None) or ModelCapabilities(
-                coding=True,
-                reasoning=True,
-                vision=True,
-                tool_calling=True,
-                structured_output=True,
                 streaming=True,
                 context_window=1048576,
             )

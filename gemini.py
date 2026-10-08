@@ -71,46 +71,23 @@ def discover_models(
 
 
 def infer_gemini_capabilities(model_dict: Dict[str, Any]) -> ModelCapabilities:
-    """Infer normalized ModelCapabilities for a Gemini model using authoritative SDK metadata."""
-    name = model_dict.get("name", "").lower()
-    description = (model_dict.get("description") or "").lower()
-    input_limit = model_dict.get("input_token_limit")
+    """Infer normalized ModelCapabilities for a Gemini model using authoritative SDK metadata.
 
-    # Authoritative context window from SDK
+    Per Rule 3 (Evidence-based capabilities), values are NOT inferred from model name substrings.
+    """
+    input_limit = model_dict.get("input_token_limit")
     context_window = int(input_limit) if input_limit and input_limit > 0 else 1048576
 
-    # Thinking / reasoning: SDK model.thinking boolean is authoritative if present
     sdk_thinking = model_dict.get("thinking")
-    if sdk_thinking is not None:
-        reasoning: Optional[bool] = bool(sdk_thinking)
-    elif "thinking" in name or "think" in description or "pro" in name or "flash" in name:
-        reasoning = True
-    elif "gemini" in name:
-        reasoning = True
-    else:
-        reasoning = None
-
-    # Multimodal vision: Gemini 1.5, 2.0, 2.5 are natively multimodal
-    if "gemini" in name:
-        vision: Optional[bool] = True
-        coding: Optional[bool] = True
-        tool_calling: Optional[bool] = True
-        structured_output: Optional[bool] = True
-        streaming: Optional[bool] = True
-    else:
-        vision = None
-        coding = None
-        tool_calling = None
-        structured_output = None
-        streaming = True
+    reasoning: Optional[bool] = bool(sdk_thinking) if sdk_thinking is not None else None
 
     return ModelCapabilities(
-        coding=coding,
+        coding=None,
         reasoning=reasoning,
-        vision=vision,
-        tool_calling=tool_calling,
-        structured_output=structured_output,
-        streaming=streaming,
+        vision=None,
+        tool_calling=None,
+        structured_output=None,
+        streaming=True,
         context_window=context_window,
     )
 

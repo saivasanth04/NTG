@@ -937,7 +937,7 @@ class UnifiedNTGRouter:
             if d.api_key and d.api_key.strip() and not d.is_quarantined and d.is_available(ts)
         ]
 
-        # Non-global requests filter to matching logical model
+        # Non-global requests filter to matching logical model, model id, or litellm_model
         if not is_global and model_group not in (
             "coding",
             "reasoning",
@@ -946,26 +946,13 @@ class UnifiedNTGRouter:
             "structured_output",
             "streaming",
         ):
-            # 1. Match primary requested provider or underlying model
-            primary_candidates = [
+            candidates = [
                 d for d in candidates
                 if d.logical_model == model_group
                 or d.model == model_group
                 or d.id == model_group
                 or d.litellm_model == model_group
             ]
-
-            # 2. Check if explicit compatible fallback providers are configured (Rule 5)
-            # Provider-specific requests must not jump to unrelated providers unless explicitly configured
-            compatible_provider_names = self.provider_fallbacks.get(model_group, [])
-            if compatible_provider_names:
-                fallback_candidates = [
-                    d for d in candidates
-                    if d.logical_model in compatible_provider_names and d not in primary_candidates
-                ]
-                candidates = primary_candidates + fallback_candidates
-            else:
-                candidates = primary_candidates
 
         # Normalize requirements
         reqs = requirements
@@ -1005,71 +992,78 @@ class UnifiedNTGRouter:
 
         return eligible
 
+    def _build_request_pool_and_fallbacks(
+        self,
+        target_model: str,
+        requirements: RequestRequirements,
+        caller_fallbacks: Any = None,
+        now: Optional[float] = None,
+    ) -> tuple[List[Dict[str, Any]], Optional[List[Dict[str, List[str]]]], List[Deployment]]:
+        """Construct the eligible LiteLLM pool and capability-safe provider group fallbacks.
+
+        LiteLLM remains the sole authority for deployment selection and load balancing.
+        NTG only filters eligibility and ensures capabilities are safe.
+        """
+        ts = now if now is not None else time.time()
+        primary_eligible = self._filter_eligible_deployments(
+            model_group=target_model,
+            requirements=requirements,
+            now=ts,
+        )
+
+        model_list: List[Dict[str, Any]] = []
+        seen_dep_ids: Set[str] = set()
+
+        for dep in primary_eligible:
+            model_list.append(dep.to_litellm_dict(group_override=target_model))
+            seen_dep_ids.add(dep.id)
+
+        fallbacks: Optional[List[Dict[str, List[str]]]] = None
+
+        if caller_fallbacks:
+            fallbacks = self._validate_user_fallbacks(caller_fallbacks, requirements, ts)
+            if fallbacks:
+                for fb_item in fallbacks:
+                    for dests in fb_item.values():
+                        for dst in dests:
+                            dst_dep = self.deployment_map.get(dst)
+                            if dst_dep and dst_dep.id not in seen_dep_ids:
+                                model_list.append(dst_dep.to_litellm_dict(group_override=dst))
+                                seen_dep_ids.add(dst_dep.id)
+        elif target_model in self.provider_fallbacks:
+            group_fallbacks: List[str] = []
+            for fb_group in self.provider_fallbacks[target_model]:
+                fb_eligible = self._filter_eligible_deployments(
+                    model_group=fb_group,
+                    requirements=requirements,
+                    now=ts,
+                )
+                if fb_eligible:
+                    for fb_dep in fb_eligible:
+                        if fb_dep.id not in seen_dep_ids:
+                            model_list.append(fb_dep.to_litellm_dict(group_override=fb_group))
+                            seen_dep_ids.add(fb_dep.id)
+                    group_fallbacks.append(fb_group)
+
+            if group_fallbacks:
+                fallbacks = [{target_model: group_fallbacks}]
+
+        return model_list, fallbacks, primary_eligible
+
     def _rank_eligible_deployments(
         self,
         eligible: List[Deployment],
         primary_group: Optional[str] = None,
     ) -> List[Deployment]:
-        """Rank and shuffle eligible deployments for LiteLLM load balancing and failover."""
-        if len(eligible) <= 1:
-            return list(eligible)
-
-        import random
-
-        def _shuffle_group(group: List[Deployment]) -> List[Deployment]:
-            healthy = [d for d in group if d.circuit_state == CircuitState.HEALTHY]
-            probes = [d for d in group if d.circuit_state == CircuitState.HALF_OPEN]
-
-            shuffled: List[Deployment] = []
-            pool = list(healthy) if healthy else list(group)
-            while pool:
-                weights = [max(0.1, d.weight) for d in pool]
-                chosen = random.choices(pool, weights=weights, k=1)[0]
-                shuffled.append(chosen)
-                pool.remove(chosen)
-
-            if healthy and probes:
-                probe_pool = list(probes)
-                while probe_pool:
-                    p_weights = [max(0.1, d.weight) for d in probe_pool]
-                    chosen = random.choices(probe_pool, weights=p_weights, k=1)[0]
-                    shuffled.append(chosen)
-                    probe_pool.remove(chosen)
-            return shuffled
-
-        if primary_group and primary_group not in (MODEL_GROUP_AUTO, MODEL_GROUP_NTG_AUTO, "auto", "ntg-auto"):
-            primaries = [
-                d for d in eligible
-                if d.logical_model == primary_group
-                or d.model == primary_group
-                or d.id == primary_group
-                or d.litellm_model == primary_group
-            ]
-            secondaries = [d for d in eligible if d not in primaries]
-            if primaries and secondaries:
-                return _shuffle_group(primaries) + _shuffle_group(secondaries)
-
-        return _shuffle_group(eligible)
+        """Deprecated: NTG no longer makes ranking decisions. LiteLLM handles selection."""
+        return list(eligible)
 
     def _build_compatible_fallbacks(
         self,
         ordered_eligible: List[Deployment],
     ) -> Optional[List[Dict[str, List[str]]]]:
-        """Construct compatibility-aware fallback chain for LiteLLM Router.
-
-        Ensures that every deployment in the fallback chain has already been verified
-        to satisfy the request's exact capability requirements and health/circuit state.
-        Each deployment points to all subsequent eligible deployments in order.
-        """
-        if len(ordered_eligible) <= 1:
-            return None
-
-        fallbacks: List[Dict[str, List[str]]] = []
-        for i in range(len(ordered_eligible) - 1):
-            cur_id = ordered_eligible[i].id
-            rem_ids = [d.id for d in ordered_eligible[i + 1:]]
-            fallbacks.append({cur_id: rem_ids})
-        return fallbacks
+        """Deprecated: Sequential fallback chains removed. LiteLLM handles pool failover."""
+        return None
 
     def _validate_user_fallbacks(
         self,
@@ -1253,15 +1247,19 @@ class UnifiedNTGRouter:
         )
         kwargs["num_retries"] = effective_retries
 
-        # Run NTG eligibility filter (Rules 7, 9, 10)
-        eligible = self._filter_eligible_deployments(
-            model_group=target_model,
+        caller_fallbacks = kwargs.pop("fallbacks", None)
+        now = time.time()
+
+        # Build eligible LiteLLM pool and capability-safe provider group fallbacks
+        model_list, fallbacks, eligible = self._build_request_pool_and_fallbacks(
+            target_model=target_model,
             requirements=reqs,
+            caller_fallbacks=caller_fallbacks,
+            now=now,
         )
 
-        now = time.time()
         # Rule 8: If no deployment satisfies strict requirements, return clear eligibility error
-        if not eligible:
+        if not model_list or (not eligible and not fallbacks):
             print_divider("NO ELIGIBLE DEPLOYMENTS")
             print(f"No available deployments satisfy request for model group '{target_model}'")
             print(f"Required capabilities: {reqs.describe()}")
@@ -1275,24 +1273,27 @@ class UnifiedNTGRouter:
             print_account_status(self.deployments)
             return None
 
-        # Pass eligible pool to LiteLLM Router with compatibility-aware fallbacks
-        ordered_eligible = self._rank_eligible_deployments(eligible, primary_group=target_model)
-        primary = ordered_eligible[0]
-
-        caller_fallbacks = kwargs.pop("fallbacks", None)
-        if caller_fallbacks:
-            fallbacks = self._validate_user_fallbacks(caller_fallbacks, reqs, now)
-        else:
-            fallbacks = self._build_compatible_fallbacks(ordered_eligible)
-
         call_kwargs = dict(kwargs)
         if fallbacks:
             call_kwargs["fallbacks"] = fallbacks
 
+        req_router = Router(
+            model_list=model_list,
+            routing_strategy="simple-shuffle",
+            cooldown_time=60.0,
+            allowed_fails=1,
+            num_retries=effective_retries,
+            retry_policy=self.retry_policy,
+            fallbacks=fallbacks,
+            model_group_alias={
+                MODEL_GROUP_NTG_AUTO: MODEL_GROUP_AUTO,
+            },
+        )
+
         try:
             # Delegate routing, load-balancing, and failover directly to LiteLLM Router
-            response = self.router.completion(
-                model=primary.id,
+            response = req_router.completion(
+                model=target_model,
                 messages=[{"role": "user", "content": prompt}],
                 **call_kwargs,
             )
@@ -1313,9 +1314,9 @@ class UnifiedNTGRouter:
             return response
 
         except Exception as error:
-            if primary:
-                primary.record_user_request()
-                self.state_manager.record_metrics(primary.id, primary.metrics)
+            if eligible:
+                eligible[0].record_user_request()
+                self.state_manager.record_metrics(eligible[0].id, eligible[0].metrics)
 
             print_divider("ALL ELIGIBLE DEPLOYMENTS EXHAUSTED")
             print(f"Request failed across healthy deployments for model group '{target_model}'.")
@@ -1354,37 +1355,44 @@ class UnifiedNTGRouter:
         )
         kwargs["num_retries"] = effective_retries
 
-        # Run NTG eligibility filter (Rules 7, 9, 10)
-        eligible = self._filter_eligible_deployments(
-            model_group=target_model,
+        caller_fallbacks = kwargs.pop("fallbacks", None)
+        now = time.time()
+
+        # Build eligible LiteLLM pool and capability-safe provider group fallbacks
+        model_list, fallbacks, eligible = self._build_request_pool_and_fallbacks(
+            target_model=target_model,
             requirements=reqs,
+            caller_fallbacks=caller_fallbacks,
+            now=now,
         )
 
         # Rule 8: If no deployment satisfies strict requirements, return clear eligibility error
-        if not eligible:
+        if not model_list or (not eligible and not fallbacks):
             raise NoEligibleDeploymentsError(
                 f"No eligible deployments for model='{target_model}' satisfying requirements: "
                 f"{reqs.describe()}."
             )
 
-        now = time.time()
-        # Pass eligible pool to LiteLLM Router with compatibility-aware fallbacks
-        ordered_eligible = self._rank_eligible_deployments(eligible, primary_group=target_model)
-        primary = ordered_eligible[0]
-
-        caller_fallbacks = kwargs.pop("fallbacks", None)
-        if caller_fallbacks:
-            fallbacks = self._validate_user_fallbacks(caller_fallbacks, reqs, now)
-        else:
-            fallbacks = self._build_compatible_fallbacks(ordered_eligible)
-
         call_kwargs = dict(kwargs)
         if fallbacks:
             call_kwargs["fallbacks"] = fallbacks
 
+        req_router = Router(
+            model_list=model_list,
+            routing_strategy="simple-shuffle",
+            cooldown_time=60.0,
+            allowed_fails=1,
+            num_retries=effective_retries,
+            retry_policy=self.retry_policy,
+            fallbacks=fallbacks,
+            model_group_alias={
+                MODEL_GROUP_NTG_AUTO: MODEL_GROUP_AUTO,
+            },
+        )
+
         try:
-            response = self.router.completion(
-                model=primary.id,
+            response = req_router.completion(
+                model=target_model,
                 messages=messages,
                 **call_kwargs,
             )
@@ -1396,9 +1404,9 @@ class UnifiedNTGRouter:
 
             return response
         except Exception:
-            if primary:
-                primary.record_user_request()
-                self.state_manager.record_metrics(primary.id, primary.metrics)
+            if eligible:
+                eligible[0].record_user_request()
+                self.state_manager.record_metrics(eligible[0].id, eligible[0].metrics)
             raise
 
 

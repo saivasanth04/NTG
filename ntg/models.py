@@ -904,11 +904,6 @@ class Account(Deployment):
         capabilities: Optional[ModelCapabilities] = None,
     ):
         caps = capabilities or ModelCapabilities(
-            coding=True,
-            reasoning=True,
-            vision=False,
-            tool_calling=True,
-            structured_output=True,
             streaming=True,
             context_window=1000000,
         )
@@ -945,11 +940,6 @@ class GeminiDeployment(Deployment):
         stale_reason: Optional[str] = None,
     ):
         caps = capabilities or ModelCapabilities(
-            coding=True,
-            reasoning="pro" in model_name.lower() or "flash" in model_name.lower(),
-            vision=True,
-            tool_calling=True,
-            structured_output=True,
             streaming=True,
             context_window=1048576,
         )
