@@ -15,9 +15,9 @@ REQUEST REQUIREMENTS (tools, structured output, vision, streaming, coding, reaso
     ↓
 NTG ELIGIBILITY FILTER (capability + quota + auth quarantine + circuit state + availability)
     ↓
-ELIGIBLE DEPLOYMENT POOL (ordered with compatibility-aware fallbacks)
+ELIGIBLE DEPLOYMENT POOL (filtered by health, capabilities, quotas, and circuit state)
     ↓
-LITELLM ROUTER (simple-shuffle load balancing + bounded retry + temporary failover)
+LITELLM ROUTER (persistent router lifecycle, simple-shuffle load balancing, bounded retry, failover)
     ↓
 UPSTREAM PROVIDER / ACCOUNT / MODEL
     ↓
@@ -32,7 +32,7 @@ LiteLLM is the **sole routing authority** (load balancing, retries, and failover
 
 ## Key Features
 
-1. **Single Routing Authority**: LiteLLM owns deployment selection, distributed load balancing, and failover. NTG enforces eligibility and tracks observability without competing routing engines.
+1. **Single Routing Authority & Persistent Router**: LiteLLM owns deployment selection, distributed load balancing, and failover across requests using a long-lived Router lifecycle. NTG enforces eligibility and tracks observability without competing routing engines or per-request instantiations.
 2. **Real Global `auto` Routing**: Requesting `auto` or `ntg-auto` balances across **all** healthy deployments from all configured providers, not merely a single provider alias.
 3. **Capability-Aware Routing**: Deployments declare normalized capabilities:
    - `coding`: High-capability coding models.
@@ -41,19 +41,20 @@ LiteLLM is the **sole routing authority** (load balancing, retries, and failover
    - `tool_calling`: Function calling / tool execution support.
    - `structured_output`: JSON Schema / structured output support.
    - `streaming`: Server-sent event token streaming.
-   - `context_window`: Verified token capacity.
+   - `context_window`: Verified token capacity (unverified fallbacks default conservatively to 4,096 tokens).
 4. **Resilient Circuit Breaker**:
    - `HEALTHY`: Serving traffic normally.
    - `OPEN`: Paused after failure or rate limits (authoritative `Retry-After` / reset duration).
-   - `HALF_OPEN`: Controlled single-request probing before returning to `HEALTHY`.
+   - `HALF_OPEN`: Controlled single-request probing (atomic token admission) before returning to `HEALTHY`.
    - `AUTH_FAILED / QUARANTINED`: Suspended on authentication failure (401/403) or missing model (404) errors with backoff revalidation.
 5. **Accurate Quota & Error Handling**:
    - Parses HTTP `Retry-After` (seconds and RFC 2822 dates) and `X-RateLimit-*` headers.
    - Distinguishes RPM, RPD (daily free tier resets at 00:00 UTC), and upstream limits.
+   - Distinguishes model-not-found (404 missing model) from general 404s.
    - Propagates account-level limits to peer deployments sharing the same provider account.
    - Client request errors (400) and capability mismatches never trip the circuit breaker.
-6. **Thread-Safe Concurrency**: Zero shared mutable request state. Uses response-level deployment metadata and LiteLLM attempt callbacks to guarantee atomic deployment attribution under high concurrency.
-7. **Local State Persistence**: Circuit breaker status, cooldown expirations, quota metadata, and discovery caches are atomically persisted to `.ntg/state.json` across process restarts without external database dependencies. API keys and secrets are NEVER persisted.
+6. **Thread-Safe Concurrency & Telemetry**: Zero shared mutable request state. Uses response-level deployment metadata and LiteLLM attempt callbacks to track user requests and upstream attempts with exact evidence-based attribution and zero double-counting.
+7. **Local State Persistence**: Circuit breaker status, cooldown expirations, quota metadata, and discovery caches are atomically persisted to `.ntg/state.json` across process restarts without external database dependencies. StateManager strictly persists and restores without mutating live deployment objects. API keys and secrets are NEVER persisted.
 8. **Dynamic Discovery with Resilient Caching**: Groq and Gemini models are discovered dynamically; discovery failures preserve last-known-good cached models as stale rather than dropping deployments.
 9. **Zero Secret Exposure**: API keys are never printed, logged, persisted, or exposed in diagnostics.
 

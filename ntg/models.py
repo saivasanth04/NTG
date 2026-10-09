@@ -777,6 +777,36 @@ class Deployment:
                 return True
             return False
 
+    def release_half_open_probe(self) -> None:
+        """Release a claimed probe slot if the probe request was not dispatched."""
+        with self._state_lock:
+            if self.circuit_state == CircuitState.HALF_OPEN and self.half_open_probes > 0:
+                self.half_open_probes -= 1
+
+    def admit_to_request_pool(self, now: Optional[float] = None) -> bool:
+        """Atomically admit deployment into an active request pool (Task 11 / Final Correctness).
+
+        For HALF_OPEN deployments, atomically claims a single probe slot before admission.
+        Returns False if probe cannot be claimed, circuit is OPEN, quota is exhausted, or credentials missing.
+        """
+        current_time = now if now is not None else time.time()
+        self.refresh(current_time)
+        with self._state_lock:
+            if not self.api_key or not self.api_key.strip():
+                return False
+            if self.circuit_state in (CircuitState.QUARANTINED, CircuitState.AUTH_FAILED):
+                return False
+            if self.quota.reset_at and current_time < self.quota.reset_at:
+                return False
+            if self.circuit_state == CircuitState.OPEN:
+                return False
+            if self.circuit_state == CircuitState.HALF_OPEN:
+                if self.half_open_probes < self.max_half_open_probes:
+                    self.half_open_probes += 1
+                    return True
+                return False
+            return True
+
     def record_failure(
         self,
         max_failures: Optional[int] = None,
@@ -905,7 +935,7 @@ class Account(Deployment):
     ):
         caps = capabilities or ModelCapabilities(
             streaming=True,
-            context_window=1000000,
+            context_window=4096,
         )
         super().__init__(
             id=f"openrouter-{name}",
@@ -941,7 +971,7 @@ class GeminiDeployment(Deployment):
     ):
         caps = capabilities or ModelCapabilities(
             streaming=True,
-            context_window=1048576,
+            context_window=4096,
         )
         super().__init__(
             id=f"gemini-{account_name}-{model_name}",

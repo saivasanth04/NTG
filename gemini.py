@@ -76,7 +76,7 @@ def infer_gemini_capabilities(model_dict: Dict[str, Any]) -> ModelCapabilities:
     Per Rule 3 (Evidence-based capabilities), values are NOT inferred from model name substrings.
     """
     input_limit = model_dict.get("input_token_limit")
-    context_window = int(input_limit) if input_limit and input_limit > 0 else 1048576
+    context_window = int(input_limit) if input_limit and input_limit > 0 else 4096
 
     sdk_thinking = model_dict.get("thinking")
     reasoning: Optional[bool] = bool(sdk_thinking) if sdk_thinking is not None else None

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import threading
 import time
 from typing import Any, Callable, Dict, List, Optional, Set
 
@@ -56,7 +57,7 @@ class NTGTelemetryLogger(CustomLogger):
         self.router = router
 
     def log_pre_api_call(self, model: Any, messages: Any, kwargs: Any = None) -> None:
-        """LiteLLM pre-API call callback: atomically claim HALF_OPEN probe (Rule 3, 11)."""
+        """LiteLLM pre-API call callback: track attempted deployment in request context."""
         kw = kwargs or {}
         dep_id = kw.get("litellm_params", {}).get("model_info", {}).get("id")
         if not dep_id:
@@ -69,8 +70,14 @@ class NTGTelemetryLogger(CustomLogger):
             dep_id = model
 
         deployment = self.router.deployment_map.get(dep_id)
-        if deployment and deployment.circuit_state == CircuitState.HALF_OPEN:
-            deployment.claim_half_open_probe()
+        if not deployment and dep_id:
+            for dep in self.router.deployments:
+                if dep.id == dep_id or dep.model == dep_id or dep.litellm_model == dep_id:
+                    deployment = dep
+                    break
+
+        if deployment:
+            self.router._record_request_attempt(deployment)
 
     def log_success_event(self, kwargs: dict, response_obj: Any, start_time: Any, end_time: Any) -> None:
         """Handle upstream success callback."""
@@ -104,6 +111,7 @@ class NTGTelemetryLogger(CustomLogger):
                             break
 
         if deployment:
+            self.router._record_request_attempt(deployment)
             deployment.metrics.record_attempt()
             deployment.metrics.record_success()
             deployment.record_success()
@@ -170,6 +178,7 @@ class NTGTelemetryLogger(CustomLogger):
                             break
 
         if deployment:
+            self.router._record_request_attempt(deployment)
             deployment.metrics.record_attempt()
 
             if exc:
@@ -582,10 +591,21 @@ class UnifiedNTGRouter:
             },
         )
 
+        # 6. Synchronization and request context
+        self._router_lock = threading.RLock()
+        self._request_context = threading.local()
+
         # 7. Register telemetry and circuit breaker callback via public litellm.callbacks contract
         self.telemetry_logger = NTGTelemetryLogger(self)
         litellm.callbacks = [cb for cb in litellm.callbacks if not isinstance(cb, NTGTelemetryLogger)]
         litellm.callbacks.append(self.telemetry_logger)
+
+    def _record_request_attempt(self, deployment: Deployment) -> None:
+        """Track deployment attempted in thread-local request context (Issue 3)."""
+        attempts = getattr(self._request_context, "attempted_deployments", None)
+        if attempts is not None and isinstance(attempts, list):
+            if not attempts or attempts[-1].id != deployment.id:
+                attempts.append(deployment)
 
     def _propagate_account_auth_quarantine(
         self,
@@ -923,6 +943,8 @@ class UnifiedNTGRouter:
         capabilities: Optional[ModelCapabilities | dict | list[str] | str] = None,
         min_context: Optional[int] = None,
         now: Optional[float] = None,
+        claim_probe: bool = False,
+        claimed_probes: Optional[List[Deployment]] = None,
     ) -> List[Deployment]:
         """NTG Eligibility Filter: evaluate health, capabilities, quotas, and circuit state."""
         ts = now if now is not None else time.time()
@@ -931,11 +953,18 @@ class UnifiedNTGRouter:
 
         is_global = model_group in (MODEL_GROUP_AUTO, MODEL_GROUP_NTG_AUTO, "auto", "ntg-auto")
 
-        candidates = self.get_global_pool(ts) if is_global else [
-            d
-            for d in self.deployments
-            if d.api_key and d.api_key.strip() and not d.is_quarantined and d.is_available(ts)
-        ]
+        if claim_probe:
+            candidates = [
+                d
+                for d in self.deployments
+                if d.api_key and d.api_key.strip() and not d.is_quarantined
+            ]
+        else:
+            candidates = self.get_global_pool(ts) if is_global else [
+                d
+                for d in self.deployments
+                if d.api_key and d.api_key.strip() and not d.is_quarantined and d.is_available(ts)
+            ]
 
         # Non-global requests filter to matching logical model, model id, or litellm_model
         if not is_global and model_group not in (
@@ -982,12 +1011,27 @@ class UnifiedNTGRouter:
             if not dep.capabilities.satisfies(reqs.capabilities):
                 continue
 
+            # Atomically admit to request pool (Task 11 / Final Correctness)
+            if claim_probe:
+                if not dep.admit_to_request_pool(ts):
+                    continue
+                if dep.circuit_state == CircuitState.HALF_OPEN and claimed_probes is not None:
+                    claimed_probes.append(dep)
+            else:
+                if not dep.is_available(ts):
+                    continue
+
             eligible.append(dep)
 
         # Rule 5: Coding-oriented requests prefer deployments marked coding=True
         if reqs.coding_preferred and not reqs.capabilities.coding:
             coding_matches = [d for d in eligible if d.capabilities.coding is True]
             if coding_matches:
+                if claim_probe and claimed_probes is not None:
+                    for d in eligible:
+                        if d not in coding_matches and d in claimed_probes:
+                            d.release_half_open_probe()
+                            claimed_probes.remove(d)
                 eligible = coding_matches
 
         return eligible
@@ -998,6 +1042,8 @@ class UnifiedNTGRouter:
         requirements: RequestRequirements,
         caller_fallbacks: Any = None,
         now: Optional[float] = None,
+        claim_probe: bool = False,
+        claimed_probes: Optional[List[Deployment]] = None,
     ) -> tuple[List[Dict[str, Any]], Optional[List[Dict[str, List[str]]]], List[Deployment]]:
         """Construct the eligible LiteLLM pool and capability-safe provider group fallbacks.
 
@@ -1009,6 +1055,8 @@ class UnifiedNTGRouter:
             model_group=target_model,
             requirements=requirements,
             now=ts,
+            claim_probe=claim_probe,
+            claimed_probes=claimed_probes,
         )
 
         model_list: List[Dict[str, Any]] = []
@@ -1021,7 +1069,13 @@ class UnifiedNTGRouter:
         fallbacks: Optional[List[Dict[str, List[str]]]] = None
 
         if caller_fallbacks:
-            fallbacks = self._validate_user_fallbacks(caller_fallbacks, requirements, ts)
+            fallbacks = self._validate_user_fallbacks(
+                caller_fallbacks,
+                requirements,
+                ts,
+                claim_probe=claim_probe,
+                claimed_probes=claimed_probes,
+            )
             if fallbacks:
                 for fb_item in fallbacks:
                     for dests in fb_item.values():
@@ -1037,6 +1091,8 @@ class UnifiedNTGRouter:
                     model_group=fb_group,
                     requirements=requirements,
                     now=ts,
+                    claim_probe=claim_probe,
+                    claimed_probes=claimed_probes,
                 )
                 if fb_eligible:
                     for fb_dep in fb_eligible:
@@ -1070,6 +1126,8 @@ class UnifiedNTGRouter:
         user_fallbacks: Any,
         requirements: RequestRequirements,
         now: Optional[float] = None,
+        claim_probe: bool = False,
+        claimed_probes: Optional[List[Deployment]] = None,
     ) -> List[Dict[str, List[str]]]:
         """Validate caller-supplied fallbacks to ensure compatibility and eligibility.
 
@@ -1102,15 +1160,21 @@ class UnifiedNTGRouter:
                             candidates = dep_by_group[dst]
 
                         for d in candidates:
-                            if (
-                                d.api_key
-                                and d.api_key.strip()
-                                and not d.is_quarantined
-                                and d.is_available(ts)
-                                and d.capabilities.satisfies(requirements.capabilities)
-                            ):
-                                if d.id not in clean_dst:
-                                    clean_dst.append(d.id)
+                            if not d.api_key or not d.api_key.strip() or d.is_quarantined:
+                                continue
+                            if not d.capabilities.satisfies(requirements.capabilities):
+                                continue
+                            if claim_probe:
+                                if not d.admit_to_request_pool(ts):
+                                    continue
+                                if d.circuit_state == CircuitState.HALF_OPEN and claimed_probes is not None:
+                                    claimed_probes.append(d)
+                            else:
+                                if not d.is_available(ts):
+                                    continue
+
+                            if d.id not in clean_dst:
+                                clean_dst.append(d.id)
 
                         if not candidates:
                             clean_dst.append(dst)
@@ -1208,6 +1272,11 @@ class UnifiedNTGRouter:
                         pass
                     return d
 
+        # 4. Check thread-local attempted deployments (Issue 3: concrete telemetry evidence)
+        attempted = getattr(self._request_context, "attempted_deployments", None)
+        if attempted and len(attempted) > 0:
+            return attempted[-1]
+
         fallback = candidates[0] if (candidates and len(candidates) > 0) else None
         if fallback:
             try:
@@ -1249,6 +1318,8 @@ class UnifiedNTGRouter:
 
         caller_fallbacks = kwargs.pop("fallbacks", None)
         now = time.time()
+        claimed_probes: List[Deployment] = []
+        self._request_context.attempted_deployments = []
 
         # Build eligible LiteLLM pool and capability-safe provider group fallbacks
         model_list, fallbacks, eligible = self._build_request_pool_and_fallbacks(
@@ -1256,10 +1327,14 @@ class UnifiedNTGRouter:
             requirements=reqs,
             caller_fallbacks=caller_fallbacks,
             now=now,
+            claim_probe=True,
+            claimed_probes=claimed_probes,
         )
 
         # Rule 8: If no deployment satisfies strict requirements, return clear eligibility error
         if not model_list or (not eligible and not fallbacks):
+            for dep in claimed_probes:
+                dep.release_half_open_probe()
             print_divider("NO ELIGIBLE DEPLOYMENTS")
             print(f"No available deployments satisfy request for model group '{target_model}'")
             print(f"Required capabilities: {reqs.describe()}")
@@ -1277,26 +1352,18 @@ class UnifiedNTGRouter:
         if fallbacks:
             call_kwargs["fallbacks"] = fallbacks
 
-        req_router = Router(
-            model_list=model_list,
-            routing_strategy="simple-shuffle",
-            cooldown_time=60.0,
-            allowed_fails=1,
-            num_retries=effective_retries,
-            retry_policy=self.retry_policy,
-            fallbacks=fallbacks,
-            model_group_alias={
-                MODEL_GROUP_NTG_AUTO: MODEL_GROUP_AUTO,
-            },
-        )
-
         try:
-            # Delegate routing, load-balancing, and failover directly to LiteLLM Router
-            response = req_router.completion(
-                model=target_model,
-                messages=[{"role": "user", "content": prompt}],
-                **call_kwargs,
-            )
+            # Persistent LiteLLM Router instance: retains failover/cooldown memory across requests (Issue 1)
+            with self._router_lock:
+                self.router.set_model_list(model_list)
+                self.router.fallbacks = fallbacks or []
+                self.router.num_retries = effective_retries
+
+                response = self.router.completion(
+                    model=target_model,
+                    messages=[{"role": "user", "content": prompt}],
+                    **call_kwargs,
+                )
 
             # Retrieve fulfilling deployment directly from response instance (100% concurrency-safe)
             deployment = self._get_response_deployment(response, eligible)
@@ -1314,15 +1381,24 @@ class UnifiedNTGRouter:
             return response
 
         except Exception as error:
-            if eligible:
-                eligible[0].record_user_request()
-                self.state_manager.record_metrics(eligible[0].id, eligible[0].metrics)
+            attempted = getattr(self._request_context, "attempted_deployments", [])
+            if attempted:
+                attempted[0].record_user_request()
+                self.state_manager.record_metrics(attempted[0].id, attempted[0].metrics)
 
             print_divider("ALL ELIGIBLE DEPLOYMENTS EXHAUSTED")
             print(f"Request failed across healthy deployments for model group '{target_model}'.")
             print(f"Final error: {error}")
             print_account_status(self.deployments)
             return None
+
+        finally:
+            attempted = getattr(self._request_context, "attempted_deployments", [])
+            attempted_ids = {d.id for d in attempted}
+            for dep in claimed_probes:
+                if dep.id not in attempted_ids:
+                    dep.release_half_open_probe()
+            self._request_context.attempted_deployments = []
 
     def completion(
         self,
@@ -1357,6 +1433,8 @@ class UnifiedNTGRouter:
 
         caller_fallbacks = kwargs.pop("fallbacks", None)
         now = time.time()
+        claimed_probes: List[Deployment] = []
+        self._request_context.attempted_deployments = []
 
         # Build eligible LiteLLM pool and capability-safe provider group fallbacks
         model_list, fallbacks, eligible = self._build_request_pool_and_fallbacks(
@@ -1364,10 +1442,14 @@ class UnifiedNTGRouter:
             requirements=reqs,
             caller_fallbacks=caller_fallbacks,
             now=now,
+            claim_probe=True,
+            claimed_probes=claimed_probes,
         )
 
         # Rule 8: If no deployment satisfies strict requirements, return clear eligibility error
         if not model_list or (not eligible and not fallbacks):
+            for dep in claimed_probes:
+                dep.release_half_open_probe()
             raise NoEligibleDeploymentsError(
                 f"No eligible deployments for model='{target_model}' satisfying requirements: "
                 f"{reqs.describe()}."
@@ -1377,25 +1459,18 @@ class UnifiedNTGRouter:
         if fallbacks:
             call_kwargs["fallbacks"] = fallbacks
 
-        req_router = Router(
-            model_list=model_list,
-            routing_strategy="simple-shuffle",
-            cooldown_time=60.0,
-            allowed_fails=1,
-            num_retries=effective_retries,
-            retry_policy=self.retry_policy,
-            fallbacks=fallbacks,
-            model_group_alias={
-                MODEL_GROUP_NTG_AUTO: MODEL_GROUP_AUTO,
-            },
-        )
-
         try:
-            response = req_router.completion(
-                model=target_model,
-                messages=messages,
-                **call_kwargs,
-            )
+            # Persistent LiteLLM Router instance: retains failover/cooldown memory across requests (Issue 1)
+            with self._router_lock:
+                self.router.set_model_list(model_list)
+                self.router.fallbacks = fallbacks or []
+                self.router.num_retries = effective_retries
+
+                response = self.router.completion(
+                    model=target_model,
+                    messages=messages,
+                    **call_kwargs,
+                )
 
             deployment = self._get_response_deployment(response, eligible)
             if deployment:
@@ -1404,10 +1479,18 @@ class UnifiedNTGRouter:
 
             return response
         except Exception:
-            if eligible:
-                eligible[0].record_user_request()
-                self.state_manager.record_metrics(eligible[0].id, eligible[0].metrics)
+            attempted = getattr(self._request_context, "attempted_deployments", [])
+            if attempted:
+                attempted[0].record_user_request()
+                self.state_manager.record_metrics(attempted[0].id, attempted[0].metrics)
             raise
+        finally:
+            attempted = getattr(self._request_context, "attempted_deployments", [])
+            attempted_ids = {d.id for d in attempted}
+            for dep in claimed_probes:
+                if dep.id not in attempted_ids:
+                    dep.release_half_open_probe()
+            self._request_context.attempted_deployments = []
 
 
 # Maintain backwards compatibility

@@ -300,21 +300,67 @@ def parse_provider_error(error: Exception, provider: str = "") -> ParsedErrorInf
             raw_payload=payload,
         )
 
-    # 2. Status 404 Not Found (Model unavailable/deleted)
+    # 2. Status 404 Not Found (Distinguish Model Not Found vs General 404)
     if status_code == 404 or "not found" in err_lower or "model_not_found" in err_lower:
-        return ParsedErrorInfo(
-            category=CATEGORY_NOT_FOUND,
-            status_code=404,
-            is_retryable=True,
-            should_quarantine=True,
-            cooldown_seconds=86400.0,
-            reset_timestamp=None,
-            limit_type="not_found",
-            quota_scope=QuotaScope.MODEL,
-            provider_name=provider_name,
-            message=msg,
-            raw_payload=payload,
+        is_model_specific = (
+            (
+                "model" in err_lower
+                and any(
+                    kw in err_lower
+                    for kw in (
+                        "not found",
+                        "does not exist",
+                        "not exist",
+                        "access",
+                        "unknown",
+                        "unavailable",
+                        "recognized",
+                        "invalid",
+                        "could not find",
+                        "no such",
+                    )
+                )
+            )
+            or any(
+                pattern in err_lower
+                for pattern in (
+                    "model not found",
+                    "model_not_found",
+                    "models/",
+                )
+            )
+            or (isinstance(err_data, dict) and err_data.get("code") == "model_not_found")
         )
+
+        if is_model_specific:
+            return ParsedErrorInfo(
+                category=CATEGORY_NOT_FOUND,
+                status_code=404,
+                is_retryable=False,
+                should_quarantine=True,
+                cooldown_seconds=86400.0,
+                reset_timestamp=None,
+                limit_type="not_found",
+                quota_scope=QuotaScope.MODEL,
+                provider_name=provider_name,
+                message=msg,
+                raw_payload=payload,
+            )
+        else:
+            # General 404 (endpoint / path / route not found): Client request error, do NOT quarantine model
+            return ParsedErrorInfo(
+                category=CATEGORY_REQUEST_ERROR,
+                status_code=404,
+                is_retryable=False,
+                should_quarantine=False,
+                cooldown_seconds=0.0,
+                reset_timestamp=None,
+                limit_type="not_found",
+                quota_scope=QuotaScope.UNKNOWN,
+                provider_name=provider_name,
+                message=msg,
+                raw_payload=payload,
+            )
 
     # 3. Status 401/403 Authentication / Permission Error
     if (

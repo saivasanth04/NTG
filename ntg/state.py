@@ -416,7 +416,7 @@ class StateManager:
         reset_timestamp: Optional[float] = None,
         quota_scope: str = "deployment",
     ) -> None:
-        """Record cooldown for either Deployment instance or deployment ID."""
+        """Persist cooldown for deployment ID or instance (strictly persistence, no live mutations)."""
         with self._lock:
             dep_id = getattr(dep_or_id, "id", str(dep_or_id))
             now = time.time()
@@ -426,14 +426,6 @@ class StateManager:
             else:
                 cooldown_secs = max(1.0, cooldown_seconds_or_until)
                 reset_at = reset_timestamp if reset_timestamp and reset_timestamp > now else (now + cooldown_secs)
-
-            if hasattr(dep_or_id, "circuit_state"):
-                dep_or_id.circuit_state = CircuitState.OPEN
-                if hasattr(dep_or_id, "quota"):
-                    dep_or_id.quota.reset_at = reset_at
-                    dep_or_id.quota.quota_scope = quota_scope
-                if hasattr(dep_or_id, "state_reason"):
-                    dep_or_id.state_reason = reason_or_limit_type
 
             if "deployments" not in self.state_data:
                 self.state_data["deployments"] = {}
@@ -455,15 +447,10 @@ class StateManager:
         reason: str,
         state: CircuitState = CircuitState.AUTH_FAILED,
     ) -> None:
-        """Quarantine a deployment due to invalid credentials or permanent errors."""
+        """Persist quarantine state for deployment ID (strictly persistence, no live mutations)."""
         with self._lock:
             dep_id = getattr(dep_or_id, "id", str(dep_or_id))
             now = time.time()
-
-            if hasattr(dep_or_id, "circuit_state"):
-                dep_or_id.circuit_state = state
-                if hasattr(dep_or_id, "state_reason"):
-                    dep_or_id.state_reason = reason
 
             if "deployments" not in self.state_data:
                 self.state_data["deployments"] = {}
@@ -550,26 +537,10 @@ class StateManager:
                 )
             return QuotaInfo()
 
-    def record_success(self, deployment: Any) -> None:
-        """Record success and transition HALF_OPEN or recovered deployments back to HEALTHY."""
+    def record_success(self, dep_or_id: Any) -> None:
+        """Persist recovery / healthy state for deployment (strictly persistence, no live mutations)."""
         with self._lock:
-            dep_id = getattr(deployment, "id", str(deployment))
-            if hasattr(deployment, "circuit_state") and deployment.circuit_state in (
-                CircuitState.HALF_OPEN,
-                CircuitState.OPEN,
-                CircuitState.QUARANTINED,
-                CircuitState.AUTH_FAILED,
-            ):
-                deployment.circuit_state = CircuitState.HEALTHY
-                if hasattr(deployment, "state_reason"):
-                    deployment.state_reason = None
-                if hasattr(deployment, "half_open_probes"):
-                    deployment.half_open_probes = 0
-                if hasattr(deployment, "circuit_open_until"):
-                    deployment.circuit_open_until = 0.0
-                if hasattr(deployment, "consecutive_failures"):
-                    deployment.consecutive_failures = 0
-
+            dep_id = getattr(dep_or_id, "id", str(dep_or_id))
             deps = self.state_data.get("deployments", {})
             if dep_id in deps:
                 deps.pop(dep_id, None)
