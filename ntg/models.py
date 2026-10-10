@@ -955,13 +955,20 @@ class Deployment:
                 if curr_hash != self.auth_failed_key_hash:
                     self.transition_to_healthy(reason="API key updated; authentication quarantine lifted")
 
+            # Clean up expired quota timestamp if elapsed
+            if self.quota.reset_at and current_time >= self.quota.reset_at:
+                self.quota.reset_at = None
+
             # Circuit OPEN -> HALF_OPEN evaluation (Rule 3)
             if self.circuit_state == CircuitState.OPEN:
-                server_recovered = bool(self.circuit_open_until and current_time >= self.circuit_open_until)
-                quota_recovered = bool(self.quota.reset_at and current_time >= self.quota.reset_at)
-                fallback_recovered = bool(not self.circuit_open_until and not self.quota.reset_at and (current_time - self.state_updated_at) >= self.recovery_time)
+                is_circuit_cooled = bool(not self.circuit_open_until or current_time >= self.circuit_open_until)
+                is_quota_cooled = bool(not self.quota.reset_at or current_time >= self.quota.reset_at)
+                is_fallback_cooled = bool(
+                    (self.circuit_open_until or self.quota.reset_at)
+                    or (current_time - self.state_updated_at) >= self.recovery_time
+                )
 
-                if server_recovered or quota_recovered or fallback_recovered:
+                if is_circuit_cooled and is_quota_cooled and is_fallback_cooled:
                     self.transition_to_half_open(reason="Recovery condition reached; entering HALF_OPEN for controlled probe")
 
             return self.is_eligible(current_time)

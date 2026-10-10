@@ -92,6 +92,10 @@ class StateManager:
     - Loads state on startup and discards expired cooldowns (Rules 4, 5).
     - Handles missing or corrupted state files without crashing (Rules 6, 7).
     - Thread-safe atomic writes via temporary file replacement and in-memory RLock (Rule 10).
+    - Architecture: Designed for single-process, multi-threaded routing architectures. Thread safety
+      is enforced by an in-memory RLock, while atomic file replacement (os.replace) prevents corruption.
+      Multi-process deployments sharing state across independent worker processes require an external
+      distributed coordinator or lock.
     - Integrates with the existing Deployment model as the source of truth (Rule 9).
     """
 

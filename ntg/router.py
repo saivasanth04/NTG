@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import hashlib
 import logging
+import random
 import threading
 import time
 from typing import Any, Callable, Dict, List, Optional, Set
@@ -471,10 +472,12 @@ class NTGTelemetryLogger(CustomLogger):
 
                     if info.quota_scope in (QuotaScope.ACCOUNT, QuotaScope.PROVIDER):
                         router._propagate_account_quota_exhaustion(
-                            deployment.provider,
-                            deployment.account,
-                            deployment.quota.reset_at,
-                            info.message,
+                            provider=deployment.provider,
+                            account=deployment.account,
+                            reset_at=deployment.quota.reset_at,
+                            reason=info.message,
+                            api_key=deployment.api_key,
+                            quota_scope=info.quota_scope,
                         )
                     else:
                         router._sync_router_model_pool()
@@ -579,7 +582,14 @@ def extract_request_requirements(
     tools = kwargs.get("tools")
     functions = kwargs.get("functions")
     tool_choice = kwargs.get("tool_choice")
-    if (tools and len(tools) > 0) or (functions and len(functions) > 0) or tool_choice:
+    has_tools = bool((tools and len(tools) > 0) or (functions and len(functions) > 0) or tool_choice)
+    if not has_tools and messages and isinstance(messages, list):
+        for msg in messages:
+            if isinstance(msg, dict):
+                if msg.get("role") in ("tool", "function") or msg.get("tool_calls"):
+                    has_tools = True
+                    break
+    if has_tools:
         req_caps.tool_calling = True
         strict_reqs.add("tool_calling")
 
@@ -587,7 +597,13 @@ def extract_request_requirements(
     response_format = kwargs.get("response_format")
     schema = kwargs.get("schema")
     fmt = kwargs.get("format")
-    if response_format is not None or schema is not None or fmt == "json":
+    if (
+        response_format is not None
+        or schema is not None
+        or fmt == "json"
+        or kwargs.get("json_schema") is not None
+        or kwargs.get("guided_json") is not None
+    ):
         req_caps.structured_output = True
         strict_reqs.add("structured_output")
 
@@ -1222,8 +1238,10 @@ class UnifiedNTGRouter:
         account: str,
         reset_at: float,
         reason: str,
+        api_key: Optional[str] = None,
+        quota_scope: str = QuotaScope.ACCOUNT,
     ) -> None:
-        """Propagate an account-wide quota exhaustion across all deployments under the same account.
+        """Propagate an account-wide or provider-wide quota exhaustion across all affected deployments.
 
         Updates NTG quota knowledge, circuit state, and persistent state so that
         the exhausted account's deployments are excluded from future candidate pools until reset.
@@ -1232,13 +1250,21 @@ class UnifiedNTGRouter:
         now = time.time()
         cooldown = max(0.0, reset_at - now)
         for dep in self.deployments:
-            if dep.provider == provider and dep.account == account:
+            should_propagate = False
+            if quota_scope == QuotaScope.PROVIDER and dep.provider == provider:
+                should_propagate = True
+            elif dep.provider == provider and dep.account == account:
+                should_propagate = True
+            elif api_key and dep.api_key and dep.api_key == api_key:
+                should_propagate = True
+
+            if should_propagate:
                 dep.transition_to_open(
                     cooldown_seconds=cooldown,
                     reason=reason,
                     reset_at=reset_at,
                 )
-                self.state_manager.record_cooldown(dep.id, reset_at, "account_quota")
+                self.state_manager.record_cooldown(dep.id, reset_at, "account_quota", quota_scope=quota_scope)
                 self.state_manager.record_circuit_state(dep.id, CircuitState.OPEN, reason=reason)
         self._sync_router_model_pool()
 
@@ -1339,6 +1365,7 @@ class UnifiedNTGRouter:
                 or d.model == model_group
                 or d.id == model_group
                 or d.litellm_model == model_group
+                or d.provider == model_group
             ]
 
         # Normalize requirements
@@ -1481,7 +1508,14 @@ class UnifiedNTGRouter:
         if user_specified_dests is not None:
             remaining_fallbacks = [dst for dst in user_specified_dests if dst != selected_dep.id]
         else:
-            remaining_fallbacks = [d.id for d in fallback_pool if d.id != selected_dep.id]
+            # Group fallbacks: remaining primary candidates first, followed by cross-provider fallbacks
+            rem_primary = [d.id for d in primary_eligible if d.id != selected_dep.id]
+            rem_secondary = [d.id for d in fallback_deployments if d not in primary_eligible and d.id != selected_dep.id]
+            if len(rem_primary) > 1:
+                rem_primary = random.sample(rem_primary, len(rem_primary))
+            if len(rem_secondary) > 1:
+                rem_secondary = random.sample(rem_secondary, len(rem_secondary))
+            remaining_fallbacks = rem_primary + rem_secondary
 
         seen_fb = set()
         clean_fallbacks = []
@@ -1697,138 +1731,23 @@ class UnifiedNTGRouter:
             self.unknown_metrics.increment_user_requests()
             self.state_manager.record_metrics("unknown", self.unknown_metrics)
 
-    def ask(
-        self,
-        prompt: str,
-        model: Optional[str] = None,
-        capabilities: Optional[ModelCapabilities | dict | list[str] | str] = None,
-        min_context: Optional[int] = None,
-        **kwargs: Any,
-    ) -> Optional[Any]:
-        """Route user prompt through LiteLLM Router with NTG capability & eligibility validation."""
-        target_model = model or self.default_model
-        if target_model in ("ntg-auto", MODEL_GROUP_NTG_AUTO):
-            target_model = MODEL_GROUP_AUTO
-
-        # Extract deterministic request requirements (Rules 1-6)
-        reqs = extract_request_requirements(
-            prompt=prompt,
-            model=target_model,
-            capabilities=capabilities,
-            min_context=min_context,
-            **kwargs,
-        )
-
-        # Enforce bounded retry budget (never derived from deployment count; capped at MAX_RETRY_BUDGET)
-        req_retries = kwargs.pop("num_retries", None)
-        effective_retries = (
-            min(max(0, req_retries), MAX_RETRY_BUDGET)
-            if req_retries is not None
-            else self.num_retries
-        )
-        kwargs["num_retries"] = effective_retries
-
-        caller_fallbacks = kwargs.pop("fallbacks", None)
-        now = time.time()
-        claimed_probes: List[Deployment] = []
-        request_id = uuid.uuid4().hex[:8]
-        self._request_context.attempted_deployments = []
-        self._request_context.recorded_call_ids = set()
-
-        # Build request pool and capability-safe provider group fallbacks
-        selected_dep, fallbacks, eligible = self._build_request_pool_and_fallbacks(
-            target_model=target_model,
-            requirements=reqs,
-            caller_fallbacks=caller_fallbacks,
-            now=now,
-            claim_probe=True,
-            claimed_probes=claimed_probes,
-            request_id=request_id,
-        )
-
-        # Rule 8: If no deployment satisfies strict requirements, return clear eligibility error
-        if not selected_dep:
-            for dep in claimed_probes:
-                dep.release_half_open_probe(request_id=request_id)
-            self.unknown_metrics.increment_user_requests()
-            self.state_manager.record_metrics("unknown", self.unknown_metrics)
-            print_divider("NO ELIGIBLE DEPLOYMENTS")
-            print(f"No available deployments satisfy request for model group '{target_model}'")
-            print(f"Required capabilities: {reqs.describe()}")
-            if min_context:
-                print(f"Required context     : >={min_context:,}")
-
-            resets = [dep.remaining_cooldown for dep in self.deployments if dep.remaining_cooldown > 0]
-            if resets:
-                next_capacity = min(resets)
-                print(f"Next available deployment capacity in: {next_capacity:.1f}s ({utc_string(now + next_capacity)})")
-            print_account_status(self.deployments)
-            return None
-
-        call_kwargs = dict(kwargs)
-        call_kwargs["num_retries"] = effective_retries
-        if fallbacks:
-            call_kwargs["fallbacks"] = fallbacks
-        meta = dict(call_kwargs.get("metadata", {}) or {})
-        meta["ntg_request_id"] = request_id
-        meta["ntg_router_id"] = self.router_id
-        call_kwargs["metadata"] = meta
-
-        active_req = self._register_active_request(request_id, selected_dep)
-        self._request_context.active_request_id = request_id
-
-        try:
-            # Persistent LiteLLM Router instance executed UNLOCKED for true concurrency
-            response = self.router.completion(
-                model=selected_dep.id,
-                messages=[{"role": "user", "content": prompt}],
-                **call_kwargs,
-            )
-
-            # Retrieve fulfilling deployment strictly from verified response metadata
-            deployment = self._get_response_deployment(response, eligible)
-            self._record_user_request_metric(active_req, deployment, selected_dep)
-
-            if hasattr(response, "choices") and response.choices:
-                print("\n" + str(response.choices[0].message.content))
-
-            if deployment:
-                print_request_execution(deployment, getattr(response, "model", None))
-
-            return response
-
-        except Exception as error:
-            self._record_user_request_metric(active_req, None, selected_dep)
-
-            print_divider("ALL ELIGIBLE DEPLOYMENTS EXHAUSTED")
-            print(f"Request failed across healthy deployments for model group '{target_model}'.")
-            print(f"Final error: {error}")
-            print_account_status(self.deployments)
-            return None
-
-        finally:
-            self._record_user_request_metric(active_req, None, selected_dep)
-            attempted = active_req.attempted_deployments if active_req.attempted_deployments else getattr(self._request_context, "attempted_deployments", [])
-            attempted_ids = {d.id for d in attempted}
-            for dep in claimed_probes:
-                if dep.id not in attempted_ids:
-                    dep.release_half_open_probe(request_id=request_id)
-                elif dep.circuit_state == CircuitState.HALF_OPEN and request_id in dep._active_probe_request_ids:
-                    dep.release_half_open_probe(request_id=request_id)
-            self._unregister_active_request(request_id)
-            self._request_context.active_request_id = None
-            self._request_context.attempted_deployments = []
-            self._request_context.recorded_call_ids = set()
-
-    def completion(
+    def _route_request(
         self,
         messages: list[dict[str, Any]],
         model: Optional[str] = None,
         capabilities: Optional[ModelCapabilities | dict | list[str] | str] = None,
         min_context: Optional[int] = None,
+        prompt: Optional[str] = None,
         **kwargs: Any,
-    ) -> Any:
-        """Execute chat completion conforming to standard OpenAI/LiteLLM signature."""
+    ) -> tuple[Optional[Any], Optional[Deployment], Optional[Exception], RequestRequirements, float]:
+        """Unified internal routing execution pipeline shared by ask() and completion().
+
+        Guarantees:
+        - Deterministic requirement extraction & bounded retry budget
+        - Concurrency-safe LiteLLM router execution without global locks
+        - Exactly-once user request telemetry and probe cleanup
+        - Zero duplicate logic between ask() and completion()
+        """
         target_model = model or self.default_model
         if target_model in ("ntg-auto", MODEL_GROUP_NTG_AUTO):
             target_model = MODEL_GROUP_AUTO
@@ -1836,6 +1755,7 @@ class UnifiedNTGRouter:
         # Extract deterministic request requirements (Rules 1-6)
         reqs = extract_request_requirements(
             messages=messages,
+            prompt=prompt,
             model=target_model,
             capabilities=capabilities,
             min_context=min_context,
@@ -1869,16 +1789,17 @@ class UnifiedNTGRouter:
             request_id=request_id,
         )
 
-        # Rule 8: If no deployment satisfies strict requirements, return clear eligibility error
+        # If no deployment satisfies strict requirements, return clear eligibility error
         if not selected_dep:
             for dep in claimed_probes:
                 dep.release_half_open_probe(request_id=request_id)
             self.unknown_metrics.increment_user_requests()
             self.state_manager.record_metrics("unknown", self.unknown_metrics)
-            raise NoEligibleDeploymentsError(
+            err = NoEligibleDeploymentsError(
                 f"No eligible deployments for model='{target_model}' satisfying requirements: "
                 f"{reqs.describe()}."
             )
+            return None, None, err, reqs, now
 
         call_kwargs = dict(kwargs)
         call_kwargs["num_retries"] = effective_retries
@@ -1900,13 +1821,16 @@ class UnifiedNTGRouter:
                 **call_kwargs,
             )
 
+            # Retrieve fulfilling deployment strictly from verified response metadata
             deployment = self._get_response_deployment(response, eligible)
             self._record_user_request_metric(active_req, deployment, selected_dep)
 
-            return response
-        except Exception:
+            return response, deployment, None, reqs, now
+
+        except Exception as error:
             self._record_user_request_metric(active_req, None, selected_dep)
-            raise
+            return None, None, error, reqs, now
+
         finally:
             self._record_user_request_metric(active_req, None, selected_dep)
             attempted = active_req.attempted_deployments if active_req.attempted_deployments else getattr(self._request_context, "attempted_deployments", [])
@@ -1920,6 +1844,78 @@ class UnifiedNTGRouter:
             self._request_context.active_request_id = None
             self._request_context.attempted_deployments = []
             self._request_context.recorded_call_ids = set()
+
+    def ask(
+        self,
+        prompt: str,
+        model: Optional[str] = None,
+        capabilities: Optional[ModelCapabilities | dict | list[str] | str] = None,
+        min_context: Optional[int] = None,
+        **kwargs: Any,
+    ) -> Optional[Any]:
+        """Route user prompt through LiteLLM Router with NTG capability & eligibility validation."""
+        target_model = model or self.default_model
+        if target_model in ("ntg-auto", MODEL_GROUP_NTG_AUTO):
+            target_model = MODEL_GROUP_AUTO
+
+        messages = [{"role": "user", "content": prompt}]
+        response, deployment, error, reqs, now = self._route_request(
+            messages=messages,
+            model=target_model,
+            capabilities=capabilities,
+            min_context=min_context,
+            prompt=prompt,
+            **kwargs,
+        )
+
+        if error is not None:
+            if isinstance(error, NoEligibleDeploymentsError):
+                print_divider("NO ELIGIBLE DEPLOYMENTS")
+                print(f"No available deployments satisfy request for model group '{target_model}'")
+                print(f"Required capabilities: {reqs.describe()}")
+                if min_context:
+                    print(f"Required context     : >={min_context:,}")
+
+                resets = [dep.remaining_cooldown for dep in self.deployments if dep.remaining_cooldown > 0]
+                if resets:
+                    next_capacity = min(resets)
+                    print(f"Next available deployment capacity in: {next_capacity:.1f}s ({utc_string(now + next_capacity)})")
+                print_account_status(self.deployments)
+                return None
+            else:
+                print_divider("ALL ELIGIBLE DEPLOYMENTS EXHAUSTED")
+                print(f"Request failed across healthy deployments for model group '{target_model}'.")
+                print(f"Final error: {error}")
+                print_account_status(self.deployments)
+                return None
+
+        if hasattr(response, "choices") and response.choices:
+            print("\n" + str(response.choices[0].message.content))
+
+        if deployment:
+            print_request_execution(deployment, getattr(response, "model", None))
+
+        return response
+
+    def completion(
+        self,
+        messages: list[dict[str, Any]],
+        model: Optional[str] = None,
+        capabilities: Optional[ModelCapabilities | dict | list[str] | str] = None,
+        min_context: Optional[int] = None,
+        **kwargs: Any,
+    ) -> Any:
+        """Execute chat completion conforming to standard OpenAI/LiteLLM signature."""
+        response, _, error, _, _ = self._route_request(
+            messages=messages,
+            model=model,
+            capabilities=capabilities,
+            min_context=min_context,
+            **kwargs,
+        )
+        if error is not None:
+            raise error
+        return response
 
 
 # Maintain backwards compatibility
