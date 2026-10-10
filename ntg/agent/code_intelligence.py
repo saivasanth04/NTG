@@ -1585,8 +1585,12 @@ class CodeIntelligence:
                 pkg_parts = parts[:-1]
                 if pkg_parts:
                     mod_to_rel[".".join(pkg_parts)] = rel
+                    if pkg_parts[0] == "src" and len(pkg_parts) >= 2:
+                        mod_to_rel[".".join(pkg_parts[1:])] = rel
             else:
                 mod_to_rel[".".join(parts)] = rel
+                if parts[0] == "src" and len(parts) >= 2:
+                    mod_to_rel[".".join(parts[1:])] = rel
         return mod_to_rel
 
     def _resolve_import_targets(
@@ -1812,7 +1816,7 @@ class CodeIntelligence:
         lines = text.splitlines()
         fname = file_path.name
 
-        if fname == "README.md":
+        if fname.lower().startswith("readme"):
             headings = [
                 line.lstrip("#").strip()
                 for line in lines
@@ -1825,7 +1829,7 @@ class CodeIntelligence:
             )
         elif fname == "pyproject.toml":
             summary = "Python package build metadata, project dependencies, and CLI entry-point configuration."
-        elif fname == "requirements.txt":
+        elif fname.lower().startswith("requirements") and fname.endswith(".txt"):
             pkgs = [
                 line.strip().split("=")[0].split(">")[0].split("<")[0].strip()
                 for line in lines
@@ -1836,10 +1840,30 @@ class CodeIntelligence:
                 if pkgs
                 else "Python runtime requirements specification."
             )
-        elif fname == ".env.example":
-            summary = "Template environment variable configuration for provider API keys (OpenRouter, Groq, Gemini, NVIDIA, Cohere)."
+        elif fname.startswith(".env"):
+            env_keys = [
+                line.split("=", 1)[0].strip()
+                for line in lines
+                if "=" in line
+                and not line.strip().startswith("#")
+                and line.split("=", 1)[0].strip()
+            ]
+            summary = (
+                f"Template environment variable configuration ({', '.join(env_keys[:6])})."
+                if env_keys
+                else "Template environment variable configuration."
+            )
         elif fname == ".gitignore":
-            summary = "Git ignore rules excluding virtual environments, secrets (.env), caches, and generated graph outputs."
+            patterns = [
+                line.strip()
+                for line in lines
+                if line.strip() and not line.strip().startswith("#")
+            ]
+            summary = (
+                f"Git ignore rules excluding untracked/generated artifacts ({', '.join(patterns[:5])})."
+                if patterns
+                else "Git ignore rules excluding untracked and generated files."
+            )
         else:
             first_non_empty = next((ln.strip() for ln in lines if ln.strip()), "")
             summary = first_non_empty[:120] or "Configuration or documentation file."
@@ -1858,25 +1882,174 @@ class CodeIntelligence:
             "external_dependencies": [],
         }
 
-    def _classify_file_layer(self, rel_path: str) -> tuple[int, str]:
-        """Assign an architectural layer rank and human-readable category for reading order."""
-        if rel_path in ("README.md", "pyproject.toml", "requirements.txt", ".env.example", ".gitignore"):
+    def _classify_file_layer(
+        self,
+        rel_path: str,
+        rec: dict[str, Any] | None = None,
+        all_paths: set[str] | None = None,
+    ) -> tuple[int, str]:
+        """Dynamically assign an architectural layer rank and human-readable category
+        for reading order based on file type, package structure, and AST metadata.
+        """
+        if (rec and rec.get("type") == "config_or_doc") or not rel_path.endswith(".py"):
             return (0, "Project Overview & Configuration")
-        if rel_path in ("main.py", "ntg/__main__.py", "test.py", "ntg/__init__.py"):
+
+        parts = Path(rel_path).parts
+        pkg_parts = parts[1:] if len(parts) > 1 and parts[0] == "src" else parts
+        fname = parts[-1]
+
+        # Layer 1: Root entry scripts, package __main__.py, and top-level package __init__.py facade
+        if len(pkg_parts) == 1:
+            if fname in (
+                "main.py",
+                "app.py",
+                "cli.py",
+                "run.py",
+                "manage.py",
+                "test.py",
+                "setup.py",
+            ) or not (rec or {}).get("imported_by"):
+                return (1, "Execution Entry Points & Top-Level Facade")
+        if fname == "__main__.py":
             return (1, "Execution Entry Points & Top-Level Facade")
-        if rel_path.startswith("ntg/core/"):
+        if len(pkg_parts) == 2 and fname == "__init__.py":
+            return (1, "Execution Entry Points & Top-Level Facade")
+
+        # Layer 7: Top-level compatibility shims (e.g. <pkg>/<mod>.py re-exporting <pkg>/<mod>/*)
+        if len(pkg_parts) == 2 and fname not in ("__init__.py", "__main__.py"):
+            stem = Path(fname).stem
+            sibling_prefix = "/".join([*parts[:-1], stem]) + "/"
+            has_sibling_subpkg = any(
+                p.startswith(sibling_prefix) for p in (all_paths or set())
+            )
+            doc_and_sum = (
+                f"{(rec or {}).get('docstring', '')} {(rec or {}).get('summary', '')}"
+            ).lower()
+            is_shim_doc = any(
+                kw in doc_and_sum for kw in ("compatibility", "shim", "re-export")
+            )
+            if (has_sibling_subpkg or is_shim_doc) and not (rec or {}).get("imported_by"):
+                return (7, "Top-Level Compatibility Shims")
+
+        subpkg = (
+            pkg_parts[1].lower()
+            if len(pkg_parts) >= 3
+            else (
+                pkg_parts[0].lower()
+                if len(pkg_parts) >= 2
+                else Path(rel_path).stem.lower()
+            )
+        )
+
+        if subpkg in {
+            "core",
+            "common",
+            "base",
+            "models",
+            "domain",
+            "types",
+            "schemas",
+            "utils",
+            "config",
+            "shared",
+            "primitives",
+        }:
             return (2, "Core Foundation (Config, Models, Quota/Error Parsing, Time)")
-        if rel_path.startswith("ntg/providers/"):
+        if subpkg in {
+            "providers",
+            "adapters",
+            "clients",
+            "integrations",
+            "backends",
+            "connectors",
+            "db",
+            "database",
+            "storage",
+            "repositories",
+        }:
             return (3, "Provider Adapters & Model Discovery")
-        if rel_path.startswith("ntg/router/") or rel_path == "ntg/cli/diagnostics.py":
-            return (4, "Smart Routing, Circuit-Breaker State, Telemetry & Runtime Diagnostics")
-        if rel_path.startswith("ntg/agent/"):
+        if subpkg in {
+            "router",
+            "routing",
+            "engine",
+            "services",
+            "pipeline",
+            "workflows",
+            "middleware",
+            "controllers",
+            "orchestration",
+        }:
+            return (
+                4,
+                "Smart Routing, Circuit-Breaker State, Telemetry & Runtime Diagnostics",
+            )
+        if subpkg in {
+            "agent",
+            "agents",
+            "intelligence",
+            "planner",
+            "reasoning",
+            "tools",
+            "verifiers",
+            "analysis",
+        }:
             return (5, "Architecture-Aware Coding Agent & Code Intelligence")
-        if rel_path.startswith("ntg/cli/"):
+        if subpkg in {
+            "cli",
+            "ui",
+            "api",
+            "web",
+            "server",
+            "views",
+            "commands",
+            "app",
+        }:
             return (6, "CLI Application Runner")
-        if rel_path in ("ntg/verifier.py", "ntg/agent.py"):
-            return (7, "Top-Level Compatibility Shims")
-        return (8, "Supporting Modules")
+
+        if len(pkg_parts) >= 3:
+            return (5, f"Package Modules ({'/'.join(parts[:-1])})")
+        return (5, "Supporting Modules")
+
+    @staticmethod
+    def _early_layer_priority(rel_path: str, rank: int) -> tuple[int, str]:
+        """Deterministic within-layer ordering key for Layer 0 (config/doc) and Layer 1 (entry points)."""
+        fname = Path(rel_path).name.lower()
+        parts = Path(rel_path).parts
+        if rank == 0:
+            if fname.startswith("readme"):
+                return (0, rel_path)
+            if fname in (
+                "pyproject.toml",
+                "setup.py",
+                "setup.cfg",
+                "package.json",
+                "cargo.toml",
+            ):
+                return (1, rel_path)
+            if fname.startswith("requirements") or fname == "pipfile":
+                return (2, rel_path)
+            if fname.startswith(".env"):
+                return (3, rel_path)
+            if fname == ".gitignore":
+                return (4, rel_path)
+            return (5, rel_path)
+        if rank == 1:
+            if len(parts) == 1 and fname in (
+                "main.py",
+                "app.py",
+                "run.py",
+                "cli.py",
+                "manage.py",
+            ):
+                return (0, rel_path)
+            if fname == "__main__.py":
+                return (1, rel_path)
+            if len(parts) == 1:
+                return (2, rel_path)
+            if fname == "__init__.py":
+                return (3, rel_path)
+            return (4, rel_path)
+        return (99, rel_path)
 
     def _compute_reading_order(
         self,
@@ -1884,28 +2057,20 @@ class CodeIntelligence:
     ) -> list[dict[str, Any]]:
         """Compute a deterministic, dependency-aware reading order across all repository files.
         Across all implementation layers (ranks >= 2), internal dependencies are guaranteed to
-        precede the modules that import them, using architectural layer rank as the primary tie-breaker.
+        precede the modules that import them, using backward-propagated architectural layer rank
+        as the primary tie-breaker.
         """
         by_path: dict[str, dict[str, Any]] = {rec["path"]: rec for rec in file_records}
+        all_paths_set: set[str] = set(by_path.keys())
         rank_by_path: dict[str, int] = {}
         label_by_path: dict[str, str] = {}
 
         for rec in file_records:
-            rank, label = self._classify_file_layer(rec["path"])
+            rank, label = self._classify_file_layer(
+                rec["path"], rec=rec, all_paths=all_paths_set
+            )
             rank_by_path[rec["path"]] = rank
             label_by_path[rec["path"]] = label
-
-        explicit_priority: dict[str, int] = {
-            "README.md": 0,
-            "pyproject.toml": 1,
-            "requirements.txt": 2,
-            ".env.example": 3,
-            ".gitignore": 4,
-            "main.py": 0,
-            "ntg/__main__.py": 1,
-            "test.py": 2,
-            "ntg/__init__.py": 3,
-        }
 
         ordered_paths: list[str] = []
         for early_rank in (0, 1):
@@ -1913,7 +2078,10 @@ class CodeIntelligence:
                 p for p, r in rank_by_path.items() if r == early_rank
             ]
             ordered_paths.extend(
-                sorted(early_paths, key=lambda p: (explicit_priority.get(p, 99), p))
+                sorted(
+                    early_paths,
+                    key=lambda p, r=early_rank: self._early_layer_priority(p, r),
+                )
             )
 
         remaining: set[str] = {
@@ -1942,6 +2110,19 @@ class CodeIntelligence:
                     if other != path and Path(other).parent == pkg_dir:
                         filtered.add(other)
             return filtered
+
+        # Propagate effective layer ranks backward along dependency edges so that any module
+        # imported by an earlier-layer module is scheduled at or before its importer's layer.
+        changed = True
+        while changed:
+            changed = False
+            for mod_path in sorted(remaining):
+                mod_rank = rank_by_path[mod_path]
+                for dep_path in _unmet_deps(mod_path, remaining):
+                    if rank_by_path[dep_path] > mod_rank:
+                        rank_by_path[dep_path] = mod_rank
+                        label_by_path[dep_path] = label_by_path[mod_path]
+                        changed = True
 
         while remaining:
             ready = [
@@ -2105,22 +2286,60 @@ class CodeIntelligence:
         question: str,
         inventory: dict[str, Any],
     ) -> list[str]:
-        """Infer relevant symbol search patterns from `question` and the repository inventory."""
+        """Infer relevant symbol search patterns dynamically from `question` and the repository inventory."""
         known_symbols: set[str] = set()
-        for f in inventory.get("files", []):
+        files = inventory.get("files", [])
+        for f in files:
             for c in f.get("classes", []):
-                known_symbols.add(c["name"])
+                if c.get("name"):
+                    known_symbols.add(str(c["name"]))
             for fn in f.get("functions", []):
-                known_symbols.add(fn["name"])
+                if fn.get("name"):
+                    known_symbols.add(str(fn["name"]))
 
         q_tokens = set(re.findall(r"[A-Za-z_][A-Za-z0-9_]{2,}", question))
         matched = [sym for sym in sorted(known_symbols) if sym in q_tokens]
         if matched:
-            return matched[:5]
+            return matched[:6]
 
-        return [
-            "UnifiedNTGRouter|ArchitectureAwareAgent|CodeIntelligence|StateManager|Deployment|run_cli"
-        ]
+        # Dynamically select representative top-level classes and entry-point functions from the inventory
+        ranked_files = sorted(
+            [f for f in files if isinstance(f, dict) and f.get("type") == "python"],
+            key=lambda f: (
+                len(f.get("classes") or []),
+                len(f.get("imported_by") or []),
+                len(f.get("internal_dependencies") or []),
+            ),
+            reverse=True,
+        )
+        representative: list[str] = []
+        for f in ranked_files:
+            for c in f.get("classes", []):
+                cname = str(c.get("name") or "")
+                if cname and cname not in representative:
+                    representative.append(cname)
+                    if len(representative) >= 6:
+                        break
+            if len(representative) >= 6:
+                break
+        if len(representative) < 6:
+            for f in ranked_files:
+                for fn in f.get("functions", []):
+                    fname = str(fn.get("name") or "")
+                    if (
+                        fname
+                        and not fname.startswith("_")
+                        and fname not in representative
+                    ):
+                        representative.append(fname)
+                        if len(representative) >= 6:
+                            break
+                if len(representative) >= 6:
+                    break
+
+        if representative:
+            return ["|".join(representative[:6])]
+        return [".*"]
 
     def gather_context(
         self,
@@ -2178,14 +2397,18 @@ class CodeIntelligence:
                     report_text = self.graph_report_path.read_text(
                         encoding="utf-8", errors="replace"
                     )
+                    valid_repo_paths = {
+                        str(f.get("path"))
+                        for f in inventory.get("files", [])
+                        if isinstance(f, dict) and f.get("path")
+                    }
+                    report_py_refs = re.findall(
+                        r"(?<![A-Za-z0-9_./\\-])((?:[A-Za-z0-9_.-]+/)+[A-Za-z0-9_.-]+\.py)\b",
+                        report_text,
+                    )
                     if not any(
-                        d in report_text
-                        for d in (
-                            "ntg/router.py",
-                            "ntg/config.py",
-                            "ntg/models.py",
-                            "ntg/telemetry.py",
-                        )
+                        ref.replace("\\", "/").lstrip("./") not in valid_repo_paths
+                        for ref in report_py_refs
                     ):
                         graphify_report_summary = "\n".join(
                             report_text.splitlines()[:80]

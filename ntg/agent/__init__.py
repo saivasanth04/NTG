@@ -8,6 +8,7 @@ from ntg.agent.orchestrator import (
     query_directory_structured,
 )
 from ntg.agent.planner import (
+    analyze_query_requirements,
     approve_plan,
     build_change_plan,
     build_planning_prompt,
@@ -33,6 +34,7 @@ __all__ = [
     "query_directory",
     "query_directory_structured",
     "CodeIntelligence",
+    "analyze_query_requirements",
     "extract_response_content",
     "build_planning_prompt",
     "build_query_prompt",

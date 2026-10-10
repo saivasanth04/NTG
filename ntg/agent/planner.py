@@ -303,48 +303,612 @@ def build_planning_prompt(
     return "\n\n".join(sections)
 
 
+_GENERIC_SNAKE_TERMS: frozenset[str] = frozenset(
+    {
+        "reading_order",
+        "file_path",
+        "file_paths",
+        "code_base",
+        "source_code",
+        "entry_point",
+        "entry_points",
+        "api_key",
+        "api_keys",
+        "rate_limit",
+        "rate_limits",
+        "circuit_breaker",
+        "circuit_breakers",
+        "step_by_step",
+        "end_to_end",
+        "high_level",
+        "top_level",
+        "command_line",
+        "open_router",
+        "error_handling",
+        "data_flow",
+        "call_graph",
+    }
+)
+
+_PYTHON_BUILTIN_IDENTIFIERS: frozenset[str] = frozenset(
+    {
+        "True",
+        "False",
+        "None",
+        "Any",
+        "Optional",
+        "Union",
+        "Callable",
+        "Iterable",
+        "Iterator",
+        "Sequence",
+        "Mapping",
+        "Path",
+        "dict",
+        "list",
+        "set",
+        "frozenset",
+        "tuple",
+        "str",
+        "int",
+        "float",
+        "bool",
+        "bytes",
+        "object",
+        "type",
+        "Exception",
+        "RuntimeError",
+        "ValueError",
+        "TypeError",
+        "KeyError",
+        "OSError",
+        "PermissionError",
+        "FileNotFoundError",
+        "SyntaxError",
+        "dataclass",
+        "Enum",
+        "main",
+        "self",
+        "cls",
+        "args",
+        "kwargs",
+    }
+)
+
+
+def _is_repo_wide_query(query: str) -> bool:
+    """Return True if the query asks for a project-wide explanation, file inventory, or reading order."""
+    q_lower = (query or "").lower()
+    keywords = (
+        "sequence of files",
+        "seqence of files",
+        "reading order",
+        "order of files",
+        "order to read",
+        "files that i should read",
+        "files to read",
+        "which files to read",
+        "understand this project",
+        "understand the project",
+        "understand this repo",
+        "understand the codebase",
+        "explain this project",
+        "explain the project",
+        "explain the codebase",
+        "explain this repo",
+        "all files",
+        "every file",
+        "repository overview",
+        "project overview",
+        "architecture",
+        "walkthrough",
+    )
+    return any(k in q_lower for k in keywords)
+
+
+def _is_early_tier_file(
+    path: str,
+    rec: dict[str, Any] | None,
+    ro_item: dict[str, Any] | None,
+) -> bool:
+    """Dynamically determine whether `path` belongs to Layer 0 (config/doc) or Layer 1
+    (execution entry points & top-level package facade) from the repository inventory.
+    """
+    if isinstance(ro_item, dict) and isinstance(ro_item.get("layer_rank"), int):
+        return int(ro_item["layer_rank"]) < 2
+    if isinstance(rec, dict) and rec.get("type") != "python":
+        return True
+    if not path.endswith(".py"):
+        return True
+    parts = Path(path).parts
+    pkg_parts = parts[1:] if len(parts) > 1 and parts[0] == "src" else parts
+    fname = parts[-1]
+    if len(pkg_parts) == 1:
+        return True
+    if fname == "__main__.py":
+        return True
+    if len(pkg_parts) == 2 and fname == "__init__.py":
+        return True
+    return False
+
+
+def analyze_query_requirements(
+    query: str,
+    context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Dynamically analyze the user's question against the verified repository inventory
+    to determine query scope, target files, queried symbols, unmatched targets,
+    architectural layers, cross-package dependency constraints, and requested deliverables.
+    """
+    q_text = (query or "").strip()
+    q_lower = q_text.lower()
+
+    inv = (
+        context.get("repository_inventory")
+        if isinstance(context, dict)
+        and isinstance(context.get("repository_inventory"), dict)
+        else {}
+    )
+    files_list = inv.get("files") if isinstance(inv.get("files"), list) else []
+    reading_order = (
+        inv.get("reading_order") if isinstance(inv.get("reading_order"), list) else []
+    )
+    excluded_dirs = (
+        inv.get("excluded_dirs") if isinstance(inv.get("excluded_dirs"), list) else []
+    )
+    excluded_files = (
+        inv.get("excluded_files") if isinstance(inv.get("excluded_files"), list) else []
+    )
+
+    files_by_path: dict[str, dict[str, Any]] = {
+        str(f["path"]): f
+        for f in files_list
+        if isinstance(f, dict) and f.get("path")
+    }
+    ro_by_path: dict[str, dict[str, Any]] = {
+        str(item["path"]): item
+        for item in reading_order
+        if isinstance(item, dict) and item.get("path")
+    }
+    ordered_repo_paths: list[str] = [
+        str(item["path"])
+        for item in reading_order
+        if isinstance(item, dict) and item.get("path") in files_by_path
+    ]
+    for p in files_by_path:
+        if p not in ordered_repo_paths:
+            ordered_repo_paths.append(p)
+
+    # Dynamically group architectural layers from reading_order
+    layers: list[dict[str, Any]] = []
+    for item in reading_order:
+        if not isinstance(item, dict) or not item.get("path"):
+            continue
+        l_name = str(item.get("layer") or "Modules")
+        step_num = int(item.get("step") or (len(layers) + 1))
+        if not layers or layers[-1]["layer"] != l_name:
+            layers.append(
+                {
+                    "layer": l_name,
+                    "layer_rank": item.get("layer_rank", 99),
+                    "start_step": step_num,
+                    "end_step": step_num,
+                    "files": [str(item["path"])],
+                }
+            )
+        else:
+            layers[-1]["end_step"] = step_num
+            layers[-1]["files"].append(str(item["path"]))
+
+    # Dynamically detect cross-package dependency promotions in reading_order
+    cross_package_deps: list[dict[str, Any]] = []
+    for item in reading_order:
+        if not isinstance(item, dict) or not item.get("path"):
+            continue
+        mod_path = str(item["path"])
+        if _is_early_tier_file(mod_path, files_by_path.get(mod_path), item):
+            continue
+        mod_step = int(item.get("step") or 0)
+        for dep_path in item.get("depends_on") or []:
+            dep_item = ro_by_path.get(dep_path)
+            if not dep_item or _is_early_tier_file(
+                dep_path, files_by_path.get(dep_path), dep_item
+            ):
+                continue
+            dep_step = int(dep_item.get("step") or 0)
+            if (
+                Path(dep_path).parent != Path(mod_path).parent
+                and dep_item.get("layer") == item.get("layer")
+                and dep_step < mod_step
+            ):
+                cross_package_deps.append(
+                    {
+                        "dependency": dep_path,
+                        "dependent": mod_path,
+                        "dependency_step": dep_step,
+                        "dependent_step": mod_step,
+                    }
+                )
+
+    # Build repository-wide symbol & module maps
+    symbol_to_files: dict[str, set[str]] = {}
+    symbol_lower_to_canonical: dict[str, str] = {}
+    all_module_stems: set[str] = set()
+    all_package_dirs: set[str] = set()
+
+    for path, rec in files_by_path.items():
+        stem = Path(path).stem.lower()
+        if stem and stem != "__init__":
+            all_module_stems.add(stem)
+        parent_str = Path(path).parent.as_posix().lower()
+        if parent_str and parent_str != ".":
+            all_package_dirs.add(parent_str)
+            for part in Path(path).parent.parts:
+                all_package_dirs.add(part.lower())
+
+        for cls in rec.get("classes", []):
+            cname = str(cls.get("name") or "")
+            if cname:
+                symbol_to_files.setdefault(cname, set()).add(path)
+                symbol_lower_to_canonical[cname.lower()] = cname
+                for m in cls.get("methods", []):
+                    if isinstance(m, str) and not m.startswith("__"):
+                        symbol_to_files.setdefault(m, set()).add(path)
+                        symbol_lower_to_canonical.setdefault(m.lower(), m)
+        for fn in rec.get("functions", []):
+            fname = str(fn.get("name") or "")
+            if fname:
+                symbol_to_files.setdefault(fname, set()).add(path)
+                symbol_lower_to_canonical[fname.lower()] = fname
+        for const in rec.get("constants", []):
+            if isinstance(const, str) and const:
+                symbol_to_files.setdefault(const, set()).add(path)
+                symbol_lower_to_canonical.setdefault(const.lower(), const)
+        for exp in rec.get("exports", []):
+            if isinstance(exp, str) and exp:
+                symbol_to_files.setdefault(exp, set()).add(path)
+                symbol_lower_to_canonical.setdefault(exp.lower(), exp)
+
+    # 1. Detect explicit file/directory mentions and unmatched file references in `query`
+    explicit_target_files: set[str] = set()
+    unmatched_targets: list[str] = []
+    valid_path_set = set(ordered_repo_paths)
+    basename_to_paths: dict[str, list[str]] = {}
+    for p in ordered_repo_paths:
+        basename_to_paths.setdefault(Path(p).name.lower(), []).append(p)
+
+    excluded_file_names = {
+        str(f.get("path") or "").lower()
+        for f in excluded_files
+        if isinstance(f, dict)
+    }
+
+    for p in ordered_repo_paths:
+        if p.lower() in q_lower or p.replace("/", "\\").lower() in q_lower:
+            explicit_target_files.add(p)
+
+    # Check explicit `.py` file tokens in the query
+    for py_match in re.findall(
+        r"(?<![A-Za-z0-9_./\\-])((?:[A-Za-z0-9_.-]+/)*[A-Za-z0-9_.-]+\.py)\b",
+        q_text,
+    ):
+        norm_py = py_match.replace("\\", "/").lstrip("./")
+        if norm_py in valid_path_set:
+            explicit_target_files.add(norm_py)
+        elif "/" not in norm_py and norm_py.lower() in basename_to_paths:
+            for matched_p in basename_to_paths[norm_py.lower()]:
+                explicit_target_files.add(matched_p)
+        elif norm_py.lower() not in excluded_file_names:
+            if norm_py not in unmatched_targets:
+                unmatched_targets.append(norm_py)
+
+    # Check explicit package directory prefixes (e.g., "ntg/router", "ntg/providers")
+    for pkg_dir in sorted(all_package_dirs, key=len, reverse=True):
+        if "/" in pkg_dir and pkg_dir in q_lower:
+            for p in ordered_repo_paths:
+                if p.lower().startswith(pkg_dir + "/"):
+                    explicit_target_files.add(p)
+
+    # 2. Detect explicit code symbol mentions and unmatched code identifiers in `query`
+    queried_symbols: list[str] = []
+    backtick_tokens = re.findall(r"`([A-Za-z_][A-Za-z0-9_]*)`", q_text)
+    camel_tokens = re.findall(
+        r"\b([A-Z][a-z0-9]+(?:[A-Z][A-Za-z0-9]*)+)\b", q_text
+    )
+    snake_tokens = re.findall(r"\b([a-z_][a-z0-9]*_[a-z0-9_]+)\b", q_text)
+
+    candidate_code_tokens: list[str] = []
+    for tok in [*backtick_tokens, *camel_tokens, *snake_tokens]:
+        if tok not in candidate_code_tokens:
+            candidate_code_tokens.append(tok)
+
+    for tok in candidate_code_tokens:
+        tok_low = tok.lower()
+        if tok in symbol_to_files:
+            if tok not in queried_symbols:
+                queried_symbols.append(tok)
+            explicit_target_files.update(symbol_to_files[tok])
+        elif tok_low in symbol_lower_to_canonical:
+            canon = symbol_lower_to_canonical[tok_low]
+            if canon not in queried_symbols:
+                queried_symbols.append(canon)
+            explicit_target_files.update(symbol_to_files[canon])
+        elif (
+            tok_low in all_module_stems
+            or tok_low in all_package_dirs
+            or tok_low in _GENERIC_SNAKE_TERMS
+            or tok in _PYTHON_BUILTIN_IDENTIFIERS
+        ):
+            for p in ordered_repo_paths:
+                if Path(p).stem.lower() == tok_low:
+                    explicit_target_files.add(p)
+        else:
+            if tok not in unmatched_targets:
+                unmatched_targets.append(tok)
+
+    # Also match exact symbol names (length >= 5) mentioned without backticks
+    for word in re.findall(r"\b([A-Za-z_][A-Za-z0-9_]{4,})\b", q_text):
+        if word in symbol_to_files and word not in _STOP_WORDS:
+            if word not in queried_symbols:
+                queried_symbols.append(word)
+            explicit_target_files.update(symbol_to_files[word])
+
+    # 3. Determine scope (`repo_wide` vs `targeted`) and `target_files`
+    broad_intent = _is_repo_wide_query(q_text)
+    if broad_intent and not unmatched_targets:
+        scope = "repo_wide"
+        is_repo_wide = True
+        target_files = list(ordered_repo_paths)
+    elif explicit_target_files:
+        scope = "targeted"
+        is_repo_wide = False
+        # Include direct internal dependencies of explicitly targeted files when dependency/flow context is requested
+        expanded = set(explicit_target_files)
+        if any(
+            k in q_lower
+            for k in ("depend", "import", "order", "sequence", "flow", "call")
+        ):
+            for p in list(explicit_target_files):
+                rec = files_by_path.get(p, {})
+                for dep in rec.get("internal_dependencies") or []:
+                    if dep in files_by_path:
+                        expanded.add(dep)
+        target_files = [p for p in ordered_repo_paths if p in expanded]
+    elif unmatched_targets:
+        scope = "targeted"
+        is_repo_wide = False
+        target_files = []
+    else:
+        # Keyword relevance scoring across the verified inventory
+        q_non_stop = {
+            t
+            for t in re.findall(r"[a-z0-9_]{4,}", q_lower)
+            if t not in _STOP_WORDS
+        }
+        scored_paths: list[str] = []
+        if q_non_stop:
+            for p in ordered_repo_paths:
+                anchors = _build_file_anchor_tokens(
+                    files_by_path[p], ro_by_path.get(p)
+                )
+                overlap = q_non_stop & anchors
+                if len(overlap) >= 2 or (
+                    len(q_non_stop) == 1 and len(overlap) == 1
+                ):
+                    scored_paths.append(p)
+        if scored_paths and len(scored_paths) < len(ordered_repo_paths):
+            scope = "targeted"
+            is_repo_wide = False
+            target_files = scored_paths
+        else:
+            scope = "repo_wide"
+            is_repo_wide = True
+            target_files = list(ordered_repo_paths)
+
+    # 4. Determine requested deliverables from the user's question
+    requested_deliverables: list[str] = []
+    if any(
+        k in q_lower
+        for k in (
+            "sequence of files",
+            "seqence of files",
+            "reading order",
+            "order of files",
+            "order to read",
+            "files that i should read",
+            "files to read",
+            "which files to read",
+            "step by step",
+            "step-by-step",
+            "walkthrough",
+        )
+    ):
+        requested_deliverables.append("reading_order")
+
+    if (
+        any(
+            k in q_lower
+            for k in (
+                "description",
+                "describe",
+                "explain",
+                "summary",
+                "summarize",
+                "what does",
+                "what each",
+                "purpose",
+                "role",
+                "understand",
+                "overview",
+            )
+        )
+        or is_repo_wide
+        or "reading_order" in requested_deliverables
+    ):
+        requested_deliverables.append("file_descriptions")
+
+    if (
+        any(
+            k in q_lower
+            for k in (
+                "class",
+                "classes",
+                "function",
+                "functions",
+                "method",
+                "methods",
+                "symbol",
+                "symbols",
+                "api",
+                "exports",
+                "signature",
+            )
+        )
+        or bool(queried_symbols)
+    ):
+        requested_deliverables.append("symbol_details")
+
+    if any(
+        k in q_lower
+        for k in (
+            "depend",
+            "dependencies",
+            "dependency",
+            "import",
+            "imports",
+            "call",
+            "flow",
+            "interact",
+            "relationship",
+            "architecture",
+            "layer",
+            "layers",
+        )
+    ):
+        requested_deliverables.append("dependency_relationships")
+
+    if is_repo_wide or any(
+        k in q_lower
+        for k in ("excluded", "ignored", ".gitignore", ".env", "coverage", "limitation")
+    ):
+        requested_deliverables.append("exclusions_or_limitations")
+
+    if not requested_deliverables:
+        requested_deliverables.append("file_descriptions")
+
+    return {
+        "scope": scope,
+        "is_repo_wide": is_repo_wide,
+        "target_files": target_files,
+        "queried_symbols": queried_symbols,
+        "unmatched_targets": unmatched_targets,
+        "requested_deliverables": requested_deliverables,
+        "layers": layers,
+        "cross_package_dependencies": cross_package_deps,
+        "excluded_dirs": [
+            str(d.get("path"))
+            for d in excluded_dirs
+            if isinstance(d, dict) and d.get("path")
+        ],
+        "excluded_files": [
+            str(f.get("path"))
+            for f in excluded_files
+            if isinstance(f, dict) and f.get("path")
+        ],
+    }
+
+
 def build_query_prompt(
     query: str,
     context: dict[str, Any] | None = None,
 ) -> str:
-    """Construct an architecture-grounded prompt for answering a query about a directory."""
+    """Construct a question-aware, architecture-grounded prompt dynamically derived
+    from the verified repository inventory without hard-coded file or step assumptions.
+    """
     if not isinstance(query, str) or not query.strip():
         raise ValueError("query must be a non-empty string.")
+
+    req = analyze_query_requirements(query=query, context=context)
+    target_files = req["target_files"]
+    total_target = len(target_files)
+    layers = req["layers"]
+    cross_deps = req["cross_package_dependencies"]
+    deliverables = req["requested_deliverables"]
+
+    rules: list[str] = [
+        "1. Reference the exact file paths, modules, classes, functions, and internal dependencies from the Verified Repository File Inventory below.",
+        "2. Never invent, guess, or hallucinate files, modules, classes, functions, or dependencies that are not present in the verified inventory.",
+    ]
+
+    if req["unmatched_targets"]:
+        unmatched_str = ", ".join(f"`{u}`" for u in req["unmatched_targets"])
+        rules.append(
+            f"3. The user question references target(s) not found in the verified repository inventory ({unmatched_str}). Explicitly state that these target(s) do not exist in this repository instead of inventing details."
+        )
+    elif req["is_repo_wide"] and total_target > 0:
+        layer_summaries: list[str] = []
+        for l_info in layers:
+            l_files = l_info.get("files") or []
+            sample_str = ", ".join(f"`{p}`" for p in l_files[:6])
+            if len(l_files) > 6:
+                sample_str += f", ... ({len(l_files)} files)"
+            layer_summaries.append(
+                f"{l_info['layer']} (steps {l_info['start_step']}–{l_info['end_step']}: {sample_str})"
+            )
+        layers_joined = "; ".join(layer_summaries) if layer_summaries else f"{total_target} repository files"
+        rules.append(
+            f"3. Cover every single file in the Verified Repository File Inventory ({total_target} files total) across all dynamically discovered architectural layers: {layers_joined}."
+        )
+    elif total_target > 0:
+        targets_str = ", ".join(f"`{p}`" for p in target_files)
+        rules.append(
+            f"3. Cover all relevant target file(s) identified for this question ({targets_str}) using their verified AST symbols, docstrings, and dependencies."
+        )
+
+    if "reading_order" in deliverables or req["is_repo_wide"]:
+        cross_note = ""
+        if cross_deps:
+            cross_clauses = [
+                f"keep `{cd['dependency']}` (step {cd['dependency_step']}) before `{cd['dependent']}` (step {cd['dependent_step']}) because `{cd['dependent']}` imports `{cd['dependency']}`"
+                for cd in cross_deps[:4]
+            ]
+            cross_note = f" (in particular, {'; '.join(cross_clauses)})"
+        step_range_str = (
+            f"steps 1 through {total_target}"
+            if total_target > 0
+            else "the dependency-aware reading order"
+        )
+        rules.append(
+            f"4. Preserve the EXACT numbered dependency-aware reading order ({step_range_str}) from the Verified Repository File Inventory below without reordering any steps{cross_note}. For each file, state its step number, backticked relative path, actual classes/functions/exports, and a concise evidence-grounded description of what the file does."
+        )
+    else:
+        deliv_str = ", ".join(deliverables)
+        rules.append(
+            f"4. Address every requested deliverable ({deliv_str}): provide evidence-grounded descriptions, actual AST classes/functions/exports, and internal dependency relationships for the relevant modules."
+        )
+
+    excl_items = [
+        *[f"`{d}/`" for d in req["excluded_dirs"]],
+        *[f"`{f}`" for f in req["excluded_files"]],
+    ]
+    excl_clause = (
+        f" (such as {', '.join(excl_items[:6])})" if excl_items else ""
+    )
+    rules.append(
+        f"5. Explicitly mention excluded directories/files{excl_clause} and any retrieval warnings or coverage limitations from the diagnostics section rather than guessing."
+    )
 
     sections: list[str] = [
         "You are an architecture-aware AI codebase assistant.",
         "Use the verified repository file inventory, AST dependency analysis, Graphify knowledge graph, and Codebase Memory MCP symbol context below to answer the user's question accurately, thoroughly, and concisely.",
         "Strict Grounding Rules:",
-        "1. Reference the exact file paths, modules, classes, functions, and internal dependencies from the Verified Repository File Inventory below.",
-        "2. Never invent, guess, or hallucinate files, modules, classes, or dependencies that are not present in the inventory.",
-        "3. Cover every single file in the Verified Repository File Inventory across all architectural layers: Project Overview & Configuration (`README.md`, `pyproject.toml`, `requirements.txt`, `.env.example`, `.gitignore`), Execution Entry Points (`main.py`, `ntg/__main__.py`, `test.py`, `ntg/__init__.py`), Core Foundation (`ntg/core/*`), Provider Adapters (`ntg/providers/*`), Smart Routing, State, Telemetry & Runtime Diagnostics (`ntg/cli/diagnostics.py`, `ntg/router/*`), Architecture-Aware Coding Agent (`ntg/agent/*`), CLI Application Runner (`ntg/cli/app.py`, `ntg/cli/__init__.py`), and Compatibility Shims (`ntg/verifier.py`, `ntg/agent.py`).",
-        "4. Preserve the EXACT numbered dependency-aware reading order (steps 1 through 37) from the Verified Repository File Inventory below without reordering any steps (in particular, keep `ntg/cli/diagnostics.py` before `ntg/router/engine.py` because `ntg/router/engine.py` imports `ntg/cli/diagnostics.py`). For each file, state its step number, backticked relative path, actual classes/functions/exports, and what the file does.",
-        "5. Explicitly mention excluded directories/files (such as `.env`, `.ntg/`, `graphify-out/`, `__pycache__/`) and any retrieval warnings or coverage limitations from the diagnostics section rather than guessing.",
+        *rules,
         "",
         f"## User Question\n{query.strip()}",
     ]
 
     _append_context_sections(sections, context)
     return "\n\n".join(sections)
-
-
-def _is_repo_wide_query(query: str) -> bool:
-    """Return True if the query asks for a project-wide explanation, file inventory, or reading order."""
-    q_lower = query.lower()
-    keywords = (
-        "sequence of files",
-        "seqence of files",
-        "reading order",
-        "files that i should read",
-        "understand this project",
-        "understand the project",
-        "explain this project",
-        "explain the codebase",
-        "all files",
-        "architecture",
-        "walkthrough",
-    )
-    return any(k in q_lower for k in keywords)
 
 
 def _strip_diagnostic_footers(answer_text: str) -> str:
@@ -443,12 +1007,23 @@ def _build_file_anchor_tokens(
         str((ro_item or {}).get("summary") or ""),
         str((ro_item or {}).get("layer") or ""),
     ]
+    combined_doc_lower = " ".join(text_sources).lower()
     for src in text_sources:
         for tok in re.findall(r"[a-z0-9_]{4,}", src.lower()):
             if tok not in _STOP_WORDS:
                 anchors.add(tok)
 
-    if path.endswith("__init__.py") or path in ("ntg/agent.py", "ntg/verifier.py"):
+    # Dynamically detect package initializer facades and compatibility shims from inventory metadata
+    is_facade_or_shim = (
+        path.endswith("__init__.py")
+        or bool(file_rec.get("exports"))
+        or (isinstance(ro_item, dict) and ro_item.get("layer_rank") == 7)
+        or any(
+            kw in combined_doc_lower
+            for kw in ("compatibility", "shim", "re-export", "facade")
+        )
+    )
+    if is_facade_or_shim:
         anchors.update(
             {
                 "re-export",
@@ -503,6 +1078,9 @@ def _extract_file_entry_lines(
     from `answer_body`. Prioritizes numbered reading-order step lines over indented sub-bullets or
     forward-references in 'Imports'/'Delegates to' clauses.
     """
+    if not all_repo_paths or not answer_body:
+        return {}, {}, []
+
     lines = answer_body.splitlines()
     sorted_paths_by_len = sorted(all_repo_paths, key=len, reverse=True)
     escaped_alts = "|".join(
@@ -614,22 +1192,38 @@ def _validate_file_descriptions(
     ro_by_path: dict[str, dict[str, Any]],
 ) -> dict[str, Any]:
     """Deterministically validate per-file descriptions against AST inventory metadata
-    and detect symbol/dependency misattributions.
+    and detect symbol/dependency misattributions or invented symbol claims.
     """
     ungrounded_descriptions: list[dict[str, Any]] = []
     unsupported_claims: list[dict[str, Any]] = []
+    files_with_ast_symbol_mentions: set[str] = set()
 
     # Build repository-wide map of top-level classes and functions to their defining and related files
     symbol_definers: dict[str, set[str]] = {}
     symbol_related_files: dict[str, set[str]] = {}
+    all_repo_valid_identifiers: set[str] = set(_PYTHON_BUILTIN_IDENTIFIERS)
 
     for path, rec in files_by_path.items():
         deps = set(rec.get("internal_dependencies") or [])
         importers = set(rec.get("imported_by") or [])
         exports = set(rec.get("exports") or [])
 
+        stem = Path(path).stem
+        if stem:
+            all_repo_valid_identifiers.add(stem)
+        for part in Path(path).parts[:-1]:
+            all_repo_valid_identifiers.add(part)
+        for ext in rec.get("external_dependencies") or []:
+            if isinstance(ext, str):
+                all_repo_valid_identifiers.add(ext)
+
         for cls in rec.get("classes", []):
             cname = str(cls.get("name") or "")
+            if cname:
+                all_repo_valid_identifiers.add(cname)
+                for m in cls.get("methods", []):
+                    if isinstance(m, str):
+                        all_repo_valid_identifiers.add(m)
             if len(cname) >= 5:
                 symbol_definers.setdefault(cname, set()).add(path)
                 symbol_related_files.setdefault(cname, set()).update(
@@ -637,19 +1231,26 @@ def _validate_file_descriptions(
                 )
         for fn in rec.get("functions", []):
             fname = str(fn.get("name") or "")
+            if fname:
+                all_repo_valid_identifiers.add(fname)
             if len(fname) >= 5 and not fname.startswith("__"):
                 symbol_definers.setdefault(fname, set()).add(path)
                 symbol_related_files.setdefault(fname, set()).update(
                     {path, *deps, *importers}
                 )
+        for const in rec.get("constants", []):
+            if isinstance(const, str) and const:
+                all_repo_valid_identifiers.add(const)
         for exp in exports:
+            if isinstance(exp, str) and exp:
+                all_repo_valid_identifiers.add(exp)
             if len(exp) >= 5:
                 symbol_related_files.setdefault(exp, set()).update(
                     {path, *deps, *importers}
                 )
 
     # Propagate symbol exports to shims/importers of re-exporting `__init__.py` packages
-    for sym, definers in list(symbol_definers.items()):
+    for sym in list(symbol_definers.keys()):
         for path, rec in files_by_path.items():
             if sym in set(rec.get("exports") or []):
                 symbol_related_files[sym].add(path)
@@ -657,6 +1258,14 @@ def _validate_file_descriptions(
 
     explicit_def_re = re.compile(
         r"\b(?:defines|implements|declares|Classes\s*:|Functions\s*:)\s*(?:the\s+)?(?:class|function|dataclass|enum)?\s*`?([A-Za-z_][A-Za-z0-9_]*)`?",
+        re.IGNORECASE,
+    )
+    symbol_list_line_re = re.compile(
+        r"(?:Classes/Functions(?:/Exports)?|Classes|Functions)\s*\*?\*?\s*:\s*(.+)",
+        re.IGNORECASE,
+    )
+    dep_claim_re = re.compile(
+        r"(?:Imports\s+from\s+repo|Internal\s+dependencies|Depends\s+on)\s*\*?\*?\s*:\s*([^\n|]+)",
         re.IGNORECASE,
     )
 
@@ -693,32 +1302,46 @@ def _validate_file_descriptions(
         else:
             grounded_count += 1
 
-        # Check for symbol misattribution in the primary description clause for `path`
-        # (Before relational clauses like "Imported by:", "Used by:", "Before", "After", "Unlike")
-        own_clause = re.split(
-            r"\b(?:imported\s+by|used\s+by|called\s+by|consumed\s+by|before\s+reading|after\s+reading|unlike|whereas|precedes|follows)\b",
-            primary_line,
-            maxsplit=1,
-            flags=re.IGNORECASE,
-        )[0]
-        # Also remove the "Imports from repo: ..." / "Depends on: ..." suffix when checking definition ownership
-        def_clause = re.split(
-            r"\b(?:imports\s+from\s+repo|imports\s*:|depends\s+on|internal\s+dependencies)\b",
-            own_clause,
-            maxsplit=1,
-            flags=re.IGNORECASE,
-        )[0]
-
         file_own_symbols = (
             {str(c["name"]) for c in rec.get("classes", []) if c.get("name")}
+            | {
+                str(m)
+                for c in rec.get("classes", [])
+                for m in (c.get("methods") or [])
+                if m
+            }
             | {str(f["name"]) for f in rec.get("functions", []) if f.get("name")}
             | {str(e) for e in rec.get("exports", []) if e}
             | {str(k) for k in rec.get("constants", []) if k}
         )
 
-        # 1. Explicit "defines/implements <Symbol>" claim check
+        # Track whether at least one actual AST symbol of `path` is mentioned in its description window
+        if any(sym in window_text for sym in file_own_symbols):
+            files_with_ast_symbol_mentions.add(path)
+
+        # Check for symbol misattribution in the primary description clause for `path`
+        own_clause = re.split(
+            r"\b(?:imported\s+by|used\s+by|called\s+by|consumed\s+by|before\s+reading|after\s+reading|unlike|whereas|precedes|follows)\b",
+            window_text,
+            maxsplit=1,
+            flags=re.IGNORECASE,
+        )[0]
+        def_clause = re.split(
+            r"\b(?:imports\s+from\s+repo|imports\s*:|depends\s+on|internal\s+dependencies|delegates\s+to|invokes)\b",
+            own_clause,
+            maxsplit=1,
+            flags=re.IGNORECASE,
+        )[0]
+
+        # 1. Explicit "defines/implements <Symbol>" claim check (catches both misattributed and invented symbols)
         for m in explicit_def_re.finditer(def_clause):
             claimed_sym = m.group(1)
+            if (
+                claimed_sym in _PYTHON_BUILTIN_IDENTIFIERS
+                or claimed_sym.lower() in _STOP_WORDS
+                or len(claimed_sym) < 4
+            ):
+                continue
             if (
                 claimed_sym in symbol_definers
                 and claimed_sym not in file_own_symbols
@@ -736,8 +1359,68 @@ def _validate_file_descriptions(
                         ),
                     }
                 )
+            elif (
+                rec.get("type") == "python"
+                and claimed_sym not in file_own_symbols
+                and claimed_sym not in all_repo_valid_identifiers
+                and (
+                    "_" in claimed_sym
+                    or bool(re.match(r"^[A-Z][a-z0-9]+[A-Z]", claimed_sym))
+                )
+            ):
+                unsupported_claims.append(
+                    {
+                        "file": path,
+                        "symbol": claimed_sym,
+                        "actual_defined_in": [],
+                        "reason": (
+                            f"Description for '{path}' claims non-existent symbol '{claimed_sym}' "
+                            "not found in the verified AST inventory"
+                        ),
+                    }
+                )
 
-        # 2. Unrelated distinctive symbol attribution check in `def_clause`
+        # 2. Check backticked identifiers inside explicit `Classes/Functions/Exports:` lines for Python files
+        if rec.get("type") == "python":
+            for m_list in symbol_list_line_re.finditer(window_text):
+                list_segment = m_list.group(1)
+                for bt_sym in re.findall(
+                    r"`([A-Za-z_][A-Za-z0-9_]*)`", list_segment
+                ):
+                    if (
+                        bt_sym in file_own_symbols
+                        or bt_sym in _PYTHON_BUILTIN_IDENTIFIERS
+                        or path in symbol_related_files.get(bt_sym, set())
+                        or bt_sym == Path(path).stem
+                    ):
+                        continue
+                    if bt_sym in symbol_definers:
+                        actual_owners = sorted(symbol_definers[bt_sym])
+                        unsupported_claims.append(
+                            {
+                                "file": path,
+                                "symbol": bt_sym,
+                                "actual_defined_in": actual_owners,
+                                "reason": (
+                                    f"Symbol list for '{path}' claims '{bt_sym}', "
+                                    f"which belongs to {', '.join(actual_owners)}"
+                                ),
+                            }
+                        )
+                    elif bt_sym not in all_repo_valid_identifiers:
+                        unsupported_claims.append(
+                            {
+                                "file": path,
+                                "symbol": bt_sym,
+                                "actual_defined_in": [],
+                                "reason": (
+                                    f"Symbol list for '{path}' claims non-existent symbol '{bt_sym}' "
+                                    "not found in the verified AST inventory"
+                                ),
+                            }
+                        )
+
+        # 3. Unrelated distinctive symbol attribution check in `def_clause`
         already_flagged = {
             c["symbol"] for c in unsupported_claims if c.get("file") == path
         }
@@ -746,7 +1429,10 @@ def _validate_file_descriptions(
                 continue
             if path in symbol_related_files.get(sym, set()):
                 continue
-            if re.search(rf"(?<![A-Za-z0-9_.]){re.escape(sym)}(?![A-Za-z0-9_])", def_clause):
+            if re.search(
+                rf"(?<![A-Za-z0-9_.]){re.escape(sym)}(?![A-Za-z0-9_])",
+                def_clause,
+            ):
                 actual_owners = sorted(definers)
                 unsupported_claims.append(
                     {
@@ -760,9 +1446,37 @@ def _validate_file_descriptions(
                     }
                 )
 
+        # 4. Contradicted internal dependency claim check
+        if rec.get("type") == "python":
+            actual_deps = set(rec.get("internal_dependencies") or [])
+            actual_importers = set(rec.get("imported_by") or [])
+            for m_dep in dep_claim_re.finditer(window_text):
+                dep_clause_text = m_dep.group(1)
+                for other_p in files_by_path:
+                    if other_p == path:
+                        continue
+                    if other_p in dep_clause_text:
+                        if (
+                            other_p not in actual_deps
+                            and other_p not in actual_importers
+                        ):
+                            unsupported_claims.append(
+                                {
+                                    "file": path,
+                                    "symbol": other_p,
+                                    "actual_defined_in": [other_p],
+                                    "reason": (
+                                        f"Description for '{path}' claims internal dependency on '{other_p}', "
+                                        f"which is not imported by '{path}' in the verified AST dependency graph"
+                                    ),
+                                }
+                            )
+
     return {
         "checked_files_count": len(covered_files),
         "grounded_files_count": grounded_count,
+        "files_with_ast_symbol_mentions_count": len(files_with_ast_symbol_mentions),
+        "files_with_ast_symbol_mentions": sorted(files_with_ast_symbol_mentions),
         "ungrounded_descriptions": ungrounded_descriptions,
         "unsupported_claims": unsupported_claims,
     }
@@ -772,17 +1486,18 @@ def _validate_reading_order(
     observed_order: list[str],
     files_by_path: dict[str, dict[str, Any]],
     ro_by_path: dict[str, dict[str, Any]],
-    is_repo_wide: bool,
+    validate_order: bool,
 ) -> dict[str, Any]:
     """Validate that in the observed reading order, internal dependencies precede the
-    implementation modules that import them.
+    implementation modules that import them. Entry-point and configuration files in
+    Layers 0–1 are derived dynamically from the repository inventory.
     """
     pos_by_path = {path: idx + 1 for idx, path in enumerate(observed_order)}
     violations: list[dict[str, Any]] = []
     checked_edges = 0
     satisfied_edges = 0
 
-    if not is_repo_wide or len(observed_order) < 2:
+    if not validate_order or len(observed_order) < 2:
         return {
             "checked_dependency_edges": 0,
             "satisfied_dependency_edges": 0,
@@ -791,14 +1506,15 @@ def _validate_reading_order(
             "observed_order": observed_order,
         }
 
-    # Entry points in Layer 1 (`main.py`, `ntg/__main__.py`, `test.py`, `ntg/__init__.py`)
-    # intentionally appear in the entry-point overview layer before the implementation layers.
-    # All implementation modules and subpackage facades in Layers 2..7 must appear AFTER
-    # their internal dependencies in Layers 2..7.
-    entry_points = {"main.py", "ntg/__main__.py", "test.py", "ntg/__init__.py"}
+    # Dynamically derive early-tier files (Layer 0 config/docs and Layer 1 entry points / top-level facade)
+    early_tier_files = {
+        p
+        for p in files_by_path
+        if _is_early_tier_file(p, files_by_path.get(p), ro_by_path.get(p))
+    }
 
     for mod_path in observed_order:
-        if mod_path in entry_points:
+        if mod_path in early_tier_files:
             continue
         mod_rec = files_by_path.get(mod_path)
         if not mod_rec or mod_rec.get("type") != "python":
@@ -808,7 +1524,7 @@ def _validate_reading_order(
         mod_deps = mod_rec.get("internal_dependencies") or []
 
         for dep_path in mod_deps:
-            if dep_path in entry_points or dep_path not in pos_by_path:
+            if dep_path in early_tier_files or dep_path not in pos_by_path:
                 continue
             dep_rec = files_by_path.get(dep_path)
             if not dep_rec:
@@ -816,8 +1532,7 @@ def _validate_reading_order(
             # Skip mutual imports if any exist
             if mod_path in (dep_rec.get("internal_dependencies") or []):
                 continue
-            # If a non-__init__ module in the same subpackage is compared with its own subpackage __init__.py,
-            # subpackage __init__.py re-export facades are placed at the end of their subpackage.
+            # Subpackage __init__.py re-export facades are placed at the end of their subpackage
             if (
                 dep_path.endswith("/__init__.py")
                 and Path(dep_path).parent == Path(mod_path).parent
@@ -851,15 +1566,259 @@ def _validate_reading_order(
     }
 
 
+def _validate_deliverables(
+    answer_body: str,
+    full_answer_text: str,
+    req: dict[str, Any],
+    ver: dict[str, Any],
+    files_by_path: dict[str, dict[str, Any]],
+    covered_files: list[str],
+    omitted_files: list[str],
+    observed_order: list[str],
+    desc_val: dict[str, Any],
+    order_val: dict[str, Any],
+) -> dict[str, Any]:
+    """Verify that every deliverable requested by the user's question is satisfied by
+    verified AST, dependency, and inventory evidence rather than heuristic path mentions.
+    """
+    requested = req["requested_deliverables"]
+    target_files = req["target_files"]
+    covered_targets = [p for p in target_files if p in covered_files]
+    queried_symbols = req["queried_symbols"]
+    unmatched_targets = req["unmatched_targets"]
+
+    missing_evidence: list[str] = []
+    if not ver["inventory_verified"] or not files_by_path:
+        missing_evidence.append(
+            "Verified repository inventory is unavailable or empty."
+        )
+    if unmatched_targets:
+        missing_evidence.append(
+            "Requested target(s) do not exist in the verified repository inventory: "
+            + ", ".join(unmatched_targets)
+        )
+
+    missing_queried_symbols = [
+        sym
+        for sym in queried_symbols
+        if not re.search(
+            rf"(?<![A-Za-z0-9_]){re.escape(sym)}(?![A-Za-z0-9_])",
+            answer_body,
+        )
+    ]
+    if missing_queried_symbols:
+        missing_evidence.append(
+            "Answer omitted requested repository symbol(s): "
+            + ", ".join(missing_queried_symbols)
+        )
+
+    satisfied_deliverables: list[str] = []
+    unsatisfied_deliverables: list[dict[str, str]] = []
+
+    for deliv in requested:
+        if deliv == "reading_order":
+            if (
+                target_files
+                and not omitted_files
+                and order_val["ordering_valid"]
+                and len(observed_order) >= min(2, len(target_files))
+            ):
+                satisfied_deliverables.append(deliv)
+            else:
+                reasons: list[str] = []
+                if not target_files:
+                    reasons.append("no verified target files available")
+                if omitted_files:
+                    reasons.append(f"{len(omitted_files)} target file(s) omitted")
+                if not order_val["ordering_valid"]:
+                    reasons.append(
+                        f"{len(order_val['ordering_violations'])} dependency ordering violation(s)"
+                    )
+                if len(observed_order) < min(2, len(target_files)):
+                    reasons.append("sequential reading order not present")
+                unsatisfied_deliverables.append(
+                    {
+                        "deliverable": deliv,
+                        "reason": "; ".join(reasons) or "reading order incomplete",
+                    }
+                )
+
+        elif deliv == "file_descriptions":
+            if (
+                target_files
+                and len(covered_targets) == len(target_files)
+                and not omitted_files
+                and not desc_val["ungrounded_descriptions"]
+                and not desc_val["unsupported_claims"]
+            ):
+                satisfied_deliverables.append(deliv)
+            else:
+                reasons = []
+                if not target_files:
+                    reasons.append("no verified target files matched")
+                if omitted_files:
+                    reasons.append(f"{len(omitted_files)} file(s) omitted")
+                if desc_val["ungrounded_descriptions"]:
+                    reasons.append(
+                        f"{len(desc_val['ungrounded_descriptions'])} file(s) lack grounded descriptions"
+                    )
+                if desc_val["unsupported_claims"]:
+                    reasons.append(
+                        f"{len(desc_val['unsupported_claims'])} unsupported symbol/dependency claim(s)"
+                    )
+                unsatisfied_deliverables.append(
+                    {
+                        "deliverable": deliv,
+                        "reason": "; ".join(reasons) or "file descriptions incomplete",
+                    }
+                )
+
+        elif deliv == "symbol_details":
+            target_py_with_syms = [
+                p
+                for p in covered_targets
+                if files_by_path.get(p, {}).get("type") == "python"
+                and (
+                    files_by_path.get(p, {}).get("classes")
+                    or files_by_path.get(p, {}).get("functions")
+                )
+            ]
+            mentioned_sym_files = set(
+                desc_val.get("files_with_ast_symbol_mentions") or []
+            )
+            covered_with_syms = [
+                p for p in target_py_with_syms if p in mentioned_sym_files
+            ]
+            if (
+                not missing_queried_symbols
+                and not desc_val["unsupported_claims"]
+                and (
+                    not target_py_with_syms
+                    or len(covered_with_syms) >= max(1, int(0.8 * len(target_py_with_syms)))
+                )
+            ):
+                satisfied_deliverables.append(deliv)
+            else:
+                reasons = []
+                if missing_queried_symbols:
+                    reasons.append(
+                        f"missing queried symbol(s): {', '.join(missing_queried_symbols)}"
+                    )
+                if desc_val["unsupported_claims"]:
+                    reasons.append(
+                        f"{len(desc_val['unsupported_claims'])} unsupported symbol claim(s)"
+                    )
+                if target_py_with_syms and len(covered_with_syms) < max(
+                    1, int(0.8 * len(target_py_with_syms))
+                ):
+                    reasons.append(
+                        f"only {len(covered_with_syms)}/{len(target_py_with_syms)} Python modules include AST symbol details"
+                    )
+                unsatisfied_deliverables.append(
+                    {
+                        "deliverable": deliv,
+                        "reason": "; ".join(reasons) or "symbol details incomplete",
+                    }
+                )
+
+        elif deliv == "dependency_relationships":
+            target_py_with_deps = [
+                p
+                for p in covered_targets
+                if files_by_path.get(p, {}).get("type") == "python"
+                and (
+                    files_by_path.get(p, {}).get("internal_dependencies")
+                    or files_by_path.get(p, {}).get("imported_by")
+                )
+            ]
+            body_low = answer_body.lower()
+            has_dep_evidence = any(
+                kw in body_low
+                for kw in (
+                    "import",
+                    "depend",
+                    "layer",
+                    "precede",
+                    "delegate",
+                    "invoke",
+                )
+            )
+            if (
+                order_val["ordering_valid"]
+                and not desc_val["unsupported_claims"]
+                and (not target_py_with_deps or has_dep_evidence)
+            ):
+                satisfied_deliverables.append(deliv)
+            else:
+                reasons = []
+                if not order_val["ordering_valid"]:
+                    reasons.append("dependency ordering violated")
+                if desc_val["unsupported_claims"]:
+                    reasons.append("contradicted dependency/symbol claim detected")
+                if target_py_with_deps and not has_dep_evidence:
+                    reasons.append(
+                        "answer does not describe internal import/dependency relationships"
+                    )
+                unsatisfied_deliverables.append(
+                    {
+                        "deliverable": deliv,
+                        "reason": "; ".join(reasons)
+                        or "dependency relationships incomplete",
+                    }
+                )
+
+        elif deliv == "exclusions_or_limitations":
+            has_exclusions_in_repo = bool(
+                req["excluded_dirs"] or req["excluded_files"]
+            )
+            combined_low = (full_answer_text or answer_body).lower()
+            has_excl_mention = (
+                not has_exclusions_in_repo
+                or "excluded" in combined_low
+                or "ignore" in combined_low
+                or any(d.lower() in combined_low for d in req["excluded_dirs"])
+                or any(f.lower() in combined_low for f in req["excluded_files"])
+            )
+            if has_excl_mention:
+                satisfied_deliverables.append(deliv)
+            else:
+                unsatisfied_deliverables.append(
+                    {
+                        "deliverable": deliv,
+                        "reason": "excluded directories/files were not reported",
+                    }
+                )
+
+    return {
+        "scope": req["scope"],
+        "requested_deliverables": requested,
+        "satisfied_deliverables": satisfied_deliverables,
+        "unsatisfied_deliverables": unsatisfied_deliverables,
+        "deliverables_satisfied": (
+            len(unsatisfied_deliverables) == 0 and len(missing_evidence) == 0
+        ),
+        "target_files": target_files,
+        "target_files_count": len(target_files),
+        "covered_target_files_count": len(covered_targets),
+        "queried_symbols": queried_symbols,
+        "missing_queried_symbols": missing_queried_symbols,
+        "unmatched_targets": unmatched_targets,
+        "missing_evidence": missing_evidence,
+    }
+
+
 def validate_query_answer(
     answer: str,
     query: str,
     context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Validate an LLM answer against the verified repository file inventory, AST symbol/dependency
-    evidence, reading-order dependency precedence, and index freshness status.
+    """Validate an LLM answer against the user's requested deliverables and scope,
+    the verified repository file inventory, AST symbol/dependency evidence,
+    reading-order dependency precedence, and index freshness status.
     """
     ver = _evaluate_source_verification(context)
+    req = analyze_query_requirements(query=query, context=context)
+
     inv = (
         context.get("repository_inventory")
         if isinstance(context, dict)
@@ -874,6 +1833,7 @@ def validate_query_answer(
     files_by_path: dict[str, dict[str, Any]] = {
         str(f["path"]): f
         for f in files_list
+        for _ in [None]
         if isinstance(f, dict) and f.get("path")
     }
     ro_by_path: dict[str, dict[str, Any]] = {
@@ -882,12 +1842,19 @@ def validate_query_answer(
         if isinstance(item, dict) and item.get("path")
     }
 
-    all_repo_paths: list[str] = list(files_by_path.keys())
+    all_repo_paths: list[str] = list(ro_by_path.keys()) or list(files_by_path.keys())
+    for p in files_by_path:
+        if p not in all_repo_paths:
+            all_repo_paths.append(p)
+
     py_repo_paths: list[str] = [
         p for p, f in files_by_path.items() if f.get("type") == "python"
     ]
     valid_path_set = set(all_repo_paths)
     valid_basenames = {p.split("/")[-1] for p in all_repo_paths}
+    top_pkg_prefixes = {
+        p.split("/")[0] for p in all_repo_paths if "/" in p
+    }
 
     answer_body = _strip_diagnostic_footers(answer or "")
     covered_files: list[str] = []
@@ -897,23 +1864,30 @@ def validate_query_answer(
         if path in answer_body or path.replace("/", "\\") in answer_body:
             covered_files.append(path)
 
-    is_broad = _is_repo_wide_query(query)
-    if is_broad and all_repo_paths:
-        ordered_paths = list(ro_by_path.keys()) or all_repo_paths
-        for p in ordered_paths:
-            if p not in covered_files:
-                omitted_files.append(p)
+    target_files = req["target_files"]
+    for p in target_files:
+        if p not in covered_files:
+            omitted_files.append(p)
 
-    # Check for hallucinated or deleted .py path references in answer_body
+    # Check for hallucinated or deleted .py path references in answer_body (repository-agnostic)
     hallucinated_files: list[str] = []
+    unmatched_set = set(req["unmatched_targets"])
     candidate_py_refs = re.findall(
-        r"(?<![A-Za-z0-9_./\\-])((?:ntg/[A-Za-z0-9_/.-]+|[A-Za-z0-9_-]+)\.py)\b",
+        r"(?<![A-Za-z0-9_./\\-])((?:[A-Za-z0-9_.-]+/)+[A-Za-z0-9_.-]+\.py|[A-Za-z0-9_-]+\.py)\b",
         answer_body,
     )
     for ref in candidate_py_refs:
         norm_ref = ref.replace("\\", "/").lstrip("./")
+        if norm_ref in unmatched_set:
+            # If the user asked about a non-existent path, it is already tracked in `unmatched_targets` / `missing_evidence`
+            continue
         if "/" in norm_ref:
-            if norm_ref not in valid_path_set and norm_ref not in hallucinated_files:
+            ref_top = norm_ref.split("/")[0]
+            if (
+                (not top_pkg_prefixes or ref_top in top_pkg_prefixes or ref_top in ("src", "app", "lib", "tests"))
+                and norm_ref not in valid_path_set
+                and norm_ref not in hallucinated_files
+            ):
                 hallucinated_files.append(norm_ref)
         else:
             if norm_ref not in valid_basenames and norm_ref not in hallucinated_files:
@@ -932,16 +1906,33 @@ def validate_query_answer(
         files_by_path=files_by_path,
         ro_by_path=ro_by_path,
     )
+    validate_order_flag = bool(
+        req["is_repo_wide"] or "reading_order" in req["requested_deliverables"]
+    )
     order_val = _validate_reading_order(
         observed_order=observed_order,
         files_by_path=files_by_path,
         ro_by_path=ro_by_path,
-        is_repo_wide=is_broad,
+        validate_order=validate_order_flag,
+    )
+    deliverable_val = _validate_deliverables(
+        answer_body=answer_body,
+        full_answer_text=answer or "",
+        req=req,
+        ver=ver,
+        files_by_path=files_by_path,
+        covered_files=covered_files,
+        omitted_files=omitted_files,
+        observed_order=observed_order,
+        desc_val=desc_val,
+        order_val=order_val,
     )
 
     unsupported_claims = desc_val["unsupported_claims"]
     ungrounded_descriptions = desc_val["ungrounded_descriptions"]
     ordering_violations = order_val["ordering_violations"]
+    unsatisfied_deliverables = deliverable_val["unsatisfied_deliverables"]
+    missing_evidence = deliverable_val["missing_evidence"]
 
     covered_py = [p for p in covered_files if p in py_repo_paths]
     warnings: list[str] = []
@@ -966,9 +1957,12 @@ def validate_query_answer(
         uncertainty_notes.append(
             "Codebase Memory MCP architecture/symbol index could not be verified against current source fingerprints."
         )
+    if missing_evidence:
+        warnings.extend(missing_evidence)
+        uncertainty_notes.extend(missing_evidence)
     if omitted_files:
         warnings.append(
-            f"Answer omitted {len(omitted_files)} file(s) from the verified inventory: {', '.join(omitted_files)}"
+            f"Answer omitted {len(omitted_files)} required file(s) from the verified inventory: {', '.join(omitted_files)}"
         )
         uncertainty_notes.append(
             f"Omitted repository files required deterministic supplementation ({len(omitted_files)} file(s))."
@@ -982,11 +1976,11 @@ def validate_query_answer(
         )
     if unsupported_claims:
         warnings.append(
-            f"Answer contained {len(unsupported_claims)} unsupported symbol attribution claim(s): "
+            f"Answer contained {len(unsupported_claims)} unsupported symbol/dependency claim(s): "
             + "; ".join(c["reason"] for c in unsupported_claims[:5])
         )
         uncertainty_notes.append(
-            "Detected symbol ownership claims contradicting the deterministic AST inventory."
+            "Detected symbol ownership or dependency claims contradicting the deterministic AST inventory."
         )
     if ungrounded_descriptions:
         warnings.append(
@@ -1004,9 +1998,20 @@ def validate_query_answer(
         uncertainty_notes.append(
             "One or more dependent modules appeared before their internal dependencies in the reading order."
         )
+    if unsatisfied_deliverables:
+        warnings.append(
+            "Answer did not satisfy all requested deliverable(s): "
+            + "; ".join(
+                f"{u['deliverable']} ({u['reason']})"
+                for u in unsatisfied_deliverables
+            )
+        )
+        uncertainty_notes.append(
+            "One or more user-requested deliverables were incomplete or unverified."
+        )
 
     epistemic_limitations: list[str] = [
-        "Deterministic validation proves repository root identity, SHA-256 file fingerprints, AST symbol/import inventory, file path existence, presence of AST/summary anchors in file descriptions, absence of cross-file symbol misattribution, and topological dependency precedence across implementation modules.",
+        "Deterministic validation proves repository root identity, SHA-256 file fingerprints, AST symbol/import inventory, file path existence, presence of AST/summary anchors in file descriptions, absence of cross-file symbol misattribution, topological dependency precedence across implementation modules, and coverage of requested deliverables.",
         "Deterministic validation cannot prove free-form prose nuance beyond AST/docstring/dependency anchors or live external LLM provider runtime behavior.",
     ]
 
@@ -1020,12 +2025,15 @@ def validate_query_answer(
     is_complete = bool(
         answer_body.strip()
         and not critical_retrieval_failed
-        and (len(covered_files) > 0 if all_repo_paths else True)
+        and len(target_files) > 0
+        and len(covered_files) > 0
+        and not missing_evidence
         and not omitted_files
         and not hallucinated_files
         and not unsupported_claims
         and not ungrounded_descriptions
         and not ordering_violations
+        and deliverable_val["deliverables_satisfied"]
     )
 
     if is_complete:
@@ -1038,7 +2046,12 @@ def validate_query_answer(
     return {
         "complete": is_complete,
         "status": status_label,
-        "is_repo_wide_query": is_broad,
+        "query_scope": req["scope"],
+        "is_repo_wide_query": req["is_repo_wide"],
+        "requested_deliverables": req["requested_deliverables"],
+        "deliverable_validation": deliverable_val,
+        "missing_evidence": missing_evidence,
+        "unmatched_targets": req["unmatched_targets"],
         "retrieval_healthy": ver["all_verified"],
         "critical_retrieval_failed": critical_retrieval_failed,
         "inventory_verified": ver["inventory_verified"],
@@ -1050,6 +2063,7 @@ def validate_query_answer(
         "memory_fresh": ver["memory_fresh"],
         "memory_fingerprint_verified": ver["memory_fingerprint_verified"],
         "total_repo_files": len(all_repo_paths),
+        "target_files_count": len(target_files),
         "covered_files_count": len(covered_files),
         "total_python_files": len(py_repo_paths),
         "covered_python_files_count": len(covered_py),
@@ -1061,6 +2075,7 @@ def validate_query_answer(
         "unsupported_claims": unsupported_claims,
         "ungrounded_descriptions": ungrounded_descriptions,
         "ordering_violations": ordering_violations,
+        "unsatisfied_deliverables": unsatisfied_deliverables,
         "uncertainty_notes": uncertainty_notes,
         "epistemic_limitations": epistemic_limitations,
         "retrieval_errors": ver["errors"],
@@ -1078,27 +2093,28 @@ def finalize_grounded_answer(
 ) -> str:
     """Validate and finalize an answer against verified inventory and dependency evidence.
     - In strict mode (`strict=True`), raises `RuntimeError` if critical retrieval/indexing failed,
-      the answer is empty, or unsupported claims / hallucinated files / ordering violations exist.
-    - In non-strict mode (`strict=False`), explicitly marks degraded or incomplete results with
-      a visible degraded-status banner and detailed evidence warnings.
-    - Supplements any omitted repository files using factual AST inventory metadata when safe.
+      required evidence is missing/unverifiable, or the finalized answer is incomplete.
+    - In non-strict mode (`strict=False`), supplements missing file/symbol/dependency facts only
+      from the verified AST inventory when safe (no contradictions), and explicitly marks any
+      remaining incomplete or degraded result with a visible warning banner and diagnostics.
     """
     val = validation or validate_query_answer(
         answer=answer, query=query, context=context
     )
 
-    critical_validation_failure = bool(
+    has_contradictory_or_missing_evidence = bool(
         val["critical_retrieval_failed"]
         or not (answer and answer.strip())
         or val["hallucinated_files"]
         or val["unsupported_claims"]
         or val["ordering_violations"]
+        or val.get("missing_evidence")
     )
 
-    if strict and critical_validation_failure:
+    if strict and has_contradictory_or_missing_evidence:
         err_msg = (
             "; ".join(val["warnings"])
-            or "Critical retrieval/indexing failure, unsupported claim, ordering violation, or empty answer"
+            or "Critical retrieval/indexing failure, missing evidence, unsupported claim, ordering violation, or empty answer"
         )
         raise RuntimeError(
             f"Strict mode: refusing to present answer as complete due to verification failure: {err_msg}"
@@ -1112,51 +2128,87 @@ def finalize_grounded_answer(
         and isinstance(context.get("repository_inventory"), dict)
         else {}
     )
+    files_list = inv.get("files") if isinstance(inv.get("files"), list) else []
     reading_order = (
         inv.get("reading_order") if isinstance(inv.get("reading_order"), list) else []
     )
+    files_by_path: dict[str, dict[str, Any]] = {
+        str(f["path"]): f
+        for f in files_list
+        if isinstance(f, dict) and f.get("path")
+    }
     ro_by_path = {
         str(item["path"]): item
         for item in reading_order
         if isinstance(item, dict) and item.get("path")
     }
 
-    # Supplement any omitted files from the verified AST inventory
     body_text = (answer or "").strip()
-    if val["omitted_files"] and ro_by_path:
+
+    # Supplement from the verified AST inventory ONLY when the inventory is verified and no contradictory claims exist
+    can_supplement = bool(
+        body_text
+        and val["inventory_verified"]
+        and not val["hallucinated_files"]
+        and not val["unsupported_claims"]
+        and not val["ordering_violations"]
+        and not val.get("unmatched_targets")
+    )
+
+    if can_supplement and val["omitted_files"] and (ro_by_path or files_by_path):
         supp_lines: list[str] = [
             "### Verified Inventory Supplement (Additional Repository Files)",
-            "The following repository files were verified by the deterministic AST inventory and are included for complete repository coverage:",
+            "The following repository files were verified by the deterministic AST inventory and are included for complete coverage:",
         ]
-        for path in val["omitted_files"]:
-            item = ro_by_path.get(path)
-            if not item:
-                continue
-            deps = item.get("depends_on") or []
+        for idx, path in enumerate(val["omitted_files"], start=1):
+            item = ro_by_path.get(path) or {}
+            rec = files_by_path.get(path) or {}
+            step_num = item.get("step") or idx
+            layer_name = item.get("layer") or "Repository"
+            summary_str = item.get("summary") or rec.get("summary") or ""
+            deps = item.get("depends_on") or rec.get("internal_dependencies") or []
             deps_str = (
                 ", ".join(f"`{d}`" for d in deps)
                 if deps
                 else "None (leaf/standalone)"
             )
-            cls_list = item.get("classes") or []
-            fn_list = item.get("functions") or []
+            cls_list = item.get("classes") or [
+                c["name"] for c in rec.get("classes", []) if c.get("name")
+            ]
+            fn_list = item.get("functions") or [
+                f["name"] for f in rec.get("functions", []) if f.get("name")
+            ]
             sym_parts: list[str] = []
             if cls_list:
-                sym_parts.append(f"Classes: `{', '.join(cls_list)}`")
+                sym_parts.append(f"Classes: {', '.join(f'`{c}`' for c in cls_list)}")
             if fn_list:
-                sym_parts.append(f"Functions: `{', '.join(fn_list[:8])}`")
+                sym_parts.append(
+                    f"Functions: {', '.join(f'`{f}`' for f in fn_list[:8])}"
+                )
             sym_str = f" [{' | '.join(sym_parts)}]" if sym_parts else ""
             supp_lines.append(
-                f"- **`{path}`** (*{item.get('layer', 'Repository')}*, step {item.get('step')}): "
-                f"{item.get('summary', '')}{sym_str} (Internal dependencies: {deps_str})"
+                f"- **`{path}`** (*{layer_name}*, step {step_num}): "
+                f"{summary_str}{sym_str} (Imports from repo: {deps_str})"
             )
         body_text = body_text + "\n\n---\n" + "\n".join(supp_lines)
 
-    # Re-evaluate validation after any deterministic inventory supplement
+    # Re-evaluate validation after any safe deterministic inventory supplement
     post_val = validate_query_answer(answer=body_text, query=query, context=context)
 
+    if strict and not post_val["complete"]:
+        err_msg = (
+            "; ".join(post_val["warnings"])
+            or "Answer failed post-validation completeness checks"
+        )
+        raise RuntimeError(
+            f"Strict mode: refusing to present incomplete or unverified answer: {err_msg}"
+        )
+
     if not post_val["complete"]:
-        reasons = "; ".join(post_val["warnings"]) or "Unverified sources or incomplete evidence"
+        reasons = (
+            "; ".join(post_val["warnings"])
+            or "Unverified sources or incomplete evidence"
+        )
         output_blocks.append(
             f"> [!WARNING] **DEGRADED / PARTIALLY VERIFIED RESULT** (`status={post_val['status']}`): "
             f"This response could not be verified as complete. Reasons: {reasons}"
@@ -1169,8 +2221,15 @@ def finalize_grounded_answer(
         or post_val["unsupported_claims"]
         or post_val["ordering_violations"]
         or post_val["ungrounded_descriptions"]
+        or post_val.get("missing_evidence")
+        or post_val.get("unsatisfied_deliverables")
     ):
         warn_lines: list[str] = ["---", "### Evidence Grounding Warning"]
+        if post_val.get("missing_evidence"):
+            warn_lines.append(
+                "- **Missing or Unverifiable Evidence**: "
+                + "; ".join(post_val["missing_evidence"])
+            )
         if post_val["hallucinated_files"]:
             warn_lines.append(
                 "- **Non-Existent / Deleted File Paths Mentioned**: "
@@ -1178,7 +2237,7 @@ def finalize_grounded_answer(
             )
         if post_val["unsupported_claims"]:
             warn_lines.append(
-                "- **Unsupported Symbol Attribution Claims**: "
+                "- **Unsupported Symbol / Dependency Claims**: "
                 + "; ".join(c["reason"] for c in post_val["unsupported_claims"])
             )
         if post_val["ordering_violations"]:
@@ -1189,7 +2248,17 @@ def finalize_grounded_answer(
         if post_val["ungrounded_descriptions"]:
             warn_lines.append(
                 "- **Files Mentioned Without Substantive AST/Summary Grounding**: "
-                + ", ".join(f"`{u['file']}`" for u in post_val["ungrounded_descriptions"])
+                + ", ".join(
+                    f"`{u['file']}`" for u in post_val["ungrounded_descriptions"]
+                )
+            )
+        if post_val.get("unsatisfied_deliverables"):
+            warn_lines.append(
+                "- **Unsatisfied Requested Deliverables**: "
+                + "; ".join(
+                    f"`{u['deliverable']}` ({u['reason']})"
+                    for u in post_val["unsatisfied_deliverables"]
+                )
             )
         output_blocks.append("\n".join(warn_lines))
 
@@ -1232,11 +2301,16 @@ def finalize_grounded_answer(
         ]
         desc_v = post_val["description_validation"]
         ord_v = post_val["ordering_validation"]
+        deliv_v = post_val["deliverable_validation"]
 
         diag_lines: list[str] = [
             "---",
             "### Verification & Coverage Diagnostics",
             f"- **Completeness Status**: `{post_val['status']}` (`complete={post_val['complete']}`)",
+            f"- **Query Scope & Deliverables**: scope=`{post_val['query_scope']}`, "
+            f"requested={deliv_v['requested_deliverables']}, "
+            f"satisfied={deliv_v['satisfied_deliverables']}, "
+            f"unsatisfied={[u['deliverable'] for u in deliv_v['unsatisfied_deliverables']]}",
             f"- **Repository Root**: `{context.get('repo_root', '') if isinstance(context, dict) else ''}`",
             f"- **Graphify Index**: verified=`{post_val['graphify_verified']}`, fresh=`{post_val['graphify_fresh']}`, "
             f"sha256_fingerprint_verified=`{post_val['graphify_fingerprint_verified']}`, "
@@ -1253,14 +2327,15 @@ def finalize_grounded_answer(
             f"deleted_files={len(mem_st.get('deleted_files', []))}, "
             f"missing_files={len(mem_st.get('missing_files', []))}, "
             f"stale_files={len(mem_st.get('stale_files', []))}",
-            f"- **Repository Inventory Coverage**: {post_val['covered_files_count']}/{post_val['total_repo_files']} files covered "
-            f"({post_val['covered_python_files_count']}/{post_val['total_python_files']} Python modules, "
+            f"- **Repository Inventory Coverage**: {post_val['covered_files_count']}/{post_val['total_repo_files']} repo files covered "
+            f"(target files: {deliv_v['covered_target_files_count']}/{deliv_v['target_files_count']}, "
+            f"{post_val['covered_python_files_count']}/{post_val['total_python_files']} Python modules, "
             f"{coverage.get('config_doc_files', 0)} config/doc files; "
-            f"initial LLM omissions supplemented={len(val['omitted_files'])}; "
+            f"initial LLM omissions supplemented={len(val['omitted_files']) if can_supplement else 0}; "
             f"remaining omissions={len(post_val['omitted_files'])}; "
             f"hallucinated paths={len(post_val['hallucinated_files'])})",
             f"- **Evidence & Description Validation**: {desc_v['grounded_files_count']}/{desc_v['checked_files_count']} covered files grounded in AST/summary evidence "
-            f"(unsupported symbol claims={len(post_val['unsupported_claims'])}, "
+            f"(unsupported symbol/dependency claims={len(post_val['unsupported_claims'])}, "
             f"ungrounded descriptions={len(post_val['ungrounded_descriptions'])})",
             f"- **Reading-Order Dependency Validation**: {ord_v['satisfied_dependency_edges']}/{ord_v['checked_dependency_edges']} internal dependency edges satisfied "
             f"(ordering_valid=`{ord_v['ordering_valid']}`, violations={len(post_val['ordering_violations'])})",
