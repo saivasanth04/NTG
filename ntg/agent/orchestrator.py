@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import inspect
 from pathlib import Path
+import sys
 from typing import Any
 
 from ntg.agent.code_intelligence import CodeIntelligence
@@ -19,6 +20,18 @@ from ntg.agent.planner import (
 )
 from ntg.agent.verifier import CodeVerifier
 from ntg.router.engine import UnifiedNTGRouter
+
+
+def _ensure_utf8_console() -> None:
+    """Ensure Windows stdout/stderr can print UTF-8 responses without cp1252 crashes."""
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            try:
+                enc = getattr(stream, "encoding", "") or ""
+                if enc.lower().replace("-", "") != "utf8":
+                    stream.reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
 
 
 class ArchitectureAwareAgent:
@@ -38,15 +51,22 @@ class ArchitectureAwareAgent:
         verifier: CodeVerifier | None = None,
         project: str | None = None,
         default_capabilities: list[str] | None = None,
+        memory_project: str | None = None,
     ) -> None:
+        _ensure_utf8_console()
         self.repo_root = Path(repo_root).expanduser().resolve()
         if not self.repo_root.exists() or not self.repo_root.is_dir():
             raise ValueError(f"Invalid repository root: {repo_root}")
 
+        effective_proj = project or memory_project
         self._router = router
-        self.intelligence = intelligence or CodeIntelligence(self.repo_root)
+        self.intelligence = intelligence or CodeIntelligence(
+            self.repo_root, default_project=effective_proj
+        )
+        self.code = self.intelligence
         self.verifier = verifier or CodeVerifier(self.repo_root)
-        self.project = project
+        self.project = effective_proj
+        self.memory_project = effective_proj
         self.default_capabilities = (
             list(default_capabilities) if default_capabilities is not None else None
         )
@@ -310,8 +330,12 @@ class ArchitectureAwareAgent:
         answer = extract_response_content(response)
         return {
             "repo_root": str(self.repo_root),
+            "project": context.get("project"),
             "query": query,
             "answer": answer,
+            "index_status": context.get("index_status"),
+            "coverage": context.get("coverage"),
+            "errors": context.get("errors", []),
             "context": context,
             "response": response,
         }

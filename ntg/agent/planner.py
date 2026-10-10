@@ -49,51 +49,101 @@ def extract_response_content(planning_response: Any) -> str:
     )
 
 
+def _append_context_sections(
+    sections: list[str],
+    context: dict[str, Any] | None,
+) -> None:
+    """Append repository identity, inventory, reading order, Graphify, Codebase Memory, and diagnostics."""
+    if not context:
+        return
+
+    meta_lines: list[str] = []
+    if context.get("repo_root"):
+        meta_lines.append(f"- **Repository Root**: `{context['repo_root']}`")
+    if context.get("project"):
+        meta_lines.append(f"- **Codebase Memory Project**: `{context['project']}`")
+    coverage = context.get("coverage")
+    if isinstance(coverage, dict):
+        meta_lines.append(
+            f"- **Coverage**: {coverage.get('total_repo_files', 0)} total files "
+            f"({coverage.get('python_files', 0)} Python modules, "
+            f"{coverage.get('config_doc_files', 0)} config/doc files); "
+            f"Graphify fresh={coverage.get('graphify_fresh')}; "
+            f"Codebase Memory indexed={coverage.get('memory_indexed')}"
+        )
+    errors = context.get("errors")
+    if isinstance(errors, list) and errors:
+        meta_lines.append(
+            "- **Retrieval Diagnostics / Warnings**: " + "; ".join(str(e) for e in errors)
+        )
+    else:
+        meta_lines.append("- **Retrieval Diagnostics**: All knowledge sources healthy (0 errors)")
+
+    if meta_lines:
+        sections.append("## Repository Identity & Index Diagnostics\n" + "\n".join(meta_lines))
+
+    formatted_inv = context.get("formatted_inventory")
+    if isinstance(formatted_inv, str) and formatted_inv.strip():
+        sections.append(
+            "## Verified Repository File Inventory & Dependency-Aware Reading Order\n"
+            + formatted_inv.strip()
+        )
+    elif isinstance(context.get("reading_order"), list) and context["reading_order"]:
+        ro_text = json.dumps(context["reading_order"], indent=2)
+        sections.append(f"## Dependency-Aware Reading Order\n{ro_text}")
+
+    graph_report = context.get("graphify_report")
+    if isinstance(graph_report, str) and graph_report.strip():
+        sections.append(f"## Graphify Architecture Report Summary\n{graph_report.strip()}")
+
+    graphify_ctx = context.get("graphify_context")
+    if graphify_ctx:
+        sections.append(f"## Graphify Knowledge Graph Context\n{graphify_ctx}")
+
+    arch_ctx = context.get("memory_architecture") or context.get("architecture_overview")
+    if arch_ctx:
+        formatted_arch = (
+            json.dumps(arch_ctx, indent=2)
+            if isinstance(arch_ctx, (dict, list))
+            else str(arch_ctx)
+        )
+        sections.append(f"## Codebase Memory Architecture Overview\n{formatted_arch}")
+
+    symbols_ctx = context.get("memory_symbols") or context.get("memory_context")
+    if symbols_ctx:
+        formatted_symbols = (
+            json.dumps(symbols_ctx, indent=2)
+            if isinstance(symbols_ctx, (dict, list))
+            else str(symbols_ctx)
+        )
+        sections.append(f"## Matching Codebase Symbols\n{formatted_symbols}")
+
+
 def build_planning_prompt(
     request: str,
     context: dict[str, Any] | None = None,
 ) -> str:
     """Construct an architecture-aware planning prompt combining the user request
-    with structural context from Graphify and Codebase Memory MCP.
+    with deterministic repository inventory, Graphify, and Codebase Memory MCP context.
     """
     if not isinstance(request, str) or not request.strip():
         raise ValueError("request must be a non-empty string.")
 
     sections: list[str] = [
         "You are an architecture-aware AI coding agent for this repository.",
-        "Analyze the user request and the repository knowledge-graph context below,",
+        "Analyze the user request and the verified repository inventory, dependency graph, Graphify context, and Codebase Memory MCP context below,",
         "then produce a clear, reviewable implementation plan covering:",
         "1. Architectural Impact & Affected Components",
         "2. Files & Symbols to Modify",
         "3. Step-by-Step Implementation Plan",
         "4. Verification & Post-Change Knowledge Sync Strategy",
         "",
+        "Ground your plan strictly in the actual files, classes, functions, and dependencies listed below. Never invent non-existent files or symbols.",
+        "",
         f"## User Request\n{request.strip()}",
     ]
 
-    if context:
-        graphify_ctx = context.get("graphify_context")
-        if graphify_ctx:
-            sections.append(f"## Graphify Knowledge Graph Context\n{graphify_ctx}")
-
-        arch_ctx = context.get("memory_architecture")
-        if arch_ctx:
-            formatted_arch = (
-                json.dumps(arch_ctx, indent=2)
-                if isinstance(arch_ctx, (dict, list))
-                else str(arch_ctx)
-            )
-            sections.append(f"## Codebase Memory Architecture Overview\n{formatted_arch}")
-
-        symbols_ctx = context.get("memory_symbols")
-        if symbols_ctx:
-            formatted_symbols = (
-                json.dumps(symbols_ctx, indent=2)
-                if isinstance(symbols_ctx, (dict, list))
-                else str(symbols_ctx)
-            )
-            sections.append(f"## Matching Codebase Symbols\n{formatted_symbols}")
-
+    _append_context_sections(sections, context)
     return "\n\n".join(sections)
 
 
@@ -107,36 +157,20 @@ def build_query_prompt(
 
     sections: list[str] = [
         "You are an architecture-aware AI codebase assistant.",
-        "Use the repository knowledge-graph and symbol context below to answer the user's question accurately and concisely.",
-        "Reference specific files, modules, classes, and functions from the codebase context where relevant.",
+        "Use the verified repository file inventory, AST dependency analysis, Graphify knowledge graph, and Codebase Memory MCP symbol context below to answer the user's question accurately, thoroughly, and concisely.",
+        "Strict Grounding Rules:",
+        "1. Reference the exact file paths, modules, classes, functions, and internal dependencies from the Verified Repository File Inventory below.",
+        "2. Never invent, guess, or hallucinate files, modules, classes, or dependencies that are not present in the inventory.",
+        "3. Cover the complete repository across all architectural layers (configuration/docs, entry points, `ntg/core/`, `ntg/providers/`, `ntg/router/`, `ntg/agent/`, `ntg/cli/`, and compatibility shims).",
+        "4. When presenting a file reading order, follow the dependency-aware progression from entry points and project configuration through core foundation modules, provider adapters, smart routing/state/telemetry, architecture-aware agent modules, and CLI/diagnostics, explaining what each file does and why it appears in that order.",
+        "5. If any retrieval warnings or coverage gaps appear in the diagnostics section, state them explicitly rather than guessing.",
         "",
         f"## User Question\n{query.strip()}",
     ]
 
-    if context:
-        graphify_ctx = context.get("graphify_context")
-        if graphify_ctx:
-            sections.append(f"## Graphify Knowledge Graph Context\n{graphify_ctx}")
-
-        arch_ctx = context.get("memory_architecture")
-        if arch_ctx:
-            formatted_arch = (
-                json.dumps(arch_ctx, indent=2)
-                if isinstance(arch_ctx, (dict, list))
-                else str(arch_ctx)
-            )
-            sections.append(f"## Codebase Memory Architecture Overview\n{formatted_arch}")
-
-        symbols_ctx = context.get("memory_symbols")
-        if symbols_ctx:
-            formatted_symbols = (
-                json.dumps(symbols_ctx, indent=2)
-                if isinstance(symbols_ctx, (dict, list))
-                else str(symbols_ctx)
-            )
-            sections.append(f"## Matching Codebase Symbols\n{formatted_symbols}")
-
+    _append_context_sections(sections, context)
     return "\n\n".join(sections)
+
 
 
 def build_change_plan(

@@ -80,8 +80,8 @@ class UnifiedNTGRouter:
     ):
         litellm.suppress_debug_info = True
         litellm.set_verbose = False
-        logging.getLogger("LiteLLM").setLevel(logging.ERROR)
-        logging.getLogger("LiteLLM Router").setLevel(logging.ERROR)
+        logging.getLogger("LiteLLM").setLevel(logging.CRITICAL)
+        logging.getLogger("LiteLLM Router").setLevel(logging.CRITICAL)
 
         self.state_manager = state_manager or StateManager()
 

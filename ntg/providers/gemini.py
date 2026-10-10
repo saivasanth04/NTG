@@ -145,6 +145,10 @@ def supports_generate_content(model: Dict[str, Any]) -> bool:
         "bidi",
         "live",
         "realtime",
+        "deep-research",
+        "nano-banana",
+        "antigravity",
+        "aqa",
     ]
 
     for pattern in excluded_patterns:

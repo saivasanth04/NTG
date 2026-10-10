@@ -1,19 +1,83 @@
-"""Adapter for Graphify and Codebase Memory MCP architecture & symbol intelligence."""
+"""Adapter for Graphify, Codebase Memory MCP, and deterministic AST repository intelligence."""
 
 from __future__ import annotations
 
+import ast
 import json
+import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
+import sys
 from typing import Any
+
+_IGNORED_DIRS: frozenset[str] = frozenset(
+    {
+        ".git",
+        "__pycache__",
+        "venv",
+        ".venv",
+        "env",
+        ".env",
+        "node_modules",
+        ".ntg",
+        "graphify-out",
+        ".codebase-memory",
+        ".pytest_cache",
+        ".mypy_cache",
+        ".ruff_cache",
+        "build",
+        "dist",
+        ".idea",
+        ".vscode",
+    }
+)
+
+_CONFIG_DOC_FILENAMES: frozenset[str] = frozenset(
+    {
+        "README.md",
+        "pyproject.toml",
+        "requirements.txt",
+        ".env.example",
+        ".gitignore",
+        "setup.py",
+        "setup.cfg",
+        "Makefile",
+        "Dockerfile",
+    }
+)
+
+
+def _canonical_project_slug(repo_root: Path) -> str:
+    """Compute the canonical Codebase Memory MCP project slug for a repository path."""
+    resolved = str(repo_root.resolve())
+    return re.sub(r"[^A-Za-z0-9]+", "-", resolved).strip("-")
+
+
+def _first_line(text: str | None) -> str:
+    """Return the first non-empty summary sentence/paragraph from a docstring."""
+    if not text:
+        return ""
+    lines: list[str] = []
+    for raw in text.strip().splitlines():
+        stripped = raw.strip()
+        if not stripped:
+            if lines:
+                break
+            continue
+        lines.append(stripped)
+        if stripped.endswith("."):
+            break
+    summary = " ".join(lines).strip()
+    return summary[:280]
 
 
 class CodeIntelligence:
-    """Adapter for Graphify and Codebase Memory MCP queries and knowledge updates."""
+    """Adapter for Graphify, Codebase Memory MCP, and deterministic repository inventory."""
 
     def __init__(self, repo_root: str | Path, default_project: str | None = None):
-        self.repo_root = Path(repo_root).resolve()
+        self.repo_root = Path(repo_root).expanduser().resolve()
 
         if not self.repo_root.is_dir():
             raise ValueError("Repository root must be an existing directory.")
@@ -24,17 +88,73 @@ class CodeIntelligence:
             else None
         )
 
+    def _resolve_executable(self, executable: str) -> str:
+        """Resolve a CLI executable path reliably, preferring native binaries on Windows."""
+        exe_str = executable.strip()
+        if not exe_str:
+            raise ValueError("Executable name cannot be empty.")
+
+        stem = Path(exe_str).stem.lower()
+        which_hit = shutil.which(exe_str)
+
+        if os.name == "nt" and stem == "codebase-memory-mcp":
+            candidates: list[Path] = []
+            if which_hit:
+                w_path = Path(which_hit).resolve()
+                if w_path.suffix.lower() == ".exe" and w_path.is_file():
+                    return str(w_path)
+                candidates.append(
+                    w_path.parent
+                    / "node_modules"
+                    / "codebase-memory-mcp"
+                    / "bin"
+                    / "codebase-memory-mcp.exe"
+                )
+                candidates.append(
+                    w_path.parent.parent
+                    / "codebase-memory-mcp"
+                    / "bin"
+                    / "codebase-memory-mcp.exe"
+                )
+            appdata = os.environ.get("APPDATA", "").strip()
+            if appdata:
+                candidates.append(
+                    Path(appdata)
+                    / "npm"
+                    / "node_modules"
+                    / "codebase-memory-mcp"
+                    / "bin"
+                    / "codebase-memory-mcp.exe"
+                )
+            for cand in candidates:
+                if cand.is_file():
+                    return str(cand)
+
+        if which_hit:
+            return which_hit
+
+        return exe_str
+
     def _run(self, args: list[str], timeout: int = 30) -> str:
-        """Run a fixed local tool command without invoking a shell."""
+        """Run a fixed local tool command safely without invoking a shell."""
         if not args or not all(isinstance(a, str) and a for a in args):
             raise ValueError("Command arguments must be a non-empty list of strings.")
 
+        cmd_args = list(args)
+        is_real_subprocess = getattr(subprocess.run, "__module__", "") == "subprocess"
+        if os.name == "nt" and is_real_subprocess:
+            resolved_first = self._resolve_executable(cmd_args[0])
+            if resolved_first != cmd_args[0]:
+                cmd_args[0] = resolved_first
+
         try:
             result = subprocess.run(
-                args,
+                cmd_args,
                 cwd=self.repo_root,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=timeout,
                 check=False,
                 shell=False,
@@ -42,7 +162,7 @@ class CodeIntelligence:
             )
         except TypeError:
             result = subprocess.run(
-                args,
+                cmd_args,
                 cwd=self.repo_root,
                 capture_output=True,
                 text=True,
@@ -51,21 +171,39 @@ class CodeIntelligence:
                 shell=False,
             )
         except FileNotFoundError as exc:
-            resolved = shutil.which(args[0])
-            if not resolved:
-                raise RuntimeError(
-                    f"Required code intelligence executable not found: {args[0]}"
-                ) from exc
-            result = subprocess.run(
-                [resolved, *args[1:]],
-                cwd=self.repo_root,
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-                check=False,
-                shell=False,
-                stdin=subprocess.DEVNULL,
-            )
+            resolved = self._resolve_executable(args[0])
+            if resolved == args[0] and not shutil.which(resolved):
+                if Path(args[0]).stem.lower() == "graphify" and sys.executable:
+                    fallback_cmd = [sys.executable, "-m", "graphify", *args[1:]]
+                    result = subprocess.run(
+                        fallback_cmd,
+                        cwd=self.repo_root,
+                        capture_output=True,
+                        text=True,
+                        encoding="utf-8",
+                        errors="replace",
+                        timeout=timeout,
+                        check=False,
+                        shell=False,
+                        stdin=subprocess.DEVNULL,
+                    )
+                else:
+                    raise RuntimeError(
+                        f"Required code intelligence executable not found: {args[0]}"
+                    ) from exc
+            else:
+                result = subprocess.run(
+                    [resolved, *args[1:]],
+                    cwd=self.repo_root,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=timeout,
+                    check=False,
+                    shell=False,
+                    stdin=subprocess.DEVNULL,
+                )
 
         if result.returncode != 0:
             err_detail = (result.stderr or result.stdout or "").strip()[-2000:]
@@ -76,7 +214,7 @@ class CodeIntelligence:
         return result.stdout
 
     # ------------------------------------------------------------------
-    # Graphify Operations
+    # Graphify Operations & Freshness / Contamination Validation
     # ------------------------------------------------------------------
 
     @property
@@ -84,7 +222,226 @@ class CodeIntelligence:
         """Path to the Graphify knowledge graph JSON file."""
         return self.repo_root / "graphify-out" / "graph.json"
 
-    def graphify_query(self, question: str, budget: int = 1500, dfs: bool = False) -> str:
+    @property
+    def graph_report_file(self) -> Path:
+        """Path to the Graphify markdown report file."""
+        return self.repo_root / "graphify-out" / "GRAPH_REPORT.md"
+
+    def _discover_repo_files(self) -> tuple[list[Path], list[Path]]:
+        """Return sorted lists of `(python_files, config_and_doc_files)` under `self.repo_root`."""
+        py_files: list[Path] = []
+        other_files: list[Path] = []
+
+        for current_root, dirs, files in os.walk(self.repo_root):
+            dirs[:] = sorted(
+                d
+                for d in dirs
+                if d not in _IGNORED_DIRS and not d.endswith(".egg-info")
+            )
+            root_path = Path(current_root)
+            for fname in sorted(files):
+                fpath = root_path / fname
+                rel_parts = fpath.relative_to(self.repo_root).parts
+                if any(p in _IGNORED_DIRS or p.endswith(".egg-info") for p in rel_parts):
+                    continue
+                if fname.endswith(".py"):
+                    py_files.append(fpath)
+                elif fname in _CONFIG_DOC_FILENAMES or (
+                    len(rel_parts) == 1 and fname.lower().endswith(".md")
+                ):
+                    other_files.append(fpath)
+
+        py_files.sort(key=lambda p: p.relative_to(self.repo_root).as_posix())
+        other_files.sort(key=lambda p: p.relative_to(self.repo_root).as_posix())
+        return py_files, other_files
+
+    def inspect_graphify_status(self) -> dict[str, Any]:
+        """Validate `graphify-out/graph.json` against the current repository root and files."""
+        status: dict[str, Any] = {
+            "graph_file": str(self.graph_file),
+            "exists": self.graph_file.is_file(),
+            "valid": False,
+            "fresh": False,
+            "needs_refresh": True,
+            "contaminated": False,
+            "mismatched_root": False,
+            "node_count": 0,
+            "edge_count": 0,
+            "indexed_files": [],
+            "deleted_files": [],
+            "missing_files": [],
+            "modified_files": [],
+            "reasons": [],
+        }
+
+        if not self.graph_file.is_file():
+            status["reasons"].append("graphify-out/graph.json does not exist")
+            return status
+
+        root_marker = self.repo_root / "graphify-out" / ".graphify_root"
+        if root_marker.is_file():
+            try:
+                recorded_root = root_marker.read_text(encoding="utf-8").strip()
+                if recorded_root and recorded_root != ".":
+                    cand_root = Path(recorded_root)
+                    if cand_root.is_absolute() and cand_root.resolve() != self.repo_root:
+                        status["mismatched_root"] = True
+                        status["contaminated"] = True
+                        status["reasons"].append(
+                            f".graphify_root points to {cand_root} instead of {self.repo_root}"
+                        )
+            except OSError:
+                pass
+
+        try:
+            raw_data = json.loads(self.graph_file.read_text(encoding="utf-8"))
+        except Exception as exc:
+            status["reasons"].append(f"Invalid JSON in graph.json: {exc}")
+            status["contaminated"] = True
+            return status
+
+        if not isinstance(raw_data, dict) or not isinstance(raw_data.get("nodes"), list):
+            status["reasons"].append("graph.json is missing a 'nodes' list")
+            status["contaminated"] = True
+            return status
+
+        nodes = raw_data.get("nodes", [])
+        edges = raw_data.get("links", raw_data.get("edges", []))
+        status["valid"] = True
+        status["node_count"] = len(nodes)
+        status["edge_count"] = len(edges) if isinstance(edges, list) else 0
+
+        graph_source_files: set[str] = set()
+        deleted_files: set[str] = set()
+        untagged_code_nodes = 0
+
+        for node in nodes:
+            if not isinstance(node, dict):
+                continue
+            sf = node.get("source_file")
+            if not isinstance(sf, str) or not sf.strip():
+                continue
+            norm_sf = sf.strip().replace("\\", "/")
+            if norm_sf.startswith("./"):
+                norm_sf = norm_sf[2:]
+            cand = Path(norm_sf)
+            resolved_sf = (
+                cand.resolve()
+                if cand.is_absolute()
+                else (self.repo_root / norm_sf).resolve()
+            )
+            try:
+                rel_sf = resolved_sf.relative_to(self.repo_root).as_posix()
+            except ValueError:
+                deleted_files.add(norm_sf)
+                continue
+
+            graph_source_files.add(rel_sf)
+            if not resolved_sf.is_file():
+                deleted_files.add(rel_sf)
+            elif node.get("file_type") == "code" and not node.get("_origin"):
+                untagged_code_nodes += 1
+
+        py_files, _ = self._discover_repo_files()
+        try:
+            graph_mtime = self.graph_file.stat().st_mtime
+        except OSError:
+            graph_mtime = 0.0
+
+        missing_files: list[str] = []
+        modified_files: list[str] = []
+
+        for py_path in py_files:
+            rel_py = py_path.relative_to(self.repo_root).as_posix()
+            try:
+                content = py_path.read_text(encoding="utf-8", errors="replace").strip()
+                mtime = py_path.stat().st_mtime
+            except OSError:
+                continue
+
+            if not content:
+                continue
+
+            # Check if file defines classes/functions or executable statements
+            has_ast_symbols = False
+            try:
+                tree = ast.parse(content)
+                has_ast_symbols = any(
+                    isinstance(
+                        stmt,
+                        (
+                            ast.FunctionDef,
+                            ast.AsyncFunctionDef,
+                            ast.ClassDef,
+                            ast.Assign,
+                            ast.AnnAssign,
+                            ast.Expr,
+                        ),
+                    )
+                    for stmt in tree.body
+                )
+            except SyntaxError:
+                has_ast_symbols = True
+
+            if has_ast_symbols and rel_py not in graph_source_files:
+                missing_files.append(rel_py)
+
+            if mtime > graph_mtime + 1.0:
+                modified_files.append(rel_py)
+
+        status["indexed_files"] = sorted(graph_source_files)
+        status["deleted_files"] = sorted(deleted_files)
+        status["missing_files"] = sorted(missing_files)
+        status["modified_files"] = sorted(modified_files)
+
+        if deleted_files:
+            status["contaminated"] = True
+            status["reasons"].append(
+                f"Graph references {len(deleted_files)} deleted file(s): {', '.join(sorted(deleted_files)[:8])}"
+            )
+        if missing_files:
+            status["reasons"].append(
+                f"Graph is missing {len(missing_files)} current file(s): {', '.join(sorted(missing_files)[:8])}"
+            )
+        if modified_files:
+            status["reasons"].append(
+                f"{len(modified_files)} file(s) modified since graph.json was built"
+            )
+            if untagged_code_nodes > 0:
+                status["contaminated"] = True
+                status["reasons"].append(
+                    "Legacy graph nodes lack '_origin' metadata for clean incremental eviction"
+                )
+
+        needs_refresh = bool(
+            status["contaminated"]
+            or status["mismatched_root"]
+            or deleted_files
+            or missing_files
+            or modified_files
+            or status["node_count"] == 0
+        )
+        status["needs_refresh"] = needs_refresh
+        status["fresh"] = status["valid"] and not needs_refresh
+        return status
+
+    def _clean_contaminated_graphify_artifacts(self) -> None:
+        """Remove contaminated `graph.json` and legacy flat cache files prior to a clean rebuild."""
+        if self.graph_file.is_file():
+            try:
+                self.graph_file.unlink()
+            except OSError:
+                pass
+        cache_dir = self.repo_root / "graphify-out" / "cache"
+        if cache_dir.is_dir():
+            for item in cache_dir.glob("*.json"):
+                if item.is_file():
+                    try:
+                        item.unlink()
+                    except OSError:
+                        pass
+
+    def graphify_query(self, question: str, budget: int = 2500, dfs: bool = False) -> str:
         """Retrieve broader graph-based architecture context."""
         if not question or not question.strip():
             raise ValueError("Question cannot be empty.")
@@ -119,17 +476,51 @@ class CodeIntelligence:
 
         return self._run(["graphify", "path", source.strip(), target.strip()])
 
-    def graphify_update(self, target_path: str = ".") -> str:
+    def graphify_update(
+        self,
+        target_path: str = ".",
+        force: bool = True,
+        clean_if_contaminated: bool = True,
+    ) -> str:
         """Re-extract code files and update the Graphify graph (no LLM required)."""
         if not target_path or not target_path.strip():
             raise ValueError("Target path cannot be empty.")
-        return self._run(["graphify", "update", target_path.strip()], timeout=60)
 
-    def ensure_graphify_graph(self) -> Path:
-        """Ensure graphify-out/graph.json exists, building it if missing."""
-        if not self.graph_file.is_file():
-            self.graphify_update(".")
+        if clean_if_contaminated and self.graph_file.is_file():
+            status = self.inspect_graphify_status()
+            if status.get("contaminated") or force:
+                self._clean_contaminated_graphify_artifacts()
+
+        cmd = ["graphify", "update", target_path.strip()]
+        return self._run(cmd, timeout=90)
+
+    def ensure_graphify_graph(self, force_refresh: bool = False) -> Path:
+        """Ensure `graphify-out/graph.json` exists and is fresh and uncontaminated."""
+        status = self.inspect_graphify_status()
+        if force_refresh or status["needs_refresh"]:
+            if status.get("contaminated"):
+                self._clean_contaminated_graphify_artifacts()
+            self.graphify_update(".", force=True, clean_if_contaminated=False)
+            post_status = self.inspect_graphify_status()
+            if not post_status["valid"]:
+                raise RuntimeError(
+                    f"Graphify rebuild did not produce a valid graph: {'; '.join(post_status['reasons'])}"
+                )
+            if post_status["deleted_files"]:
+                raise RuntimeError(
+                    f"Graphify graph still contains deleted files after rebuild: {post_status['deleted_files']}"
+                )
         return self.graph_file
+
+    def read_graphify_report_summary(self, max_chars: int = 3500) -> str:
+        """Read high-signal sections (Summary, God Nodes, Surprising Connections) from GRAPH_REPORT.md."""
+        if not self.graph_report_file.is_file():
+            return ""
+        try:
+            text = self.graph_report_file.read_text(encoding="utf-8", errors="replace").strip()
+            return text[:max_chars]
+        except OSError:
+            return ""
 
     def graphify_save_result(
         self,
@@ -164,107 +555,207 @@ class CodeIntelligence:
     # Codebase Memory MCP Operations
     # ------------------------------------------------------------------
 
-    def memory_query(self, project: str, symbol_pattern: str) -> str:
-        """Search indexed code symbols using Codebase Memory MCP."""
+    def list_memory_projects(self) -> list[dict[str, Any]]:
+        """Return the list of indexed projects from Codebase Memory MCP."""
+        out = self._run(
+            [
+                "codebase-memory-mcp",
+                "cli",
+                "--quiet",
+                "list_projects",
+                json.dumps({"format": "json"}),
+            ]
+        )
+        data = json.loads(out)
+        if isinstance(data, dict) and isinstance(data.get("projects"), list):
+            return [p for p in data["projects"] if isinstance(p, dict)]
+        return []
+
+    def is_memory_project_indexed(self, project: str | None = None) -> tuple[bool, str | None]:
+        """Check whether `self.repo_root` is currently indexed in Codebase Memory MCP."""
+        try:
+            projects = self.list_memory_projects()
+        except Exception:
+            return False, None
+
+        canonical_slug = _canonical_project_slug(self.repo_root)
+        matching_names: list[str] = []
+        for entry in projects:
+            root_str = entry.get("root_path")
+            name = entry.get("name")
+            if not isinstance(root_str, str) or not isinstance(name, str) or not name.strip():
+                continue
+            try:
+                if Path(root_str).resolve() == self.repo_root:
+                    matching_names.append(name.strip())
+            except Exception:
+                continue
+
+        if not matching_names:
+            return False, None
+
+        if project and project.strip() in matching_names:
+            return True, project.strip()
+        if canonical_slug in matching_names:
+            return True, canonical_slug
+        for name in matching_names:
+            if name.lower() == canonical_slug.lower():
+                return True, name
+        matching_names.sort(key=len)
+        return True, matching_names[0]
+
+    def resolve_memory_project(self, preferred_project: str | None = None) -> str:
+        """Resolve the indexed project name corresponding to `self.repo_root` in Codebase Memory MCP.
+        Never silently selects an unrelated project belonging to a different directory.
+        """
+        pref = (
+            preferred_project.strip()
+            if isinstance(preferred_project, str) and preferred_project.strip()
+            else None
+        )
+        canonical_slug = _canonical_project_slug(self.repo_root)
+
+        try:
+            projects = self.list_memory_projects()
+            matching_repo_projects: list[str] = []
+            unrelated_project_names: set[str] = set()
+
+            for entry in projects:
+                root_str = entry.get("root_path")
+                name = entry.get("name")
+                if not isinstance(name, str) or not name.strip():
+                    continue
+                clean_name = name.strip()
+                if isinstance(root_str, str) and root_str.strip():
+                    try:
+                        if Path(root_str).resolve() == self.repo_root:
+                            matching_repo_projects.append(clean_name)
+                        else:
+                            unrelated_project_names.add(clean_name)
+                    except Exception:
+                        unrelated_project_names.add(clean_name)
+
+            if matching_repo_projects:
+                if pref and pref in matching_repo_projects:
+                    self.default_project = pref
+                    return pref
+                if canonical_slug in matching_repo_projects:
+                    self.default_project = canonical_slug
+                    return canonical_slug
+                for candidate in matching_repo_projects:
+                    if candidate.lower() == canonical_slug.lower():
+                        self.default_project = candidate
+                        return candidate
+                if self.default_project and self.default_project in matching_repo_projects:
+                    return self.default_project
+                matching_repo_projects.sort(key=len)
+                self.default_project = matching_repo_projects[0]
+                return matching_repo_projects[0]
+
+            if pref and pref not in unrelated_project_names:
+                return pref
+        except Exception:
+            if pref:
+                return pref
+
+        if self.default_project:
+            return self.default_project
+        return canonical_slug
+
+    def memory_query(
+        self,
+        project: str,
+        symbol_pattern: str,
+        limit: int = 100,
+        label: str | None = None,
+    ) -> str:
+        """Search indexed code symbols using Codebase Memory MCP JSON CLI."""
         if not project or not project.strip():
             raise ValueError("Project name cannot be empty.")
 
         if not symbol_pattern or not symbol_pattern.strip():
             raise ValueError("Symbol pattern cannot be empty.")
 
+        payload: dict[str, Any] = {
+            "project": project.strip(),
+            "name_pattern": symbol_pattern.strip(),
+            "limit": int(limit),
+            "format": "json",
+        }
+        if isinstance(label, str) and label.strip():
+            payload["label"] = label.strip()
+
         return self._run(
             [
                 "codebase-memory-mcp",
                 "cli",
+                "--quiet",
                 "search_graph",
-                "--project",
-                project,
-                "--name-pattern",
-                symbol_pattern,
-                "--format",
-                "json",
+                json.dumps(payload),
             ]
         )
 
     def memory_index(self, project: str | None = None, mode: str = "fast") -> str:
         """Index or refresh the repository in Codebase Memory MCP."""
-        cmd = [
-            "codebase-memory-mcp",
-            "cli",
-            "index_repository",
-            "--repo-path",
-            str(self.repo_root),
-            "--mode",
-            mode,
-        ]
-        target_name = (
-            project.strip()
-            if isinstance(project, str) and project.strip()
-            else self.default_project
+        payload: dict[str, Any] = {
+            "repo_path": str(self.repo_root),
+            "mode": mode,
+            "format": "json",
+        }
+        output = self._run(
+            [
+                "codebase-memory-mcp",
+                "cli",
+                "--quiet",
+                "index_repository",
+                json.dumps(payload),
+            ],
+            timeout=90,
         )
-        if target_name:
-            cmd.extend(["--name", target_name])
-
-        output = self._run(cmd, timeout=60)
         try:
             parsed = json.loads(output)
             if isinstance(parsed, dict) and isinstance(parsed.get("project"), str):
-                self.default_project = parsed["project"]
+                self.default_project = parsed["project"].strip()
         except (ValueError, TypeError):
             pass
         return output
 
-    def resolve_memory_project(self, preferred_project: str | None = None) -> str:
-        """Resolve the indexed project name corresponding to repo_root in Codebase Memory MCP."""
-        try:
-            out = self._run(
-                ["codebase-memory-mcp", "cli", "list_projects", "--format", "json"]
-            )
-            data = json.loads(out)
-            projects = data.get("projects", []) if isinstance(data, dict) else []
-            for entry in projects:
-                if not isinstance(entry, dict):
-                    continue
-                root_str = entry.get("root_path")
-                name = entry.get("name")
-                if root_str and name:
-                    try:
-                        if Path(root_str).resolve() == self.repo_root:
-                            self.default_project = str(name)
-                            return str(name)
-                    except Exception:
-                        pass
-            if preferred_project:
-                for entry in projects:
-                    if isinstance(entry, dict) and entry.get("name") == preferred_project:
-                        return preferred_project
-        except Exception:
-            pass
-
-        return (
-            (
-                preferred_project.strip()
-                if isinstance(preferred_project, str) and preferred_project.strip()
-                else None
-            )
-            or self.default_project
-            or self.repo_root.name
-        )
-
-    def memory_architecture(self, project: str, aspects: str = "overview") -> str:
-        """Retrieve architectural structure from Codebase Memory MCP."""
+    def memory_architecture(
+        self,
+        project: str,
+        aspects: str | list[str] = "all",
+    ) -> str:
+        """Retrieve architectural structure (file tree, layers, packages, hotspots, boundaries)
+        from Codebase Memory MCP.
+        """
         if not project or not project.strip():
             raise ValueError("Project name cannot be empty.")
 
+        if isinstance(aspects, list):
+            raw_aspects = [str(a).strip() for a in aspects if str(a).strip()]
+        elif isinstance(aspects, str) and aspects.strip():
+            raw_aspects = [a.strip() for a in aspects.split(",") if a.strip()]
+        else:
+            raw_aspects = ["all"]
+
+        normalized_aspects = [
+            "all" if a.lower() in ("overview", "all", "*") else a for a in raw_aspects
+        ]
+        if not normalized_aspects or "all" in normalized_aspects:
+            normalized_aspects = ["all"]
+
+        payload: dict[str, Any] = {
+            "project": project.strip(),
+            "aspects": normalized_aspects,
+            "format": "json",
+        }
         return self._run(
             [
                 "codebase-memory-mcp",
                 "cli",
+                "--quiet",
                 "get_architecture",
-                "--project",
-                project.strip(),
-                "--format",
-                "json",
+                json.dumps(payload),
             ]
         )
 
@@ -281,21 +772,20 @@ class CodeIntelligence:
         if not function_name or not function_name.strip():
             raise ValueError("Function name cannot be empty.")
 
+        payload: dict[str, Any] = {
+            "project": project.strip(),
+            "function_name": function_name.strip(),
+            "direction": direction,
+            "depth": int(depth),
+            "format": "json",
+        }
         return self._run(
             [
                 "codebase-memory-mcp",
                 "cli",
+                "--quiet",
                 "trace_path",
-                "--project",
-                project.strip(),
-                "--function-name",
-                function_name.strip(),
-                "--direction",
-                direction,
-                "--depth",
-                str(depth),
-                "--format",
-                "json",
+                json.dumps(payload),
             ]
         )
 
@@ -304,17 +794,18 @@ class CodeIntelligence:
         if not project or not project.strip():
             raise ValueError("Project name cannot be empty.")
 
+        payload: dict[str, Any] = {
+            "project": project.strip(),
+            "base_branch": base_branch,
+            "format": "json",
+        }
         return self._run(
             [
                 "codebase-memory-mcp",
                 "cli",
+                "--quiet",
                 "detect_changes",
-                "--project",
-                project.strip(),
-                "--base-branch",
-                base_branch,
-                "--format",
-                "json",
+                json.dumps(payload),
             ]
         )
 
@@ -325,19 +816,647 @@ class CodeIntelligence:
         if not qualified_name or not qualified_name.strip():
             raise ValueError("Qualified name cannot be empty.")
 
+        payload: dict[str, Any] = {
+            "project": project.strip(),
+            "qualified_name": qualified_name.strip(),
+            "format": "json",
+        }
         return self._run(
             [
                 "codebase-memory-mcp",
                 "cli",
+                "--quiet",
                 "get_code_snippet",
-                "--project",
-                project.strip(),
-                "--qualified-name",
-                qualified_name.strip(),
-                "--format",
-                "json",
+                json.dumps(payload),
             ]
         )
+
+    # ------------------------------------------------------------------
+    # Deterministic Repository Inventory & Dependency-Aware Reading Order
+    # ------------------------------------------------------------------
+
+    def _module_map_for_repo(self, py_files: list[Path]) -> dict[str, str]:
+        """Map dotted Python module names to relative POSIX file paths in `self.repo_root`."""
+        mod_to_rel: dict[str, str] = {}
+        for py_path in py_files:
+            rel = py_path.relative_to(self.repo_root).as_posix()
+            no_ext = rel[:-3] if rel.endswith(".py") else rel
+            parts = no_ext.split("/")
+            if parts[-1] == "__init__":
+                pkg_Parts = parts[:-1]
+                if pkg_Parts:
+                    mod_to_rel[".".join(pkg_Parts)] = rel
+            else:
+                mod_to_rel[".".join(parts)] = rel
+        return mod_to_rel
+
+    def _resolve_import_targets(
+        self,
+        current_rel: str,
+        module_name: str | None,
+        names: list[str],
+        level: int,
+        mod_to_rel: dict[str, str],
+    ) -> tuple[set[str], set[str]]:
+        """Resolve an import statement into `(internal_rel_paths, external_top_packages)`."""
+        internal: set[str] = set()
+        external: set[str] = set()
+
+        current_parts = current_rel[:-3].split("/") if current_rel.endswith(".py") else []
+        if current_parts and current_parts[-1] == "__init__":
+            current_pkg_parts = current_parts[:-1]
+        else:
+            current_pkg_parts = current_parts[:-1]
+
+        base_mod = module_name or ""
+        if level > 0:
+            up = max(0, len(current_pkg_parts) - (level - 1))
+            prefix_parts = current_pkg_parts[:up]
+            if base_mod:
+                base_mod = ".".join([*prefix_parts, base_mod])
+            else:
+                base_mod = ".".join(prefix_parts)
+
+        matched_internal = False
+        if base_mod:
+            if base_mod in mod_to_rel:
+                target_rel = mod_to_rel[base_mod]
+                if target_rel != current_rel:
+                    internal.add(target_rel)
+                matched_internal = True
+
+            for imported_symbol in names:
+                if imported_symbol == "*":
+                    continue
+                sub_cand = f"{base_mod}.{imported_symbol}"
+                if sub_cand in mod_to_rel:
+                    target_rel = mod_to_rel[sub_cand]
+                    if target_rel != current_rel:
+                        internal.add(target_rel)
+                    matched_internal = True
+
+            # Also check parent packages if base_mod is a deep symbol reference
+            if not matched_internal and "." in base_mod:
+                parts = base_mod.split(".")
+                for i in range(len(parts) - 1, 0, -1):
+                    prefix = ".".join(parts[:i])
+                    if prefix in mod_to_rel:
+                        target_rel = mod_to_rel[prefix]
+                        if target_rel != current_rel:
+                            internal.add(target_rel)
+                        matched_internal = True
+                        break
+
+        if not matched_internal and level == 0:
+            if base_mod:
+                top_pkg = base_mod.split(".")[0]
+                if top_pkg:
+                    external.add(top_pkg)
+            else:
+                for imported_symbol in names:
+                    top_pkg = imported_symbol.split(".")[0]
+                    if top_pkg in mod_to_rel:
+                        target_rel = mod_to_rel[top_pkg]
+                        if target_rel != current_rel:
+                            internal.add(target_rel)
+                    elif top_pkg:
+                        external.add(top_pkg)
+
+        return internal, external
+
+    def _analyze_python_file(
+        self,
+        py_path: Path,
+        mod_to_rel: dict[str, str],
+    ) -> dict[str, Any]:
+        """Extract docstring, classes, functions, imports, and entry-point info from a Python file."""
+        rel_path = py_path.relative_to(self.repo_root).as_posix()
+        try:
+            source = py_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            source = ""
+
+        line_count = len(source.splitlines())
+        info: dict[str, Any] = {
+            "path": rel_path,
+            "type": "python",
+            "lines": line_count,
+            "docstring": "",
+            "summary": "",
+            "classes": [],
+            "functions": [],
+            "exports": [],
+            "internal_dependencies": [],
+            "external_dependencies": [],
+            "depended_on_by": [],
+            "is_entry_point": rel_path in ("main.py", "test.py") or rel_path.endswith("__main__.py"),
+        }
+
+        if not source.strip():
+            info["summary"] = "Empty module marker."
+            return info
+
+        try:
+            tree = ast.parse(source)
+        except SyntaxError as exc:
+            info["summary"] = f"Python source file (syntax error at line {exc.lineno})."
+            return info
+
+        doc = _first_line(ast.get_docstring(tree))
+        info["docstring"] = doc
+
+        classes: list[dict[str, Any]] = []
+        functions: list[dict[str, Any]] = []
+        exports: list[str] = []
+        internal_deps: set[str] = set()
+        external_deps: set[str] = set()
+
+        for node in tree.body:
+            if isinstance(node, ast.ClassDef):
+                methods = [
+                    item.name
+                    for item in node.body
+                    if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    and (not item.name.startswith("_") or item.name == "__init__")
+                ]
+                bases: list[str] = []
+                for b in node.bases:
+                    try:
+                        bases.append(ast.unparse(b))
+                    except Exception:
+                        pass
+                classes.append(
+                    {
+                        "name": node.name,
+                        "bases": bases,
+                        "methods": methods[:12],
+                        "docstring": _first_line(ast.get_docstring(node)),
+                        "line": node.lineno,
+                    }
+                )
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                functions.append(
+                    {
+                        "name": node.name,
+                        "docstring": _first_line(ast.get_docstring(node)),
+                        "line": node.lineno,
+                    }
+                )
+            elif isinstance(node, ast.Import):
+                names = [alias.name for alias in node.names]
+                int_d, ext_d = self._resolve_import_targets(
+                    rel_path, None, names, 0, mod_to_rel
+                )
+                internal_deps.update(int_d)
+                external_deps.update(ext_d)
+            elif isinstance(node, ast.ImportFrom):
+                names = [alias.name for alias in node.names]
+                int_d, ext_d = self._resolve_import_targets(
+                    rel_path, node.module, names, node.level or 0, mod_to_rel
+                )
+                internal_deps.update(int_d)
+                external_deps.update(ext_d)
+            elif isinstance(node, ast.Assign):
+                for target in node.targets:
+                    if isinstance(target, ast.Name) and target.id == "__all__":
+                        if isinstance(node.value, (ast.List, ast.Tuple, ast.Set)):
+                            for elt in node.value.elts:
+                                if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
+                                    exports.append(elt.value)
+            elif isinstance(node, ast.If):
+                try:
+                    cond_str = ast.unparse(node.test)
+                    if "__name__" in cond_str and "__main__" in cond_str:
+                        info["is_entry_point"] = True
+                except Exception:
+                    pass
+
+        # Also inspect nested imports inside functions/methods so lazy imports are captured
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                names = [alias.name for alias in node.names]
+                int_d, ext_d = self._resolve_import_targets(
+                    rel_path, None, names, 0, mod_to_rel
+                )
+                internal_deps.update(int_d)
+                external_deps.update(ext_d)
+            elif isinstance(node, ast.ImportFrom):
+                names = [alias.name for alias in node.names]
+                int_d, ext_d = self._resolve_import_targets(
+                    rel_path, node.module, names, node.level or 0, mod_to_rel
+                )
+                internal_deps.update(int_d)
+                external_deps.update(ext_d)
+
+        info["classes"] = classes
+        info["functions"] = functions
+        info["exports"] = exports or [c["name"] for c in classes] + [
+            f["name"] for f in functions if not f["name"].startswith("_")
+        ]
+        info["internal_dependencies"] = sorted(internal_deps)
+        info["external_dependencies"] = sorted(external_deps)
+
+        if doc:
+            info["summary"] = doc
+        elif rel_path == "test.py":
+            info["summary"] = (
+                "Top-level verification/demo script that invokes `query_directory('.', ...)` "
+                "from `ntg.agent` to explain the codebase and output a file reading order."
+            )
+        elif classes or functions:
+            sym_list = [c["name"] for c in classes] + [f["name"] for f in functions]
+            info["summary"] = f"Defines {', '.join(sym_list[:6])}."
+        elif exports:
+            info["summary"] = f"Package interface re-exporting {', '.join(exports[:8])}."
+        else:
+            info["summary"] = f"Python module `{rel_path}`."
+
+        return info
+
+    def _analyze_config_or_doc_file(self, fpath: Path) -> dict[str, Any]:
+        """Extract a factual summary of a non-Python project configuration or documentation file."""
+        rel_path = fpath.relative_to(self.repo_root).as_posix()
+        try:
+            text = fpath.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            text = ""
+
+        lines = text.splitlines()
+        summary = f"Project file `{rel_path}`."
+        fname = fpath.name
+
+        if fname == "README.md":
+            headings = [
+                ln.lstrip("#").strip()
+                for ln in lines
+                if ln.strip().startswith("#")
+            ]
+            title = headings[0] if headings else "README"
+            summary = (
+                f"Primary project documentation ({title}) covering architecture, "
+                "multi-provider routing, CLI commands, and setup."
+            )
+        elif fname == "pyproject.toml":
+            summary = (
+                "Python package build & metadata configuration (`ntg` v2.0.0, Python >=3.9, "
+                "dependencies: litellm, httpx, pydantic, python-dotenv; console script `ntg = ntg.cli.app:main`)."
+            )
+        elif fname == "requirements.txt":
+            pkgs = [
+                ln.split(">=")[0].split("==")[0].strip()
+                for ln in lines
+                if ln.strip() and not ln.strip().startswith("#")
+            ]
+            summary = (
+                f"Runtime and development dependency specification ({', '.join(pkgs[:8])})."
+                if pkgs
+                else "Python dependency requirements file."
+            )
+        elif fname == ".env.example":
+            env_keys = [
+                ln.split("=")[0].strip()
+                for ln in lines
+                if "=" in ln and not ln.strip().startswith("#")
+            ]
+            summary = (
+                f"Template environment configuration documenting API key and runtime variables "
+                f"({', '.join(env_keys[:8])})."
+                if env_keys
+                else "Environment variable template file."
+            )
+        elif fname == ".gitignore":
+            summary = "Git ignore rules excluding virtualenvs, caches, `.env`, `.ntg/`, and build artifacts."
+
+        return {
+            "path": rel_path,
+            "type": "doc" if fname.lower().endswith(".md") else "config",
+            "lines": len(lines),
+            "docstring": "",
+            "summary": summary,
+            "classes": [],
+            "functions": [],
+            "exports": [],
+            "internal_dependencies": [],
+            "external_dependencies": [],
+            "depended_on_by": [],
+            "is_entry_point": False,
+        }
+
+    def _classify_layer(self, file_info: dict[str, Any]) -> tuple[int, str, int]:
+        """Classify a file into `(layer_order, layer_name, intra_layer_priority)` for reading order."""
+        rel = file_info["path"]
+        ftype = file_info["type"]
+        parts = rel.split("/")
+        is_init = parts[-1] == "__init__.py"
+
+        if ftype in ("doc", "config"):
+            order_map = {
+                "README.md": 0,
+                "pyproject.toml": 1,
+                "requirements.txt": 2,
+                ".env.example": 3,
+                ".gitignore": 4,
+            }
+            return (1, "1. Project Overview & Configuration", order_map.get(rel, 10))
+
+        if rel in ("main.py", "ntg/__main__.py", "test.py"):
+            ep_map = {"main.py": 0, "ntg/__main__.py": 1, "test.py": 2}
+            return (2, "2. Execution Entry Points", ep_map.get(rel, 5))
+
+        if rel == "ntg/__init__.py":
+            return (2, "2. Execution Entry Points", 3)
+
+        if len(parts) >= 2 and parts[0] == "ntg":
+            subpkg = parts[1]
+            if subpkg == "core":
+                # Leaf utilities & config/models/exceptions before __init__.py
+                prio_map = {
+                    "ntg/core/utils.py": 0,
+                    "ntg/core/config.py": 1,
+                    "ntg/core/models.py": 2,
+                    "ntg/core/exceptions.py": 3,
+                    "ntg/core/__init__.py": 9,
+                }
+                return (
+                    3,
+                    "3. Core Foundation Layer (ntg/core/)",
+                    prio_map.get(rel, 8 if is_init else 4),
+                )
+            if subpkg == "providers":
+                prio_map = {
+                    "ntg/providers/base.py": 0,
+                    "ntg/providers/openrouter.py": 1,
+                    "ntg/providers/groq.py": 2,
+                    "ntg/providers/gemini.py": 3,
+                    "ntg/providers/nvidia.py": 4,
+                    "ntg/providers/cohere.py": 5,
+                    "ntg/providers/discovery.py": 6,
+                    "ntg/providers/__init__.py": 9,
+                }
+                return (
+                    4,
+                    "4. Provider Discovery & Adapter Layer (ntg/providers/)",
+                    prio_map.get(rel, 8 if is_init else 5),
+                )
+            if subpkg == "router":
+                prio_map = {
+                    "ntg/router/requirements.py": 0,
+                    "ntg/router/state.py": 1,
+                    "ntg/router/telemetry.py": 2,
+                    "ntg/router/engine.py": 3,
+                    "ntg/router/__init__.py": 9,
+                }
+                return (
+                    5,
+                    "5. Smart Routing, Quota State & Telemetry Layer (ntg/router/)",
+                    prio_map.get(rel, 8 if is_init else 4),
+                )
+            if subpkg == "agent":
+                prio_map = {
+                    "ntg/agent/code_intelligence.py": 0,
+                    "ntg/agent/planner.py": 1,
+                    "ntg/agent/verifier.py": 2,
+                    "ntg/agent/orchestrator.py": 3,
+                    "ntg/agent/__init__.py": 9,
+                }
+                return (
+                    6,
+                    "6. Architecture-Aware Coding Agent Layer (ntg/agent/)",
+                    prio_map.get(rel, 8 if is_init else 4),
+                )
+            if subpkg == "cli":
+                prio_map = {
+                    "ntg/cli/diagnostics.py": 0,
+                    "ntg/cli/app.py": 1,
+                    "ntg/cli/__init__.py": 9,
+                }
+                return (
+                    7,
+                    "7. CLI & Diagnostics Layer (ntg/cli/)",
+                    prio_map.get(rel, 8 if is_init else 4),
+                )
+
+        return (
+            8,
+            "8. Compatibility & Supporting Modules",
+            9 if is_init else 5,
+        )
+
+    def _compute_reading_order(
+        self,
+        files_by_path: dict[str, dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Compute a deterministic, dependency-aware reading order across all project files."""
+        layers: dict[int, tuple[str, list[dict[str, Any]]]] = {}
+        for fpath, info in files_by_path.items():
+            layer_num, layer_name, _ = self._classify_layer(info)
+            if layer_num not in layers:
+                layers[layer_num] = (layer_name, [])
+            layers[layer_num][1].append(info)
+
+        ordered_items: list[dict[str, Any]] = []
+        step = 1
+
+        for layer_num in sorted(layers.keys()):
+            layer_name, layer_files = layers[layer_num]
+            layer_paths = {f["path"] for f in layer_files}
+
+            # Topological sort within the layer so intra-layer dependencies come first
+            in_degree: dict[str, int] = {p: 0 for p in layer_paths}
+            adj: dict[str, list[str]] = {p: [] for p in layer_paths}
+
+            for f in layer_files:
+                p = f["path"]
+                for dep in f["internal_dependencies"]:
+                    if dep in layer_paths and dep != p:
+                        adj[dep].append(p)
+                        in_degree[p] += 1
+
+            ready = [p for p, deg in in_degree.items() if deg == 0]
+            ready.sort(
+                key=lambda p: (
+                    self._classify_layer(files_by_path[p])[2],
+                    len(files_by_path[p]["internal_dependencies"]),
+                    p,
+                )
+            )
+
+            sorted_layer_paths: list[str] = []
+            while ready:
+                curr = ready.pop(0)
+                sorted_layer_paths.append(curr)
+                for nxt in adj[curr]:
+                    in_degree[nxt] -= 1
+                    if in_degree[nxt] == 0:
+                        ready.append(nxt)
+                        ready.sort(
+                            key=lambda p: (
+                                self._classify_layer(files_by_path[p])[2],
+                                len(files_by_path[p]["internal_dependencies"]),
+                                p,
+                            )
+                        )
+
+            # In case of intra-layer cycles (e.g. __init__.py <-> submodule), append remaining in priority order
+            if len(sorted_layer_paths) < len(layer_paths):
+                remaining = [p for p in layer_paths if p not in sorted_layer_paths]
+                remaining.sort(
+                    key=lambda p: (
+                        self._classify_layer(files_by_path[p])[2],
+                        len(files_by_path[p]["internal_dependencies"]),
+                        p,
+                    )
+                )
+                sorted_layer_paths.extend(remaining)
+
+            for p in sorted_layer_paths:
+                info = files_by_path[p]
+                deps = info["internal_dependencies"]
+                rev_deps = info["depended_on_by"]
+                if info["type"] in ("doc", "config"):
+                    rationale = "Project metadata, configuration, and setup context read before source code."
+                elif info["is_entry_point"]:
+                    rationale = (
+                        f"Top-level entry point invoking {', '.join(deps[:4])}."
+                        if deps
+                        else "Top-level execution entry point."
+                    )
+                elif not deps:
+                    rationale = (
+                        f"Zero internal dependencies (foundational leaf module); imported by {len(rev_deps)} module(s)."
+                        if rev_deps
+                        else "Zero internal dependencies (standalone module)."
+                    )
+                else:
+                    rationale = (
+                        f"Depends on {', '.join(deps[:5])}"
+                        + (f" (+{len(deps) - 5} more)" if len(deps) > 5 else "")
+                        + (
+                            f"; imported by {', '.join(rev_deps[:4])}"
+                            + (f" (+{len(rev_deps) - 4} more)" if len(rev_deps) > 4 else "")
+                            if rev_deps
+                            else "."
+                        )
+                    )
+
+                key_symbols = [c["name"] for c in info["classes"]] + [
+                    fn["name"] for fn in info["functions"] if not fn["name"].startswith("_")
+                ]
+                ordered_items.append(
+                    {
+                        "step": step,
+                        "path": p,
+                        "layer": layer_name,
+                        "summary": info["summary"],
+                        "key_symbols": key_symbols[:10],
+                        "depends_on": deps,
+                        "depended_on_by": rev_deps,
+                        "rationale": rationale,
+                    }
+                )
+                step += 1
+
+        return ordered_items
+
+    def build_repository_inventory(self) -> dict[str, Any]:
+        """Build a complete, deterministic AST and filesystem inventory of the repository."""
+        py_files, other_files = self._discover_repo_files()
+        mod_to_rel = self._module_map_for_repo(py_files)
+
+        files_by_path: dict[str, dict[str, Any]] = {}
+        for fpath in other_files:
+            info = self._analyze_config_or_doc_file(fpath)
+            files_by_path[info["path"]] = info
+
+        for py_path in py_files:
+            info = self._analyze_python_file(py_path, mod_to_rel)
+            files_by_path[info["path"]] = info
+
+        # Populate reverse dependencies (`depended_on_by`)
+        for src_path, info in files_by_path.items():
+            for target_dep in info["internal_dependencies"]:
+                if target_dep in files_by_path and src_path not in files_by_path[target_dep]["depended_on_by"]:
+                    files_by_path[target_dep]["depended_on_by"].append(src_path)
+
+        for info in files_by_path.values():
+            info["depended_on_by"].sort()
+
+        reading_order = self._compute_reading_order(files_by_path)
+        entry_points = [
+            p for p, info in sorted(files_by_path.items()) if info.get("is_entry_point")
+        ]
+
+        return {
+            "repo_root": str(self.repo_root),
+            "repo_name": self.repo_root.name,
+            "total_files": len(files_by_path),
+            "python_file_count": len(py_files),
+            "config_doc_file_count": len(other_files),
+            "entry_points": entry_points,
+            "files": [files_by_path[k] for k in sorted(files_by_path.keys())],
+            "reading_order": reading_order,
+        }
+
+    def format_inventory_for_prompt(
+        self,
+        inventory: dict[str, Any] | None = None,
+    ) -> str:
+        """Render the complete file inventory and dependency-aware reading order as concise Markdown."""
+        inv = inventory or self.build_repository_inventory()
+        lines: list[str] = [
+            f"- **Repository Root**: `{inv['repo_root']}`",
+            f"- **Total Relevant Files**: {inv['total_files']} ({inv['python_file_count']} Python modules, {inv['config_doc_file_count']} config/documentation files)",
+            f"- **Execution Entry Points**: {', '.join(f'`{ep}`' for ep in inv['entry_points']) or 'None'}",
+            "",
+            "### Dependency-Aware Reading Order & Complete File Inventory",
+        ]
+
+        current_layer = ""
+        files_lookup = {f["path"]: f for f in inv.get("files", [])}
+
+        for item in inv.get("reading_order", []):
+            layer = item["layer"]
+            if layer != current_layer:
+                current_layer = layer
+                lines.append(f"\n#### {current_layer}")
+
+            path = item["path"]
+            f_info = files_lookup.get(path, {})
+            classes = [
+                f"{c['name']}({', '.join(c['methods'][:5])})"
+                if c.get("methods")
+                else c["name"]
+                for c in f_info.get("classes", [])
+            ]
+            funcs = [
+                fn["name"]
+                for fn in f_info.get("functions", [])
+                if not fn["name"].startswith("_")
+            ]
+            deps = item.get("depends_on", [])
+            rev_deps = item.get("depended_on_by", [])
+            ext_deps = f_info.get("external_dependencies", [])
+
+            details: list[str] = [f"**`{path}`** ({f_info.get('lines', 0)} lines): {item['summary']}"]
+            if classes:
+                details.append(f"  - Classes: `{', '.join(classes)}`")
+            if funcs:
+                details.append(f"  - Functions: `{', '.join(funcs[:10])}`")
+            if deps:
+                details.append(f"  - Internal Imports (`depends_on`): {', '.join(f'`{d}`' for d in deps)}")
+            else:
+                details.append("  - Internal Imports (`depends_on`): None (leaf / standalone file)")
+            if rev_deps:
+                details.append(
+                    f"  - Imported By (`depended_on_by`): {', '.join(f'`{r}`' for r in rev_deps[:8])}"
+                    + (f" (+{len(rev_deps) - 8} more)" if len(rev_deps) > 8 else "")
+                )
+            if ext_deps:
+                details.append(f"  - External/Stdlib Imports: `{', '.join(ext_deps[:8])}`")
+
+            lines.append(f"{item['step']}. " + "\n".join(details))
+
+        return "\n".join(lines)
 
     # ------------------------------------------------------------------
     # Unified Context & Knowledge Synchronization
@@ -352,8 +1471,13 @@ class CodeIntelligence:
         memory_out = ""
 
         try:
-            graphify_out = self.graphify_update(".")
-            graphify_ok = True
+            graphify_out = self.graphify_update(".", force=True, clean_if_contaminated=True)
+            post_graph = self.inspect_graphify_status()
+            graphify_ok = bool(post_graph["valid"] and not post_graph["deleted_files"])
+            if not graphify_ok:
+                errors.append(
+                    f"graphify_update validation failed: {'; '.join(post_graph['reasons'])}"
+                )
         except Exception as err:
             errors.append(f"graphify_update: {err}")
 
@@ -363,7 +1487,7 @@ class CodeIntelligence:
         except Exception as err:
             errors.append(f"memory_index: {err}")
 
-        effective_proj = self.default_project or project or self.repo_root.name
+        effective_proj = self.resolve_memory_project(project)
         return {
             "synced": graphify_ok and memory_ok,
             "graphify_updated": graphify_ok,
@@ -383,6 +1507,47 @@ class CodeIntelligence:
             "errors": errors,
         }
 
+    @staticmethod
+    def _summarize_memory_architecture(raw_arch: str) -> str:
+        """Compact Codebase Memory MCP `get_architecture` JSON output for high-signal prompting."""
+        if not raw_arch or not raw_arch.strip():
+            return ""
+        try:
+            data = json.loads(raw_arch)
+        except Exception:
+            return raw_arch[:4000]
+
+        if not isinstance(data, dict):
+            return raw_arch[:4000]
+
+        compact: dict[str, Any] = {}
+        for key in ("languages", "node_labels", "edge_types", "packages", "layers", "boundaries"):
+            if key in data:
+                compact[key] = data[key]
+        if isinstance(data.get("hotspots"), list):
+            compact["hotspots"] = data["hotspots"][:15]
+        if isinstance(data.get("clusters"), list):
+            compact["clusters"] = data["clusters"][:12]
+        if isinstance(data.get("file_tree"), dict):
+            compact["file_tree"] = data["file_tree"]
+
+        return json.dumps(compact, indent=2)
+
+    @staticmethod
+    def _summarize_memory_symbols(raw_symbols: str) -> str:
+        """Compact Codebase Memory MCP `search_graph` JSON output for high-signal prompting."""
+        if not raw_symbols or not raw_symbols.strip():
+            return ""
+        try:
+            data = json.loads(raw_symbols)
+        except Exception:
+            return raw_symbols[:4000]
+
+        if not isinstance(data, dict):
+            return raw_symbols[:4000]
+
+        return json.dumps(data, indent=2)[:4500]
+
     def gather_context(
         self,
         question: str,
@@ -390,46 +1555,110 @@ class CodeIntelligence:
         symbol_pattern: str | None = None,
         auto_build: bool = False,
     ) -> dict[str, Any]:
-        """Gather combined architectural and symbol context from Graphify and Codebase Memory MCP."""
+        """Gather combined deterministic AST inventory, Graphify context, and Codebase Memory MCP
+        architecture & symbol intelligence.
+        """
         if not question or not question.strip():
             raise ValueError("Question cannot be empty.")
 
         errors: list[str] = []
         graph_ctx = ""
+        graph_report = ""
         memory_ctx = ""
         arch_ctx = ""
 
+        # 1. Build deterministic repository inventory and dependency-aware reading order
+        inventory = self.build_repository_inventory()
+        formatted_inventory = self.format_inventory_for_prompt(inventory)
+
+        # 2. Validate Graphify freshness & contamination, refreshing if auto_build=True
+        graph_status = self.inspect_graphify_status()
         try:
-            if auto_build and not self.graph_file.is_file():
-                self.ensure_graphify_graph()
-            graph_ctx = self.graphify_query(question)
+            if graph_status["needs_refresh"]:
+                if auto_build:
+                    self.ensure_graphify_graph(force_refresh=True)
+                    graph_status = self.inspect_graphify_status()
+                elif not graph_status["exists"]:
+                    errors.append("graphify_status: graphify-out/graph.json is missing (auto_build=False)")
+                else:
+                    errors.append(
+                        f"graphify_status: graph is stale/contaminated ({'; '.join(graph_status['reasons'])})"
+                    )
+            if graph_status["valid"]:
+                graph_ctx = self.graphify_query(question, budget=2500)
+                graph_report = self.read_graphify_report_summary(max_chars=3000)
         except Exception as err:
             errors.append(f"graphify_query: {err}")
 
-        resolved_proj = self.resolve_memory_project(project)
+        # 3. Resolve & validate Codebase Memory MCP project and retrieve full architecture
+        is_indexed, matched_proj = self.is_memory_project_indexed(project)
+        resolved_proj = matched_proj or self.resolve_memory_project(project)
+
         try:
-            arch_ctx = self.memory_architecture(resolved_proj)
+            if not is_indexed and auto_build:
+                self.memory_index(project=project)
+                is_indexed, matched_proj = self.is_memory_project_indexed(project)
+                resolved_proj = matched_proj or self.resolve_memory_project(project)
+
+            raw_arch = self.memory_architecture(resolved_proj, aspects="all")
+            arch_ctx = self._summarize_memory_architecture(raw_arch)
         except Exception as err:
             if auto_build:
                 try:
                     self.memory_index(project=project)
-                    resolved_proj = self.resolve_memory_project(project)
-                    arch_ctx = self.memory_architecture(resolved_proj)
+                    is_indexed, matched_proj = self.is_memory_project_indexed(project)
+                    resolved_proj = matched_proj or self.resolve_memory_project(project)
+                    raw_arch = self.memory_architecture(resolved_proj, aspects="all")
+                    arch_ctx = self._summarize_memory_architecture(raw_arch)
                 except Exception as retry_err:
                     errors.append(f"memory_architecture: {retry_err}")
             else:
                 errors.append(f"memory_architecture: {err}")
 
-        if symbol_pattern and symbol_pattern.strip():
-            try:
-                memory_ctx = self.memory_query(resolved_proj, symbol_pattern.strip())
-            except Exception as err:
-                errors.append(f"memory_query: {err}")
+        # 4. Retrieve symbol context (even when symbol_pattern is not explicitly supplied)
+        effective_pattern = (
+            symbol_pattern.strip()
+            if isinstance(symbol_pattern, str) and symbol_pattern.strip()
+            else ".*"
+        )
+        try:
+            raw_symbols = self.memory_query(
+                resolved_proj,
+                effective_pattern,
+                limit=80,
+            )
+            memory_ctx = self._summarize_memory_symbols(raw_symbols)
+        except Exception as err:
+            errors.append(f"memory_query: {err}")
+
+        coverage = {
+            "total_repo_files": inventory["total_files"],
+            "python_files": inventory["python_file_count"],
+            "config_doc_files": inventory["config_doc_file_count"],
+            "graphify_fresh": graph_status["fresh"],
+            "graphify_indexed_files": len(graph_status["indexed_files"]),
+            "graphify_deleted_files": graph_status["deleted_files"],
+            "graphify_missing_files": graph_status["missing_files"],
+            "memory_project": resolved_proj,
+            "memory_indexed": is_indexed,
+            "complete_inventory_available": True,
+        }
 
         return {
+            "repo_root": str(self.repo_root),
             "question": question,
             "project": resolved_proj,
+            "index_status": {
+                "graphify": graph_status,
+                "memory_project": resolved_proj,
+                "memory_indexed": is_indexed,
+            },
+            "coverage": coverage,
+            "repository_inventory": inventory,
+            "reading_order": inventory["reading_order"],
+            "formatted_inventory": formatted_inventory,
             "graphify_context": graph_ctx,
+            "graphify_report": graph_report,
             "memory_context": memory_ctx,
             "memory_symbols": memory_ctx,
             "architecture_overview": arch_ctx,
