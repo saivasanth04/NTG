@@ -8,9 +8,11 @@ env/
 venv/
 .venv/
 
-# NTG Persistent State
+# NTG Persistent State & Knowledge Graphs
 .ntg/
 .ntg_state.json
+graphify-out/
+.codebase-memory/
 
 # Environment Variables & Secrets
 .env

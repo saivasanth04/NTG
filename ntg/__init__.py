@@ -58,6 +58,17 @@ from ntg.models import (
     QuotaScope,
     utc_string,
 )
+from ntg.agent import ArchitectureAwareAgent, CodingAgent
+from ntg.code_intelligence import CodeIntelligence
+from ntg.planner import (
+    approve_plan,
+    build_change_plan,
+    build_planning_prompt,
+    record_files_changed,
+    record_validation_result,
+    reject_plan,
+    require_approved_plan,
+)
 from ntg.router import (
     NoEligibleDeploymentsError,
     OpenRouterFallbackRouter,
@@ -66,6 +77,12 @@ from ntg.router import (
     extract_request_requirements,
 )
 from ntg.state import StateManager
+from ntg.verifier import (
+    CodeVerifier,
+    inspect_git_diff,
+    run_verification_command,
+    verify_python_syntax,
+)
 
 __all__ = [
     "Deployment",
@@ -83,6 +100,20 @@ __all__ = [
     "extract_request_requirements",
     "UnifiedNTGRouter",
     "OpenRouterFallbackRouter",
+    "CodeIntelligence",
+    "build_planning_prompt",
+    "build_change_plan",
+    "approve_plan",
+    "reject_plan",
+    "require_approved_plan",
+    "record_files_changed",
+    "record_validation_result",
+    "CodeVerifier",
+    "verify_python_syntax",
+    "run_verification_command",
+    "inspect_git_diff",
+    "ArchitectureAwareAgent",
+    "CodingAgent",
     "OPENROUTER_ACTUAL_MODEL",
     "OPENROUTER_FREE_MODEL",
     "OPENROUTER_LITELLM_MODEL",

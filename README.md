@@ -1,15 +1,33 @@
-# NTG: Multi-Provider LiteLLM Smart Router
+# NTG: Architecture-Aware AI Coding Agent & Multi-Provider LiteLLM Smart Router
 
-A clean, production-grade, highly resilient multi-provider AI model router that unifies OpenRouter, Groq, NVIDIA NIM, Cohere, and Gemini into an intelligent routing fabric powered by **LiteLLM**.
+A production-grade, architecture-aware AI coding agent and resilient multi-provider LLM routing fabric. NTG combines **Graphify** and **Codebase Memory MCP** for deep repository knowledge with **LiteLLM** smart routing across OpenRouter, Groq, NVIDIA NIM, Cohere, and Gemini.
 
 ---
 
-## Architecture & Responsibilities
+## System Architecture
 
-NTG cleanly divides responsibilities between infrastructure routing and domain intelligence:
+### 1. Architecture-Aware Coding Agent Workflow
 
 ```
-USER REQUEST
+USER CODING REQUEST
+    ↓
+CODE INTELLIGENCE (Graphify Knowledge Graph + Codebase Memory MCP Symbol/Call Graph)
+    ↓
+ARCHITECTURE-AWARE PLANNER (Builds structured prompt + routes via UnifiedNTGRouter [coding])
+    ↓
+HUMAN-IN-THE-LOOP APPROVAL GATE (awaiting_review → approved / rejected)
+    ↓
+SAFE CHANGE APPLICATION (Repository boundary enforcement + file tracking)
+    ↓
+IMPLEMENTATION VERIFIER (AST + py_compile syntax verification + shell-free test commands)
+    ↓
+KNOWLEDGE GRAPH SYNC (graphify update . + codebase-memory-mcp cli index_repository)
+```
+
+### 2. Multi-Provider Smart Routing Fabric
+
+```
+AGENT / USER PROMPT
     ↓
 REQUEST REQUIREMENTS (tools, structured output, vision, streaming, coding, reasoning)
     ↓
@@ -26,37 +44,41 @@ RESPONSE
 NTG TELEMETRY & PERSISTENT STATE (.ntg/state.json)
 ```
 
-LiteLLM is the **sole routing authority** (load balancing, retries, and failovers). NTG serves as the **eligibility, quota intelligence, circuit state, and telemetry layer** with zero duplicate routing loops.
+LiteLLM is the **sole routing authority** (load balancing, retries, and failovers). NTG serves as the **code intelligence, planning, verification, eligibility, quota intelligence, circuit state, and telemetry layer** with zero duplicate routing loops.
 
 ---
 
 ## Key Features
 
-1. **Single Routing Authority & Persistent Router**: LiteLLM owns deployment selection, distributed load balancing, and failover across requests using a long-lived Router lifecycle. NTG enforces eligibility and tracks observability without competing routing engines or per-request instantiations.
-2. **Real Global `auto` Routing**: Requesting `auto` or `ntg-auto` balances across **all** healthy deployments from all configured providers, not merely a single provider alias.
-3. **Capability-Aware Routing**: Deployments declare normalized capabilities:
-   - `coding`: High-capability coding models.
-   - `reasoning`: Deep reasoning/thinking models (e.g., Nemotron, R1).
-   - `vision`: Multimodal image processing models.
-   - `tool_calling`: Function calling / tool execution support.
-   - `structured_output`: JSON Schema / structured output support.
-   - `streaming`: Server-sent event token streaming.
-   - `context_window`: Verified token capacity (unverified fallbacks default conservatively to 4,096 tokens).
+### Architecture-Aware Coding Agent (`ntg/agent.py`, `ntg/code_intelligence.py`, `ntg/planner.py`, `ntg/verifier.py`)
+1. **Dual Knowledge-Graph Intelligence (`CodeIntelligence`)**:
+   - **Graphify (`graphify`)**: Queries community-clustered architecture graphs (`graphify query`), node explanations (`graphify explain`), shortest dependency paths (`graphify path`), and incremental code-graph updates (`graphify update .`).
+   - **Codebase Memory MCP (`codebase-memory-mcp`)**: Queries indexed AST/call-graph symbols (`search_graph`), architectural overviews (`get_architecture`), call paths (`trace_path`), change impact (`detect_changes`), and code snippets (`get_code_snippet`).
+2. **Human-in-the-Loop Change Planning (`planner`)**:
+   - Combines Graphify and Codebase Memory context into structured planning prompts.
+   - Generates reviewable plans in `awaiting_review` status (`approved=False`).
+   - Enforces explicit approval (`approve_plan` / `require_approved_plan`) before any file writes can occur.
+3. **Safe Execution & Verification (`CodeVerifier`)**:
+   - Enforces strict repository-root path containment (blocks `..` path traversal and `.git` tampering).
+   - Validates Python files via `ast.parse` and `py_compile`.
+   - Executes verification commands with `shell=False` and rejects direct shell binaries.
+4. **Automatic Knowledge Synchronization**:
+   - Automatically refreshes both `graphify-out/graph.json` and the Codebase Memory MCP index after verified changes so codebase knowledge never drifts.
+
+### Multi-Provider Smart Router (`ntg/router.py`)
+1. **Single Routing Authority & Persistent Router**: LiteLLM owns deployment selection, distributed load balancing, and failover across requests using a long-lived Router lifecycle.
+2. **Real Global `auto` Routing**: Requesting `auto` or `ntg-auto` balances across **all** healthy deployments from all configured providers.
+3. **Capability-Aware Routing**: Deployments declare normalized capabilities (`coding`, `reasoning`, `vision`, `tool_calling`, `structured_output`, `streaming`, `context_window`).
 4. **Resilient Circuit Breaker**:
    - `HEALTHY`: Serving traffic normally.
    - `OPEN`: Paused after failure or rate limits (authoritative `Retry-After` / reset duration).
-   - `HALF_OPEN`: Controlled single-request probing (atomic token admission) before returning to `HEALTHY`.
-   - `AUTH_FAILED / QUARANTINED`: Suspended on authentication failure (401/403) or missing model (404) errors with backoff revalidation.
+   - `HALF_OPEN`: Controlled single-request probing (atomic reservation) before returning to `HEALTHY`.
+   - `AUTH_FAILED`: Suspended on authentication failure (401/403) or missing model (404) errors.
 5. **Accurate Quota & Error Handling**:
-   - Parses HTTP `Retry-After` (seconds and RFC 2822 dates) and `X-RateLimit-*` headers.
-   - Distinguishes RPM, RPD (daily free tier resets at 00:00 UTC), and upstream limits.
-   - Distinguishes model-not-found (404 missing model) from general 404s.
-   - Propagates account-level limits to peer deployments sharing the same provider account.
-   - Client request errors (400) and capability mismatches never trip the circuit breaker.
-6. **Thread-Safe Concurrency & Telemetry**: Zero shared mutable request state. Uses response-level deployment metadata and LiteLLM attempt callbacks to track user requests and upstream attempts with exact evidence-based attribution and zero double-counting.
-7. **Local State Persistence**: Circuit breaker status, cooldown expirations, quota metadata, and discovery caches are atomically persisted to `.ntg/state.json` across process restarts without external database dependencies. StateManager strictly persists and restores without mutating live deployment objects. API keys and secrets are NEVER persisted.
-8. **Dynamic Discovery with Resilient Caching**: Groq and Gemini models are discovered dynamically; discovery failures preserve last-known-good cached models as stale rather than dropping deployments.
-9. **Zero Secret Exposure**: API keys are never printed, logged, persisted, or exposed in diagnostics.
+   - Parses HTTP `Retry-After` and `X-RateLimit-*` headers.
+   - Distinguishes RPM, RPD, and account-wide vs. deployment-scoped limits.
+6. **Thread-Safe Concurrency & Exact-Once Telemetry**: Zero shared mutable request state; attributes every attempt to the actual deployment via LiteLLM callback metadata.
+7. **Local State Persistence**: Circuit breaker status, cooldown expirations, quota metadata, and discovery caches are atomically persisted to `.ntg/state.json`. API keys are never persisted or logged.
 
 ---
 
@@ -65,6 +87,10 @@ LiteLLM is the **sole routing authority** (load balancing, retries, and failover
 ```bash
 pip install -r requirements.txt
 ```
+
+Ensure the code intelligence CLI tools are available on your `PATH` for full graph capabilities:
+- **Graphify**: `pip install graphifyy` (`graphify --help`)
+- **Codebase Memory MCP**: `codebase-memory-mcp --version`
 
 ---
 
@@ -92,7 +118,7 @@ Gemini_API_KEY_1=...
 
 ---
 
-## Usage
+## CLI Usage
 
 ### Interactive CLI
 
@@ -100,7 +126,20 @@ Gemini_API_KEY_1=...
 python main.py
 ```
 
-### CLI with Model & Capability Flags
+### Architecture-Aware Coding Agent CLI Flags
+
+```bash
+# Generate an architecture-aware change plan using Graphify + Codebase Memory MCP
+python main.py --plan "Add retry budget telemetry to UnifiedNTGRouter"
+
+# Verify Python syntax (AST + bytecode compilation) across the repository
+python main.py --verify
+
+# Rebuild/synchronize Graphify knowledge graph and Codebase Memory MCP index
+python main.py --refresh-knowledge
+```
+
+### Smart Router CLI Flags
 
 ```bash
 # Global auto load-balanced routing
@@ -120,11 +159,70 @@ python main.py --capability reasoning "Solve this logic puzzle step by step"
 # View deployment health & circuit states
 python main.py --status
 
+# Force live model rediscovery across provider accounts
+python main.py --rediscover
+
 # Reset persisted circuit breaker & metrics
 python main.py --reset-state
 ```
 
-### Programmatic Python API
+---
+
+## Programmatic Python API
+
+### 1. Architecture-Aware Coding Agent (`ArchitectureAwareAgent`)
+
+```python
+from ntg import ArchitectureAwareAgent
+
+agent = ArchitectureAwareAgent(repo_root=".")
+
+# 1. Gather context from Graphify + Codebase Memory MCP and create a reviewable plan
+plan = agent.create_plan(
+    request="Add helper method to inspect active circuit breakers",
+    symbol_pattern="UnifiedNTGRouter",
+    auto_build_graph=True,
+)
+print(plan["plan"])  # Status: "awaiting_review", approved: False
+
+# 2. Explicitly approve the plan after human review
+agent.approve(plan)
+
+# 3. Execute approved changes, run verification, and auto-sync Graphify + Codebase Memory MCP
+result = agent.execute_plan(
+    plan,
+    file_changes={
+        # "ntg/example.py": "...",
+    },
+    verification_commands=[
+        ["python", "main.py", "--verify"],
+    ],
+    refresh_knowledge=True,
+)
+print("Verified:", result["passed"], "Knowledge synced:", plan.get("knowledge_synced"))
+```
+
+### 2. Direct Code Intelligence (`CodeIntelligence`)
+
+```python
+from ntg import CodeIntelligence
+
+intel = CodeIntelligence(".")
+
+# Query Graphify knowledge graph
+print(intel.graphify_query("How does UnifiedNTGRouter handle failovers?"))
+print(intel.graphify_explain("UnifiedNTGRouter"))
+
+# Query Codebase Memory MCP symbol graph
+project = intel.resolve_memory_project()
+print(intel.memory_query(project, "UnifiedNTGRouter"))
+print(intel.memory_architecture(project))
+
+# Synchronize both knowledge stores after edits
+intel.refresh_knowledge()
+```
+
+### 3. Multi-Provider Smart Router (`UnifiedNTGRouter`)
 
 ```python
 from ntg import UnifiedNTGRouter, ModelCapabilities
@@ -150,3 +248,4 @@ response = router.completion(
     capabilities={"coding": True},
 )
 ```
+

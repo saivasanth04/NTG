@@ -11,11 +11,18 @@ if hasattr(sys.stdout, "reconfigure"):
     except Exception:
         pass
 
-from ntg import UnifiedNTGRouter, print_account_status, print_banner
+from ntg import (
+    ArchitectureAwareAgent,
+    CodeIntelligence,
+    CodeVerifier,
+    UnifiedNTGRouter,
+    print_account_status,
+    print_banner,
+)
 
 
 def main() -> None:
-    """Run interactive or argument-based multi-provider router CLI."""
+    """Run interactive or argument-based multi-provider router and coding agent CLI."""
     args = sys.argv[1:]
 
     # Check for reset-state flag
@@ -35,6 +42,9 @@ def main() -> None:
         print("Options:")
         print("  --model <name>          Route to specific model group (auto, groq, openrouter, gemini, etc.)")
         print("  --capability <caps>     Filter by comma-separated capabilities (coding, vision, reasoning, etc.)")
+        print("  --plan                  Generate an architecture-aware change plan using Graphify + Codebase Memory")
+        print("  --verify                Verify Python syntax across the repository")
+        print("  --refresh-knowledge     Update Graphify knowledge graph and Codebase Memory MCP index")
         print("  --status                Display detailed status table of all deployments and quotas")
         print("  --rediscover            Force authoritative discovery of models across provider accounts")
         print("  --reset-state           Reset persisted routing state, circuit breakers, and metrics")
@@ -57,6 +67,33 @@ def main() -> None:
         for k, v in res.get("failed", {}).items():
             print(f"  ! {k}: {v}")
         return
+
+    # Check for refresh-knowledge flag
+    if "--refresh-knowledge" in args:
+        print("Refreshing Graphify knowledge graph and Codebase Memory MCP index...")
+        intel = CodeIntelligence(".")
+        sync_res = intel.refresh_knowledge()
+        print(f"Knowledge sync complete (synced={sync_res.get('synced')}):")
+        print(f"  Graphify: {sync_res.get('graphify')}")
+        print(f"  Codebase Memory: {sync_res.get('memory')}")
+        return
+
+    # Check for verify flag
+    if "--verify" in args:
+        verifier = CodeVerifier(".")
+        res = verifier.verify_syntax()
+        print(
+            f"Syntax verification {'PASSED' if res['passed'] else 'FAILED'} "
+            f"({len(res['checked_files'])} files checked)."
+        )
+        for err in res.get("errors", []):
+            print(f"  ! {err['file']}: {err['error']}")
+        return
+
+    plan_mode = False
+    if "--plan" in args:
+        plan_mode = True
+        args = [a for a in args if a != "--plan"]
 
     selected_model = None
     if "--model" in args:
@@ -91,6 +128,19 @@ def main() -> None:
 
     if not prompt:
         print("No prompt supplied.")
+        return
+
+    if plan_mode:
+        agent = ArchitectureAwareAgent(repo_root=".", router=router)
+        plan = agent.create_plan(
+            request=prompt,
+            model=selected_model,
+            capabilities=selected_capability,
+            auto_build_graph=True,
+        )
+        print("\n=== Architecture-Aware Change Plan ===")
+        print(f"Status: {plan['status']} (approved={plan['approved']})\n")
+        print(plan["plan"])
         return
 
     router.ask(prompt, model=selected_model, capabilities=selected_capability)
