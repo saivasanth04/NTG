@@ -401,10 +401,15 @@ class StateManager:
             if dep_id not in self.state_data["deployments"]:
                 self.state_data["deployments"][dep_id] = {}
             self.state_data["deployments"][dep_id]["circuit_state"] = state.value
-            if reason:
-                self.state_data["deployments"][dep_id]["state_reason"] = reason
-            if recovery_time > 0:
-                self.state_data["deployments"][dep_id]["circuit_open_until"] = recovery_time
+            if state == CircuitState.HEALTHY:
+                self.state_data["deployments"][dep_id]["circuit_open_until"] = 0.0
+                self.state_data["deployments"][dep_id].pop("reset_at", None)
+                self.state_data["deployments"][dep_id]["state_reason"] = reason or "Healthy"
+            else:
+                if reason:
+                    self.state_data["deployments"][dep_id]["state_reason"] = reason
+                if recovery_time > 0:
+                    self.state_data["deployments"][dep_id]["circuit_open_until"] = recovery_time
             self.state_data["deployments"][dep_id]["state_updated_at"] = time.time()
             self.save()
 
@@ -543,7 +548,11 @@ class StateManager:
             dep_id = getattr(dep_or_id, "id", str(dep_or_id))
             deps = self.state_data.get("deployments", {})
             if dep_id in deps:
-                deps.pop(dep_id, None)
+                deps[dep_id]["circuit_state"] = CircuitState.HEALTHY.value
+                deps[dep_id]["circuit_open_until"] = 0.0
+                deps[dep_id].pop("reset_at", None)
+                deps[dep_id]["state_reason"] = "Recovered to HEALTHY"
+                deps[dep_id]["state_updated_at"] = time.time()
                 self.save()
 
     def apply_to_deployment(self, deployment: Any) -> None:
@@ -553,12 +562,22 @@ class StateManager:
             if deployment.id in self.state_data.get("quota", {}):
                 deployment.quota = self.get_quota(deployment.id)
 
+            # Restore metrics if deployment has zero counters
+            if hasattr(deployment, "metrics") and deployment.id in self.state_data.get("metrics", {}):
+                if deployment.metrics.user_requests == 0 and deployment.metrics.upstream_attempts == 0:
+                    deployment.metrics = self.get_metrics(deployment.id)
+
             deps = self.state_data.get("deployments", {})
             saved = deps.get(deployment.id)
             if not saved:
                 return
 
             now = time.time()
+            saved_updated_at = saved.get("state_updated_at", 0.0)
+            if getattr(deployment, "state_updated_at", 0.0) > saved_updated_at and saved_updated_at > 0:
+                # Live state is newer than persisted state: do not overwrite newer live state
+                return
+
             circuit_str = saved.get("circuit_state", CircuitState.HEALTHY.value)
             reset_at = saved.get("reset_at", 0.0)
             open_until = saved.get("circuit_open_until", 0.0) or reset_at
@@ -570,7 +589,26 @@ class StateManager:
                 except ValueError:
                     deployment.circuit_state = CircuitState.AUTH_FAILED
                 deployment.state_reason = saved.get("state_reason", "Quarantined due to authentication error")
-                deployment.state_updated_at = saved.get("state_updated_at", now)
+                deployment.state_updated_at = saved_updated_at or now
+                return
+
+            # Handle circuit HEALTHY
+            if circuit_str == CircuitState.HEALTHY.value:
+                deployment.circuit_state = CircuitState.HEALTHY
+                deployment.circuit_open_until = 0.0
+                deployment.state_reason = saved.get("state_reason", "Healthy")
+                deployment.state_updated_at = saved_updated_at or now
+                return
+
+            # Handle circuit HALF_OPEN
+            if circuit_str == CircuitState.HALF_OPEN.value:
+                deployment.circuit_state = CircuitState.HALF_OPEN
+                deployment.circuit_open_until = 0.0
+                deployment.state_reason = saved.get("state_reason", "Ready for probe")
+                deployment.state_updated_at = saved_updated_at or now
+                deployment.half_open_probes = 0
+                if hasattr(deployment, "_active_probe_request_ids"):
+                    deployment._active_probe_request_ids.clear()
                 return
 
             # Handle circuit OPEN (server breaker or quota cooldown)
@@ -581,7 +619,7 @@ class StateManager:
                     if reset_at > 0:
                         deployment.quota.reset_at = reset_at
                     deployment.state_reason = saved.get("state_reason", "Circuit breaker OPEN / cooldown active")
-                    deployment.state_updated_at = saved.get("state_updated_at", now)
+                    deployment.state_updated_at = saved_updated_at or now
                 else:
                     # Transition to HALF_OPEN for controlled probing (Rule 3)
                     deployment.circuit_state = CircuitState.HALF_OPEN
@@ -589,6 +627,8 @@ class StateManager:
                     deployment.state_reason = "Recovery condition reached; entering HALF_OPEN for controlled probe"
                     deployment.state_updated_at = now
                     deployment.half_open_probes = 0
+                    if hasattr(deployment, "_active_probe_request_ids"):
+                        deployment._active_probe_request_ids.clear()
 
     def reset_all(self) -> None:
         """Reset all persisted state."""

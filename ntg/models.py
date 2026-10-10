@@ -6,7 +6,7 @@ from email.utils import parsedate_to_datetime
 import re
 import threading
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from ntg.config import (
     CIRCUIT_BREAKER_HALF_OPEN_PROBES,
@@ -550,8 +550,23 @@ class Deployment:
     is_stale: bool = False
     stale_reason: Optional[str] = None
     last_discovered_at: float = 0.0
-    _active_probe_request_id: Optional[str] = field(default=None, repr=False, compare=False)
+    _active_probe_request_ids: Set[str] = field(default_factory=set, repr=False, compare=False)
     _state_lock: threading.RLock = field(default_factory=threading.RLock, repr=False, compare=False)
+
+    @property
+    def _active_probe_request_id(self) -> Optional[str]:
+        """Backwards-compatibility property returning active probe request ID."""
+        with self._state_lock:
+            return next(iter(self._active_probe_request_ids)) if self._active_probe_request_ids else None
+
+    @_active_probe_request_id.setter
+    def _active_probe_request_id(self, val: Optional[str]) -> None:
+        with self._state_lock:
+            if val is None:
+                self._active_probe_request_ids.clear()
+            else:
+                self._active_probe_request_ids = {val}
+            self.half_open_probes = len(self._active_probe_request_ids)
 
     @property
     def is_quarantined(self) -> bool:
@@ -755,10 +770,10 @@ class Deployment:
         # If circuit breaker is OPEN, deployment is excluded (Rule 2)
         if self.circuit_state == CircuitState.OPEN:
             return False
-        # If circuit is HALF_OPEN, allow exactly one controlled probe (Rule 3)
+        # If circuit is HALF_OPEN, allow controlled probes up to max_half_open_probes (Rule 3)
         if self.circuit_state == CircuitState.HALF_OPEN:
             with self._state_lock:
-                if self.half_open_probes >= self.max_half_open_probes:
+                if len(self._active_probe_request_ids) >= self.max_half_open_probes:
                     return False
             return True
         return True
@@ -768,30 +783,30 @@ class Deployment:
         return self.is_eligible(now)
 
     def claim_half_open_probe(self, request_id: Optional[str] = None) -> bool:
-        """Atomically claim the single allowed controlled probe in HALF_OPEN state (Rule 3, 11).
+        """Atomically claim a controlled probe slot in HALF_OPEN state (Rule 3, 11).
 
-        Returns True if the probe was successfully claimed, False if not in HALF_OPEN or probe already claimed.
+        Returns True if the probe was successfully claimed or already claimed by this request_id,
+        False if not in HALF_OPEN or probe capacity is exhausted.
         """
         with self._state_lock:
             if self.circuit_state != CircuitState.HALF_OPEN:
                 return False
-            if request_id is not None and self._active_probe_request_id == request_id:
+            req_key = request_id or "__anonymous__"
+            if req_key in self._active_probe_request_ids:
                 return True
-            if self.half_open_probes >= self.max_half_open_probes or self._active_probe_request_id is not None:
+            if len(self._active_probe_request_ids) >= self.max_half_open_probes:
                 return False
-            self.half_open_probes += 1
-            self._active_probe_request_id = request_id
+            self._active_probe_request_ids.add(req_key)
+            self.half_open_probes = len(self._active_probe_request_ids)
             return True
 
     def release_half_open_probe(self, request_id: Optional[str] = None) -> None:
         """Release a claimed probe slot if the probe request was not dispatched."""
         with self._state_lock:
-            if self._active_probe_request_id is not None:
-                if request_id is None or self._active_probe_request_id != request_id:
-                    return
-            if self.half_open_probes > 0:
-                self.half_open_probes -= 1
-            self._active_probe_request_id = None
+            req_key = request_id or "__anonymous__"
+            if req_key in self._active_probe_request_ids:
+                self._active_probe_request_ids.remove(req_key)
+            self.half_open_probes = len(self._active_probe_request_ids)
 
     def admit_to_request_pool(self, now: Optional[float] = None, request_id: Optional[str] = None) -> bool:
         """Atomically admit deployment into an active request pool (Task 11 / Final Correctness).
@@ -811,13 +826,7 @@ class Deployment:
             if self.circuit_state == CircuitState.OPEN:
                 return False
             if self.circuit_state == CircuitState.HALF_OPEN:
-                if request_id is not None and self._active_probe_request_id == request_id:
-                    return True
-                if self.half_open_probes >= self.max_half_open_probes or self._active_probe_request_id is not None:
-                    return False
-                self.half_open_probes += 1
-                self._active_probe_request_id = request_id
-                return True
+                return self.claim_half_open_probe(request_id=request_id)
             return True
 
     def record_failure(
@@ -837,16 +846,16 @@ class Deployment:
             if self.circuit_state == CircuitState.HALF_OPEN:
                 # Failed probe in HALF_OPEN: immediately return to OPEN with backoff recovery time (Rule 5)
                 self.circuit_state = CircuitState.OPEN
+                self._active_probe_request_ids.clear()
                 self.half_open_probes = 0
-                self._active_probe_request_id = None
                 backoff_cooldown = cooldown * 2.0
                 self.circuit_open_until = now + backoff_cooldown
                 self.state_reason = f"Probe request failed while in HALF_OPEN; circuit OPEN until {utc_string(self.circuit_open_until)}"
             elif self.consecutive_failures >= threshold:
                 # Reached consecutive failure threshold: trip circuit to OPEN (Rule 2)
                 self.circuit_state = CircuitState.OPEN
+                self._active_probe_request_ids.clear()
                 self.half_open_probes = 0
-                self._active_probe_request_id = None
                 self.circuit_open_until = now + cooldown
                 self.state_reason = f"Consecutive failure threshold reached ({self.consecutive_failures}); circuit OPEN until {utc_string(self.circuit_open_until)}"
 
@@ -855,8 +864,8 @@ class Deployment:
         with self._state_lock:
             self.consecutive_failures = 0
             self.circuit_open_until = 0.0
+            self._active_probe_request_ids.clear()
             self.half_open_probes = 0
-            self._active_probe_request_id = None
             now = time.time()
             self.state_updated_at = now
             if self.circuit_state in (CircuitState.HALF_OPEN, CircuitState.AUTH_FAILED, CircuitState.OPEN):
@@ -888,8 +897,8 @@ class Deployment:
 
                 if server_recovered or quota_recovered or fallback_recovered:
                     self.circuit_state = CircuitState.HALF_OPEN
+                    self._active_probe_request_ids.clear()
                     self.half_open_probes = 0
-                    self._active_probe_request_id = None
                     self.state_reason = "Recovery condition reached; entering HALF_OPEN for controlled probe"
                     self.state_updated_at = current_time
 
