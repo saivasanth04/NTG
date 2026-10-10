@@ -182,6 +182,7 @@ def _evaluate_source_verification(context: dict[str, Any] | None) -> dict[str, A
 def _append_context_sections(
     sections: list[str],
     context: dict[str, Any] | None,
+    include_execution_flows: bool = False,
 ) -> None:
     """Append repository identity, inventory, reading order, Graphify, Codebase Memory, and diagnostics."""
     if not context:
@@ -242,6 +243,47 @@ def _append_context_sections(
         ro_text = json.dumps(context["reading_order"], indent=2)
         sections.append(f"## Dependency-Aware Reading Order\n{ro_text}")
 
+    if include_execution_flows and (
+        not isinstance(formatted_inv, str)
+        or "Verified Runtime Execution Flows" not in formatted_inv
+    ):
+        inv_dict = (
+            context.get("repository_inventory")
+            if isinstance(context.get("repository_inventory"), dict)
+            else {}
+        )
+        exec_flows = (
+            context.get("execution_flows")
+            or inv_dict.get("execution_flows")
+            or []
+        )
+        if isinstance(exec_flows, list) and exec_flows:
+            flow_lines: list[str] = []
+            for flow in exec_flows:
+                if not isinstance(flow, dict):
+                    continue
+                ep = flow.get("entry_point")
+                ecalls = flow.get("entry_calls") or []
+                ecall_str = f" (entry calls: `{', '.join(ecalls)}`)" if ecalls else ""
+                hop_strs = [
+                    f"`{h['from']}` -> `{h['to']}`"
+                    + (
+                        f" [{', '.join(h['invoked_symbols'][:4])}]"
+                        if h.get("invoked_symbols")
+                        else ""
+                    )
+                    for h in (flow.get("hops") or [])[:8]
+                    if isinstance(h, dict)
+                ]
+                flow_lines.append(
+                    f"- **Entry `{ep}`**{ecall_str}: " + " ; ".join(hop_strs)
+                )
+            if flow_lines:
+                sections.append(
+                    "### Verified Runtime Execution Flows (AST Call-Graph Traces)\n"
+                    + "\n".join(flow_lines)
+                )
+
     graph_report = context.get("graphify_report")
     if isinstance(graph_report, str) and graph_report.strip():
         sections.append(
@@ -273,6 +315,24 @@ def _append_context_sections(
             else str(symbols_ctx)
         )
         sections.append(f"## Matching Codebase Symbols\n{formatted_symbols}")
+
+    scoped_excerpts = context.get("scoped_source_excerpts")
+    if isinstance(scoped_excerpts, dict) and scoped_excerpts:
+        excerpt_blocks = [
+            f"### `{rel_p}`\n```python\n{snippet.strip()}\n```"
+            for rel_p, snippet in scoped_excerpts.items()
+            if isinstance(snippet, str) and snippet.strip()
+        ]
+        if excerpt_blocks:
+            sections.append(
+                "## Scoped Source Code Excerpts (Direct Source Inspection)\n"
+                + "\n\n".join(excerpt_blocks)
+            )
+    elif isinstance(scoped_excerpts, str) and scoped_excerpts.strip():
+        sections.append(
+            "## Scoped Source Code Excerpts (Direct Source Inspection)\n"
+            + scoped_excerpts.strip()
+        )
 
 
 def build_planning_prompt(
@@ -787,6 +847,20 @@ def analyze_query_requirements(
     ):
         requested_deliverables.append("dependency_relationships")
 
+    if any(
+        k in q_lower
+        for k in (
+            "execution flow",
+            "call graph",
+            "call chain",
+            "runtime flow",
+            "trace execution",
+            "how does execution flow",
+            "execution path",
+        )
+    ):
+        requested_deliverables.append("execution_flow")
+
     if is_repo_wide or any(
         k in q_lower
         for k in ("excluded", "ignored", ".gitignore", ".env", "coverage", "limitation")
@@ -805,6 +879,16 @@ def analyze_query_requirements(
         "requested_deliverables": requested_deliverables,
         "layers": layers,
         "cross_package_dependencies": cross_package_deps,
+        "execution_flows": (
+            inv.get("execution_flows")
+            if isinstance(inv.get("execution_flows"), list)
+            else []
+        ),
+        "call_graph_edges": (
+            inv.get("call_graph_edges")
+            if isinstance(inv.get("call_graph_edges"), list)
+            else []
+        ),
         "excluded_dirs": [
             str(d.get("path"))
             for d in excluded_dirs
@@ -849,15 +933,13 @@ def build_query_prompt(
         layer_summaries: list[str] = []
         for l_info in layers:
             l_files = l_info.get("files") or []
-            sample_str = ", ".join(f"`{p}`" for p in l_files[:6])
-            if len(l_files) > 6:
-                sample_str += f", ... ({len(l_files)} files)"
+            files_str = ", ".join(f"`{p}`" for p in l_files)
             layer_summaries.append(
-                f"{l_info['layer']} (steps {l_info['start_step']}–{l_info['end_step']}: {sample_str})"
+                f"{l_info['layer']} (steps {l_info['start_step']}–{l_info['end_step']}: {files_str})"
             )
         layers_joined = "; ".join(layer_summaries) if layer_summaries else f"{total_target} repository files"
         rules.append(
-            f"3. Cover every single file in the Verified Repository File Inventory ({total_target} files total) across all dynamically discovered architectural layers: {layers_joined}."
+            f"3. Cover every single file in the Verified Repository File Inventory ({total_target} files total) across all dynamically discovered architectural layers without omitting or grouping any files: {layers_joined}."
         )
     elif total_target > 0:
         targets_str = ", ".join(f"`{p}`" for p in target_files)
@@ -870,7 +952,7 @@ def build_query_prompt(
         if cross_deps:
             cross_clauses = [
                 f"keep `{cd['dependency']}` (step {cd['dependency_step']}) before `{cd['dependent']}` (step {cd['dependent_step']}) because `{cd['dependent']}` imports `{cd['dependency']}`"
-                for cd in cross_deps[:4]
+                for cd in cross_deps
             ]
             cross_note = f" (in particular, {'; '.join(cross_clauses)})"
         step_range_str = (
@@ -879,7 +961,7 @@ def build_query_prompt(
             else "the dependency-aware reading order"
         )
         rules.append(
-            f"4. Preserve the EXACT numbered dependency-aware reading order ({step_range_str}) from the Verified Repository File Inventory below without reordering any steps{cross_note}. For each file, state its step number, backticked relative path, actual classes/functions/exports, and a concise evidence-grounded description of what the file does."
+            f"4. Preserve the EXACT numbered dependency-aware reading order ({step_range_str}) from the Verified Repository File Inventory below without reordering or grouping any steps{cross_note}. Write each file as its own separate numbered step (`1. \\`path\\`: ...` through `{total_target}. \\`path\\`: ...`) with its backticked relative path, actual classes/functions/exports, and a concise evidence-grounded description of what the file does."
         )
     else:
         deliv_str = ", ".join(deliverables)
@@ -907,7 +989,11 @@ def build_query_prompt(
         f"## User Question\n{query.strip()}",
     ]
 
-    _append_context_sections(sections, context)
+    _append_context_sections(
+        sections,
+        context,
+        include_execution_flows=("execution_flow" in deliverables),
+    )
     return "\n\n".join(sections)
 
 
@@ -938,7 +1024,7 @@ def _build_file_anchor_tokens(
     file_rec: dict[str, Any],
     ro_item: dict[str, Any] | None,
 ) -> set[str]:
-    """Build deterministic set of valid grounding tokens (symbols, dependencies, domain keywords) for a file."""
+    """Build deterministic set of valid grounding tokens (symbols, signatures, calls, raises, dependencies, domain keywords) for a file."""
     path = str(file_rec.get("path") or "")
     anchors: set[str] = set()
 
@@ -953,7 +1039,7 @@ def _build_file_anchor_tokens(
     if parent_name and len(parent_name) >= 3:
         anchors.add(parent_name)
 
-    # AST classes, functions, methods, exports, constants
+    # AST classes, functions, methods, signatures, calls, raises, exports, constants
     for cls in file_rec.get("classes", []):
         if isinstance(cls, dict) and cls.get("name"):
             cname = str(cls["name"]).lower()
@@ -961,6 +1047,20 @@ def _build_file_anchor_tokens(
             for m in cls.get("methods", []):
                 if isinstance(m, str) and len(m) >= 3 and not m.startswith("__"):
                     anchors.add(m.lower())
+            for md in cls.get("method_details", []) or []:
+                if isinstance(md, dict):
+                    if md.get("docstring"):
+                        for tok in re.findall(
+                            r"[a-z0-9_]{4,}", str(md["docstring"]).lower()
+                        ):
+                            if tok not in _STOP_WORDS:
+                                anchors.add(tok)
+                    for call_sym in md.get("calls", []) or []:
+                        if isinstance(call_sym, str) and len(call_sym) >= 3:
+                            anchors.add(call_sym.lower())
+                    for exc_sym in md.get("raises", []) or []:
+                        if isinstance(exc_sym, str) and len(exc_sym) >= 3:
+                            anchors.add(exc_sym.lower())
             if cls.get("docstring"):
                 for tok in re.findall(r"[a-z0-9_]{4,}", str(cls["docstring"]).lower()):
                     if tok not in _STOP_WORDS:
@@ -973,10 +1073,27 @@ def _build_file_anchor_tokens(
             for part in fname.split("_"):
                 if len(part) >= 4 and part not in _STOP_WORDS:
                     anchors.add(part)
+            for p_name in fn.get("params", []) or []:
+                if isinstance(p_name, str) and len(p_name) >= 4 and p_name not in _STOP_WORDS:
+                    anchors.add(p_name.lower())
+            for call_sym in fn.get("calls", []) or []:
+                if isinstance(call_sym, str) and len(call_sym) >= 3:
+                    anchors.add(call_sym.lower())
+            for exc_sym in fn.get("raises", []) or []:
+                if isinstance(exc_sym, str) and len(exc_sym) >= 3:
+                    anchors.add(exc_sym.lower())
             if fn.get("docstring"):
                 for tok in re.findall(r"[a-z0-9_]{4,}", str(fn["docstring"]).lower()):
                     if tok not in _STOP_WORDS:
                         anchors.add(tok)
+
+    for call_sym in file_rec.get("all_calls", []) or []:
+        if isinstance(call_sym, str) and len(call_sym) >= 3:
+            anchors.add(call_sym.lower())
+
+    for exc_sym in file_rec.get("raises", []) or []:
+        if isinstance(exc_sym, str) and len(exc_sym) >= 3:
+            anchors.add(exc_sym.lower())
 
     for exp in file_rec.get("exports", []):
         if isinstance(exp, str) and len(exp) >= 3:
@@ -1088,11 +1205,19 @@ def _extract_file_entry_lines(
         for p in sorted_paths_by_len
     )
 
-    # Numbered step line (e.g., "1. `path`: ...", "### 34. **`path`**", "- **Step 34: `path`**")
+    # Numbered step line (e.g., "1. `path`: ...", "**1.** `path`", "### 34. **`path`**", "- **Step 34**: `path`")
     numbered_step_re = re.compile(
-        r"^\s*(?:#{1,6}\s*)?(?:[-*+•]\s*)?(?:\*\*|\*|_|\s)*(?:Step\s+)?(\d+)\s*[:.)–—-]\s*(?:\*\*|`|\*|_|\s)*("
+        r"^\s*(?:#{1,6}\s*)?(?:[-*+•]\s*)?(?:\*\*|\*|_|\s)*(?:Step\s+)?(\d+)(?:\*\*|\*|_|\s)*[:.)–—-](?:\*\*|\*|_|\s|\[|`)*("
         + escaped_alts
         + r")(?![A-Za-z0-9_./\\-])",
+        re.IGNORECASE,
+    )
+
+    # Supplemented inventory line (e.g., "- **`path`** (*Layer*, step 18): ...")
+    supplement_step_re = re.compile(
+        r"^\s*[-*+•]\s*\*\*`("
+        + escaped_alts
+        + r")`\*\*\s*\([^)]*?\bstep\s+(\d+)\)",
         re.IGNORECASE,
     )
 
@@ -1104,16 +1229,29 @@ def _extract_file_entry_lines(
     )
 
     numbered_idx_by_path: dict[str, int] = {}
+    numbered_step_by_path: dict[str, int] = {}
+    supplement_step_by_path: dict[str, int] = {}
     bullet_idx_by_path: dict[str, int] = {}
     all_subject_indices: set[int] = set()
 
     for idx, line in enumerate(lines):
+        m_supp = supplement_step_re.search(line)
+        if m_supp:
+            norm_p = m_supp.group(1).replace("\\", "/")
+            step_n = int(m_supp.group(2))
+            all_subject_indices.add(idx)
+            numbered_idx_by_path[norm_p] = idx
+            supplement_step_by_path[norm_p] = step_n
+            continue
+
         m_num = numbered_step_re.search(line)
         if m_num:
+            step_n = int(m_num.group(1))
             norm_p = m_num.group(2).replace("\\", "/")
             all_subject_indices.add(idx)
             if norm_p not in numbered_idx_by_path:
                 numbered_idx_by_path[norm_p] = idx
+                numbered_step_by_path[norm_p] = step_n
             continue
 
         m_bul = bullet_item_re.search(line)
@@ -1135,10 +1273,33 @@ def _extract_file_entry_lines(
         elif path in bullet_idx_by_path:
             chosen_idx_by_path[path] = bullet_idx_by_path[path]
 
-    structured_order = [
+    # Preserve observed line order for the main answer, while inserting any deterministic
+    # supplement entries at their canonical step position relative to numbered steps.
+    main_ordered = [
         p
-        for p, _ in sorted(chosen_idx_by_path.items(), key=lambda kv: kv[1])
+        for p, _ in sorted(
+            (
+                (p, i)
+                for p, i in chosen_idx_by_path.items()
+                if p not in supplement_step_by_path
+            ),
+            key=lambda kv: kv[1],
+        )
     ]
+    if supplement_step_by_path and numbered_step_by_path:
+        combined_with_keys: list[tuple[float, int, str]] = []
+        for rank_idx, p in enumerate(main_ordered):
+            s_num = float(numbered_step_by_path.get(p, rank_idx + 1))
+            combined_with_keys.append((s_num, chosen_idx_by_path[p], p))
+        for p, s_num in supplement_step_by_path.items():
+            combined_with_keys.append((float(s_num) - 0.1, chosen_idx_by_path[p], p))
+        combined_with_keys.sort(key=lambda item: (item[0], item[1]))
+        structured_order = [p for _, _, p in combined_with_keys]
+    else:
+        structured_order = [
+            p
+            for p, _ in sorted(chosen_idx_by_path.items(), key=lambda kv: kv[1])
+        ]
 
     primary_line_by_path: dict[str, str] = {}
     desc_window_by_path: dict[str, list[str]] = {}
@@ -1266,6 +1427,10 @@ def _validate_file_descriptions(
     )
     dep_claim_re = re.compile(
         r"(?:Imports\s+from\s+repo|Internal\s+dependencies|Depends\s+on)\s*\*?\*?\s*:\s*([^\n|]+)",
+        re.IGNORECASE,
+    )
+    call_claim_re = re.compile(
+        r"\b(?:calls|invokes)\s+(?:the\s+)?(?:function\s+|method\s+|class\s+)?`([A-Za-z_][A-Za-z0-9_]*)`",
         re.IGNORECASE,
     )
 
@@ -1446,10 +1611,11 @@ def _validate_file_descriptions(
                     }
                 )
 
-        # 4. Contradicted internal dependency claim check
+        # 4. Contradicted internal dependency & runtime call claim checks
         if rec.get("type") == "python":
             actual_deps = set(rec.get("internal_dependencies") or [])
             actual_importers = set(rec.get("imported_by") or [])
+            actual_calls = set(rec.get("all_calls") or [])
             for m_dep in dep_claim_re.finditer(window_text):
                 dep_clause_text = m_dep.group(1)
                 for other_p in files_by_path:
@@ -1471,6 +1637,47 @@ def _validate_file_descriptions(
                                     ),
                                 }
                             )
+
+            for m_call in call_claim_re.finditer(own_clause):
+                called_sym = m_call.group(1)
+                if (
+                    called_sym in _PYTHON_BUILTIN_IDENTIFIERS
+                    or called_sym in actual_calls
+                    or called_sym in file_own_symbols
+                    or path in symbol_related_files.get(called_sym, set())
+                ):
+                    continue
+                if called_sym in symbol_definers:
+                    actual_owners = sorted(symbol_definers[called_sym])
+                    unsupported_claims.append(
+                        {
+                            "file": path,
+                            "symbol": called_sym,
+                            "actual_defined_in": actual_owners,
+                            "reason": (
+                                f"Description for '{path}' claims runtime call to '{called_sym}', "
+                                f"which is defined in {', '.join(actual_owners)} and neither imported nor called in '{path}' AST"
+                            ),
+                        }
+                    )
+                elif (
+                    called_sym not in all_repo_valid_identifiers
+                    and (
+                        "_" in called_sym
+                        or bool(re.match(r"^[A-Z][a-z0-9]+[A-Z]", called_sym))
+                    )
+                ):
+                    unsupported_claims.append(
+                        {
+                            "file": path,
+                            "symbol": called_sym,
+                            "actual_defined_in": [],
+                            "reason": (
+                                f"Description for '{path}' claims runtime call to non-existent symbol '{called_sym}' "
+                                "not found in the verified AST inventory"
+                            ),
+                        }
+                    )
 
     return {
         "checked_files_count": len(covered_files),
@@ -1767,6 +1974,52 @@ def _validate_deliverables(
                     }
                 )
 
+        elif deliv == "execution_flow":
+            exec_flows = req.get("execution_flows") or []
+            call_edges = req.get("call_graph_edges") or []
+            target_set = set(target_files)
+            relevant_edges = [
+                e
+                for e in call_edges
+                if e.get("caller_file") in target_set
+                or e.get("callee_file") in target_set
+            ]
+            has_flow_evidence = True
+            if relevant_edges or exec_flows:
+                has_flow_evidence = any(
+                    (
+                        e.get("caller_file", "") in answer_body
+                        and e.get("callee_file", "") in answer_body
+                    )
+                    or any(
+                        sym in answer_body
+                        for sym in (e.get("invoked_symbols") or [])
+                    )
+                    for e in (relevant_edges or call_edges)
+                )
+            if (
+                order_val["ordering_valid"]
+                and not desc_val["unsupported_claims"]
+                and has_flow_evidence
+            ):
+                satisfied_deliverables.append(deliv)
+            else:
+                reasons = []
+                if not order_val["ordering_valid"]:
+                    reasons.append("dependency ordering violated")
+                if desc_val["unsupported_claims"]:
+                    reasons.append("contradicted call/symbol claim detected")
+                if not has_flow_evidence:
+                    reasons.append(
+                        "answer does not trace verified AST call-graph edges or entry-point execution flow"
+                    )
+                unsatisfied_deliverables.append(
+                    {
+                        "deliverable": deliv,
+                        "reason": "; ".join(reasons) or "execution flow incomplete",
+                    }
+                )
+
         elif deliv == "exclusions_or_limitations":
             has_exclusions_in_repo = bool(
                 req["excluded_dirs"] or req["excluded_files"]
@@ -2011,8 +2264,8 @@ def validate_query_answer(
         )
 
     epistemic_limitations: list[str] = [
-        "Deterministic validation proves repository root identity, SHA-256 file fingerprints, AST symbol/import inventory, file path existence, presence of AST/summary anchors in file descriptions, absence of cross-file symbol misattribution, topological dependency precedence across implementation modules, and coverage of requested deliverables.",
-        "Deterministic validation cannot prove free-form prose nuance beyond AST/docstring/dependency anchors or live external LLM provider runtime behavior.",
+        "Deterministic validation proves repository root identity, SHA-256 file fingerprints, AST symbol/signature/call/exception/import inventory, cross-module AST call-graph edges, entry-point execution flow traces, file path existence, AST/summary grounding in file descriptions, absence of cross-file symbol/call/dependency misattribution, topological dependency precedence across implementation modules, and coverage of requested deliverables.",
+        "Deterministic validation cannot prove unbounded natural-language prose equivalence or dynamic runtime reflection/external I/O behavior beyond static AST, call-graph, and docstring evidence.",
     ]
 
     critical_retrieval_failed = bool(

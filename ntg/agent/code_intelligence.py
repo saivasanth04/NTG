@@ -1661,12 +1661,145 @@ class CodeIntelligence:
 
         return internal, external
 
+    _TRIVIAL_CALL_NAMES: frozenset[str] = frozenset(
+        {
+            "len",
+            "str",
+            "int",
+            "float",
+            "bool",
+            "dict",
+            "list",
+            "set",
+            "frozenset",
+            "tuple",
+            "min",
+            "max",
+            "sum",
+            "any",
+            "all",
+            "sorted",
+            "enumerate",
+            "zip",
+            "range",
+            "isinstance",
+            "issubclass",
+            "getattr",
+            "setattr",
+            "hasattr",
+            "print",
+            "append",
+            "extend",
+            "update",
+            "get",
+            "setdefault",
+            "items",
+            "keys",
+            "values",
+            "strip",
+            "lstrip",
+            "rstrip",
+            "split",
+            "splitlines",
+            "join",
+            "replace",
+            "lower",
+            "upper",
+            "startswith",
+            "endswith",
+            "find",
+            "format",
+            "encode",
+            "decode",
+            "copy",
+            "add",
+            "remove",
+            "pop",
+            "clear",
+            "super",
+        }
+    )
+
+    @staticmethod
+    def _clean_docstring(raw_doc: str, max_chars: int = 320) -> str:
+        """Normalize a single- or multi-line docstring into a concise behavioral summary."""
+        if not raw_doc or not raw_doc.strip():
+            return ""
+        cleaned = " ".join(
+            ln.strip() for ln in raw_doc.strip().splitlines() if ln.strip()
+        )
+        if len(cleaned) <= max_chars:
+            return cleaned
+        return cleaned[: max_chars - 3].rstrip() + "..."
+
+    @staticmethod
+    def _format_function_signature(
+        fn_node: ast.FunctionDef | ast.AsyncFunctionDef,
+    ) -> str:
+        """Format a concise parameter and return-annotation signature for a function or method."""
+        params: list[str] = []
+        for arg in fn_node.args.args:
+            if arg.arg == "self":
+                continue
+            params.append(arg.arg)
+        if fn_node.args.vararg:
+            params.append(f"*{fn_node.args.vararg.arg}")
+        for kwarg in fn_node.args.kwonlyargs:
+            params.append(kwarg.arg)
+        if fn_node.args.kwarg:
+            params.append(f"**{fn_node.args.kwarg.arg}")
+        param_str = ", ".join(params[:6])
+        if len(params) > 6:
+            param_str += ", ..."
+        ret_str = ""
+        if fn_node.returns is not None and hasattr(ast, "unparse"):
+            try:
+                ret_str = f" -> {ast.unparse(fn_node.returns)}"
+            except Exception:
+                ret_str = ""
+        return f"({param_str}){ret_str}"
+
+    def _extract_calls_and_raises(
+        self, scope_node: ast.AST
+    ) -> tuple[list[str], list[str]]:
+        """Extract non-trivial function/method call names and raised exception types within `scope_node`."""
+        calls: list[str] = []
+        raises: list[str] = []
+        for sub in ast.walk(scope_node):
+            if isinstance(sub, ast.Call):
+                cname = ""
+                if isinstance(sub.func, ast.Name):
+                    cname = sub.func.id
+                elif isinstance(sub.func, ast.Attribute):
+                    cname = sub.func.attr
+                if (
+                    cname
+                    and cname not in self._TRIVIAL_CALL_NAMES
+                    and not cname.startswith("__")
+                    and cname not in calls
+                ):
+                    calls.append(cname)
+            elif isinstance(sub, ast.Raise) and sub.exc is not None:
+                rname = ""
+                if isinstance(sub.exc, ast.Call):
+                    if isinstance(sub.exc.func, ast.Name):
+                        rname = sub.exc.func.id
+                    elif isinstance(sub.exc.func, ast.Attribute):
+                        rname = sub.exc.func.attr
+                elif isinstance(sub.exc, ast.Name):
+                    rname = sub.exc.id
+                if rname and rname not in raises:
+                    raises.append(rname)
+        return calls[:25], raises[:10]
+
     def _analyze_python_file(
         self,
         py_path: Path,
         mod_to_rel: dict[str, str],
     ) -> dict[str, Any]:
-        """Extract docstring, classes, functions, exports, and internal/external imports via AST."""
+        """Extract docstring, classes, methods, functions, signatures, AST call targets,
+        raised exceptions, exports, and internal/external imports via AST.
+        """
         rel_path = py_path.relative_to(self.repo_root).as_posix()
         try:
             source = py_path.read_text(encoding="utf-8", errors="replace")
@@ -1677,9 +1810,14 @@ class CodeIntelligence:
                 "error": str(exc),
                 "line_count": 0,
                 "docstring": "",
+                "full_docstring": "",
                 "classes": [],
                 "functions": [],
                 "exports": [],
+                "all_calls": [],
+                "entry_calls": [],
+                "raises": [],
+                "has_main_guard": False,
                 "internal_dependencies": [],
                 "external_dependencies": [],
             }
@@ -1695,15 +1833,23 @@ class CodeIntelligence:
                 "error": f"SyntaxError: {exc}",
                 "line_count": line_count,
                 "docstring": "",
+                "full_docstring": "",
                 "classes": [],
                 "functions": [],
                 "exports": [],
+                "all_calls": [],
+                "entry_calls": [],
+                "raises": [],
+                "has_main_guard": False,
                 "internal_dependencies": [],
                 "external_dependencies": [],
             }
 
         raw_doc = ast.get_docstring(tree) or ""
-        first_doc_line = raw_doc.strip().splitlines()[0].strip() if raw_doc.strip() else ""
+        first_doc_line = (
+            raw_doc.strip().splitlines()[0].strip() if raw_doc.strip() else ""
+        )
+        full_doc_summary = self._clean_docstring(raw_doc, max_chars=320)
 
         classes: list[dict[str, Any]] = []
         functions: list[dict[str, Any]] = []
@@ -1711,38 +1857,95 @@ class CodeIntelligence:
         constants: list[str] = []
         internal_deps: set[str] = set()
         external_deps: set[str] = set()
+        all_calls: set[str] = set()
+        all_raises: set[str] = set()
+        entry_calls: list[str] = []
+        has_main_guard = False
 
         for node in tree.body:
             if isinstance(node, ast.ClassDef):
                 cls_doc = ast.get_docstring(node) or ""
-                cls_doc_summary = (
-                    cls_doc.strip().splitlines()[0].strip() if cls_doc.strip() else ""
-                )
-                methods = [
-                    n.name
-                    for n in node.body
-                    if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
-                ]
+                cls_doc_summary = self._clean_docstring(cls_doc, max_chars=240)
+                bases: list[str] = []
+                if hasattr(ast, "unparse"):
+                    for b in node.bases:
+                        try:
+                            bases.append(ast.unparse(b))
+                        except Exception:
+                            pass
+                methods: list[str] = []
+                method_details: list[dict[str, Any]] = []
+                cls_calls: list[str] = []
+                for n in node.body:
+                    if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        methods.append(n.name)
+                        m_calls, m_raises = self._extract_calls_and_raises(n)
+                        all_calls.update(m_calls)
+                        all_raises.update(m_raises)
+                        for mc in m_calls:
+                            if mc not in cls_calls:
+                                cls_calls.append(mc)
+                        method_details.append(
+                            {
+                                "name": n.name,
+                                "line": n.lineno,
+                                "signature": self._format_function_signature(n),
+                                "docstring": self._clean_docstring(
+                                    ast.get_docstring(n) or "", max_chars=180
+                                ),
+                                "calls": m_calls[:10],
+                                "raises": m_raises[:6],
+                            }
+                        )
                 classes.append(
                     {
                         "name": node.name,
                         "line": node.lineno,
+                        "bases": bases,
                         "methods": methods,
+                        "method_details": method_details,
+                        "calls": cls_calls[:15],
                         "docstring": cls_doc_summary,
                     }
                 )
             elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 fn_doc = ast.get_docstring(node) or ""
-                fn_doc_summary = (
-                    fn_doc.strip().splitlines()[0].strip() if fn_doc.strip() else ""
-                )
+                fn_doc_summary = self._clean_docstring(fn_doc, max_chars=240)
+                fn_calls, fn_raises = self._extract_calls_and_raises(node)
+                all_calls.update(fn_calls)
+                all_raises.update(fn_raises)
                 functions.append(
                     {
                         "name": node.name,
                         "line": node.lineno,
+                        "signature": self._format_function_signature(node),
+                        "calls": fn_calls[:12],
+                        "raises": fn_raises[:6],
                         "docstring": fn_doc_summary,
                     }
                 )
+            elif isinstance(node, ast.If):
+                # Detect `if __name__ == "__main__":` runtime entry blocks
+                test_src = ""
+                if hasattr(ast, "unparse"):
+                    try:
+                        test_src = ast.unparse(node.test)
+                    except Exception:
+                        test_src = ""
+                if "__name__" in test_src and "__main__" in test_src:
+                    has_main_guard = True
+                    m_calls, m_raises = self._extract_calls_and_raises(node)
+                    all_calls.update(m_calls)
+                    all_raises.update(m_raises)
+                    for mc in m_calls:
+                        if mc not in entry_calls:
+                            entry_calls.append(mc)
+            elif isinstance(node, ast.Expr) and isinstance(node.value, ast.Call):
+                e_calls, _ = self._extract_calls_and_raises(node)
+                all_calls.update(e_calls)
+                for ec in e_calls:
+                    if ec not in entry_calls:
+                        entry_calls.append(ec)
             elif isinstance(node, ast.Assign):
                 for target in node.targets:
                     if isinstance(target, ast.Name):
@@ -1777,7 +1980,7 @@ class CodeIntelligence:
                 external_deps.update(ex_deps)
 
         # Infer concise purpose summary if module docstring is absent
-        summary = first_doc_line
+        summary = full_doc_summary or first_doc_line
         if not summary:
             if classes:
                 cls_names = ", ".join(c["name"] for c in classes[:4])
@@ -1797,11 +2000,16 @@ class CodeIntelligence:
             "type": "python",
             "line_count": line_count,
             "docstring": first_doc_line,
+            "full_docstring": full_doc_summary,
             "summary": summary,
             "classes": classes,
             "functions": functions,
             "constants": constants[:12],
             "exports": exports,
+            "all_calls": sorted(all_calls),
+            "entry_calls": entry_calls,
+            "raises": sorted(all_raises),
+            "has_main_guard": has_main_guard,
             "internal_dependencies": sorted(internal_deps),
             "external_dependencies": sorted(external_deps),
         }
@@ -2169,10 +2377,164 @@ class CodeIntelligence:
 
         return ordered_items
 
+    def _compute_call_graph_and_execution_flows(
+        self,
+        records: list[dict[str, Any]],
+        reading_order: list[dict[str, Any]],
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """Compute cross-module runtime symbol invocation edges (`call_graph_edges`)
+        and multi-hop runtime execution flows (`execution_flows`) from entry points.
+        """
+        by_path: dict[str, dict[str, Any]] = {r["path"]: r for r in records}
+        ro_by_path: dict[str, dict[str, Any]] = {
+            item["path"]: item for item in reading_order
+        }
+
+        # Map each file to the symbols it directly defines vs defines-or-re-exports
+        defined_only_by_path: dict[str, set[str]] = {}
+        defined_or_exported_by_path: dict[str, set[str]] = {}
+        for path, rec in by_path.items():
+            own_syms: set[str] = set()
+            for c in rec.get("classes", []):
+                if c.get("name"):
+                    own_syms.add(str(c["name"]))
+                for m in c.get("methods", []):
+                    if isinstance(m, str) and not m.startswith("__"):
+                        own_syms.add(m)
+            for fn in rec.get("functions", []):
+                if fn.get("name"):
+                    own_syms.add(str(fn["name"]))
+            for const in rec.get("constants", []):
+                if isinstance(const, str) and const:
+                    own_syms.add(const)
+            defined_only_by_path[path] = set(own_syms)
+
+            all_syms = set(own_syms)
+            for exp in rec.get("exports", []):
+                if isinstance(exp, str) and exp:
+                    all_syms.add(exp)
+            defined_or_exported_by_path[path] = all_syms
+
+        call_graph_edges: list[dict[str, Any]] = []
+        for rec in records:
+            if rec.get("type") != "python":
+                rec["invoked_from_deps"] = {}
+                continue
+            caller_path = rec["path"]
+            caller_calls = set(rec.get("all_calls") or [])
+            invoked_map: dict[str, list[str]] = {}
+            for dep_path in rec.get("internal_dependencies", []):
+                dep_syms = defined_or_exported_by_path.get(dep_path, set())
+                invoked = sorted(caller_calls & dep_syms)
+                if invoked:
+                    invoked_map[dep_path] = invoked[:10]
+                    call_graph_edges.append(
+                        {
+                            "caller": caller_path,
+                            "callee": dep_path,
+                            "caller_file": caller_path,
+                            "callee_file": dep_path,
+                            "invoked_symbols": invoked[:10],
+                        }
+                    )
+                    # If `dep_path` is a package `__init__.py` re-export facade, transitively resolve
+                    # the underlying concrete submodule(s) that define the invoked symbol(s).
+                    if dep_path.endswith("__init__.py"):
+                        facade_queue = [dep_path]
+                        seen_facades = {dep_path}
+                        while facade_queue:
+                            cur_facade = facade_queue.pop(0)
+                            facade_rec = by_path.get(cur_facade, {})
+                            for sub_dep in facade_rec.get("internal_dependencies", []):
+                                if sub_dep.endswith("__init__.py") and sub_dep not in seen_facades:
+                                    seen_facades.add(sub_dep)
+                                    facade_queue.append(sub_dep)
+                                sub_own = defined_only_by_path.get(sub_dep, set())
+                                sub_invoked = sorted(set(invoked) & sub_own)
+                                if sub_invoked and sub_dep not in invoked_map:
+                                    invoked_map[sub_dep] = sub_invoked[:10]
+                                    call_graph_edges.append(
+                                        {
+                                            "caller": caller_path,
+                                            "callee": sub_dep,
+                                            "caller_file": caller_path,
+                                            "callee_file": sub_dep,
+                                            "via_facade": dep_path,
+                                            "invoked_symbols": sub_invoked[:10],
+                                        }
+                                    )
+            rec["invoked_from_deps"] = invoked_map
+
+        # Trace multi-hop runtime execution flows from entry-point scripts (`layer_rank == 1`)
+        execution_flows: list[dict[str, Any]] = []
+        entry_candidates = [
+            item["path"]
+            for item in reading_order
+            if item.get("layer_rank") == 1
+            and item["path"].endswith(".py")
+            and not item["path"].endswith("/__init__.py")
+        ]
+        for entry_path in entry_candidates:
+            entry_rec = by_path.get(entry_path, {})
+            hops: list[dict[str, Any]] = []
+            visited: set[str] = {entry_path}
+            frontier: list[str] = [entry_path]
+
+            for depth in range(1, 6):
+                next_frontier: list[str] = []
+                for cur_p in frontier:
+                    cur_rec = by_path.get(cur_p, {})
+                    invoked_map = cur_rec.get("invoked_from_deps") or {}
+                    candidate_callees = list(invoked_map.keys())
+                    if depth == 1:
+                        for d in cur_rec.get("internal_dependencies") or []:
+                            if d not in candidate_callees:
+                                candidate_callees.append(d)
+                    ordered_callees = sorted(
+                        candidate_callees,
+                        key=lambda d: (
+                            0 if d in invoked_map and not d.endswith("__init__.py") else 1,
+                            0 if d in invoked_map else 1,
+                            ro_by_path.get(d, {}).get("step", 999),
+                        ),
+                    )
+                    for callee_p in ordered_callees:
+                        if callee_p in visited:
+                            continue
+                        inv_syms = invoked_map.get(callee_p, [])
+                        if not inv_syms and depth > 1:
+                            continue
+                        visited.add(callee_p)
+                        if not callee_p.endswith("__init__.py"):
+                            next_frontier.append(callee_p)
+                        hops.append(
+                            {
+                                "hop": depth,
+                                "from": cur_p,
+                                "to": callee_p,
+                                "invoked_symbols": inv_syms,
+                            }
+                        )
+                if not next_frontier:
+                    break
+                frontier = next_frontier[:5]
+
+            if hops:
+                execution_flows.append(
+                    {
+                        "entry_point": entry_path,
+                        "has_main_guard": bool(entry_rec.get("has_main_guard")),
+                        "entry_calls": entry_rec.get("entry_calls", [])[:8],
+                        "hops": hops[:14],
+                    }
+                )
+
+        return call_graph_edges, execution_flows
+
     def build_repository_inventory(self) -> dict[str, Any]:
         """Build a complete, deterministic inventory of all relevant repository files,
-        their AST symbols, docstrings, internal/external dependencies, excluded files,
-        and a dependency-aware reading order.
+        their AST symbols, signatures, docstrings, call-graph edges, runtime execution flows,
+        internal/external dependencies, excluded files, and a dependency-aware reading order.
         """
         py_files, other_files, excluded_dirs, excluded_files = (
             self._discover_repo_files_with_exclusions()
@@ -2196,6 +2558,9 @@ class CodeIntelligence:
             rec["imported_by"] = sorted(imported_by.get(rec["path"], []))
 
         reading_order = self._compute_reading_order(records)
+        call_graph_edges, execution_flows = (
+            self._compute_call_graph_and_execution_flows(records, reading_order)
+        )
 
         return {
             "repo_root": str(self.repo_root),
@@ -2206,11 +2571,17 @@ class CodeIntelligence:
             "excluded_files": excluded_files,
             "files": records,
             "reading_order": reading_order,
+            "call_graph_edges": call_graph_edges,
+            "execution_flows": execution_flows,
         }
 
-    def format_inventory_for_prompt(self, inventory: dict[str, Any]) -> str:
+    def format_inventory_for_prompt(
+        self,
+        inventory: dict[str, Any],
+        include_execution_flows: bool = False,
+    ) -> str:
         """Render the complete repository inventory and dependency-aware reading order
-        into a structured Markdown block for LLM prompt grounding.
+        (plus optional runtime execution flows) into a structured Markdown block for LLM prompt grounding.
         """
         lines: list[str] = [
             f"Repository Root: `{inventory.get('repo_root')}`",
@@ -2275,6 +2646,23 @@ class CodeIntelligence:
             detail_str = f" — {' | '.join(details)}" if details else ""
             lines.append(f"{item['step']}. `{path}`: {summary}{detail_str}")
 
+        execution_flows = inventory.get("execution_flows") or []
+        if include_execution_flows and execution_flows:
+            lines.append("")
+            lines.append("### Verified Runtime Execution Flows (AST Call-Graph Traces)")
+            for flow in execution_flows:
+                ep = flow.get("entry_point")
+                ecalls = flow.get("entry_calls") or []
+                ecall_str = f" (entry calls: `{', '.join(ecalls)}`)" if ecalls else ""
+                hop_strs: list[str] = []
+                for h in flow.get("hops", [])[:8]:
+                    syms = h.get("invoked_symbols") or []
+                    sym_note = f" [{', '.join(syms[:4])}]" if syms else ""
+                    hop_strs.append(f"`{h['from']}` -> `{h['to']}`{sym_note}")
+                lines.append(
+                    f"- **Entry `{ep}`**{ecall_str}: " + " ; ".join(hop_strs)
+                )
+
         return "\n".join(lines)
 
     # ------------------------------------------------------------------
@@ -2300,9 +2688,9 @@ class CodeIntelligence:
         q_tokens = set(re.findall(r"[A-Za-z_][A-Za-z0-9_]{2,}", question))
         matched = [sym for sym in sorted(known_symbols) if sym in q_tokens]
         if matched:
-            return matched[:6]
+            return matched[:8]
 
-        # Dynamically select representative top-level classes and entry-point functions from the inventory
+        # Dynamically select representative top-level classes and entry-point functions across layers
         ranked_files = sorted(
             [f for f in files if isinstance(f, dict) and f.get("type") == "python"],
             key=lambda f: (
@@ -2318,11 +2706,11 @@ class CodeIntelligence:
                 cname = str(c.get("name") or "")
                 if cname and cname not in representative:
                     representative.append(cname)
-                    if len(representative) >= 6:
+                    if len(representative) >= 8:
                         break
-            if len(representative) >= 6:
+            if len(representative) >= 8:
                 break
-        if len(representative) < 6:
+        if len(representative) < 8:
             for f in ranked_files:
                 for fn in f.get("functions", []):
                     fname = str(fn.get("name") or "")
@@ -2332,14 +2720,123 @@ class CodeIntelligence:
                         and fname not in representative
                     ):
                         representative.append(fname)
-                        if len(representative) >= 6:
+                        if len(representative) >= 8:
                             break
-                if len(representative) >= 6:
+                if len(representative) >= 8:
                     break
 
         if representative:
-            return ["|".join(representative[:6])]
+            return ["|".join(representative[:8])]
         return [".*"]
+
+    def _extract_scoped_source_excerpts(
+        self,
+        question: str,
+        inventory: dict[str, Any],
+        max_files: int = 5,
+        max_lines_per_file: int = 110,
+    ) -> dict[str, str]:
+        """Inspect actual source files on disk when the question targets specific files,
+        packages, or symbols (or for small repositories), ensuring deep behavioral context.
+        """
+        q_lower = (question or "").lower()
+        files = inventory.get("files") or []
+        by_path = {
+            str(f["path"]): f
+            for f in files
+            if isinstance(f, dict) and f.get("path")
+        }
+
+        matched_paths: list[str] = []
+        # Pass 1: Explicit file path mentions in the question (highest priority)
+        for path in by_path:
+            if path.lower() in q_lower or path.replace("/", "\\").lower() in q_lower:
+                if path not in matched_paths:
+                    matched_paths.append(path)
+
+        # Pass 2: Word-boundary class/function symbol matches (prioritize concrete modules over __init__.py)
+        q_words = set(re.findall(r"[a-z_][a-z0-9_]{3,}", q_lower))
+        ordered_candidates = sorted(
+            by_path.keys(),
+            key=lambda p: (1 if p.endswith("__init__.py") else 0, p),
+        )
+        for path in ordered_candidates:
+            if path in matched_paths:
+                continue
+            rec = by_path[path]
+            for c in rec.get("classes", []):
+                cname = str(c.get("name") or "")
+                if cname and cname.lower() in q_words:
+                    matched_paths.append(path)
+                    break
+            if path in matched_paths:
+                continue
+            for fn in rec.get("functions", []):
+                fname = str(fn.get("name") or "")
+                if fname and len(fname) >= 5 and fname.lower() in q_words:
+                    matched_paths.append(path)
+                    break
+
+        # Pass 3: Package prefix or domain-token relevance for targeted natural-language questions
+        is_broad = any(
+            kw in q_lower
+            for kw in (
+                "sequence of files",
+                "seqence of files",
+                "reading order",
+                "files that i should read",
+                "all files",
+                "every file",
+                "understand this project",
+                "explain this project",
+            )
+        )
+        if not matched_paths and not is_broad and q_words:
+            scored: list[tuple[int, str]] = []
+            for path in ordered_candidates:
+                rec = by_path[path]
+                if rec.get("type") != "python":
+                    continue
+                file_tokens = set(
+                    re.findall(
+                        r"[a-z0-9_]{4,}",
+                        " ".join(
+                            [
+                                path.lower(),
+                                str(rec.get("summary") or "").lower(),
+                                *[str(c.get("name") or "").lower() for c in rec.get("classes", [])],
+                                *[str(f.get("name") or "").lower() for f in rec.get("functions", [])],
+                            ]
+                        ),
+                    )
+                )
+                overlap = len(q_words & file_tokens)
+                if overlap >= 2:
+                    scored.append((overlap, path))
+            scored.sort(key=lambda item: (-item[0], item[1]))
+            matched_paths.extend(p for _, p in scored[:max_files])
+
+        if not matched_paths and len(by_path) <= max_files:
+            matched_paths = [
+                p for p, r in by_path.items() if r.get("type") == "python"
+            ]
+
+        excerpts: dict[str, str] = {}
+        for rel_p in matched_paths[:max_files]:
+            disk_p = (self.repo_root / rel_p).resolve()
+            try:
+                disk_p.relative_to(self.repo_root)
+                if disk_p.is_file():
+                    src_lines = disk_p.read_text(
+                        encoding="utf-8", errors="replace"
+                    ).splitlines()
+                    snippet = "\n".join(src_lines[:max_lines_per_file])
+                    if len(src_lines) > max_lines_per_file:
+                        snippet += f"\n# ... ({len(src_lines) - max_lines_per_file} additional lines)"
+                    excerpts[rel_p] = snippet
+            except OSError:
+                continue
+        return excerpts
 
     def gather_context(
         self,
@@ -2351,15 +2848,20 @@ class CodeIntelligence:
         strict: bool = False,
     ) -> dict[str, Any]:
         """Gather comprehensive codebase context from:
-        1. Deterministic AST repository inventory (all files, docstrings, symbols, dependencies, reading order)
-        2. Graphify structural graph (`graphify-out/graph.json` + `GRAPH_REPORT.md`) — queried ONLY if verified fresh
-        3. Codebase Memory MCP (`get_architecture` with `aspects=["all"]` + symbol search) — queried ONLY if verified fresh
+        1. Deterministic AST repository inventory (all files, docstrings, symbols, signatures,
+           call-graph edges, runtime execution flows, dependencies, and reading order)
+        2. Scoped direct source-file inspection for targeted file/symbol queries
+        3. Graphify structural graph (`graphify-out/graph.json` + `GRAPH_REPORT.md`) — queried ONLY if verified fresh
+        4. Codebase Memory MCP (`get_architecture` with `aspects=["all"]` + symbol search) — queried ONLY if verified fresh
         """
         errors: list[str] = []
 
-        # 1. Deterministic full-repository AST inventory & reading order
+        # 1. Deterministic full-repository AST inventory, call graph, execution flows & reading order
         inventory = self.build_repository_inventory()
         formatted_inventory = self.format_inventory_for_prompt(inventory)
+        scoped_source_excerpts = self._extract_scoped_source_excerpts(
+            question, inventory
+        )
 
         # 2. Graphify verification, auto-refresh, and structural query (never query unverified index data)
         graphify_status: dict[str, Any] = {}
@@ -2487,6 +2989,9 @@ class CodeIntelligence:
             "total_repo_files": inventory["total_files"],
             "python_files": inventory["python_files_count"],
             "config_doc_files": inventory["config_doc_files_count"],
+            "call_graph_edges_count": len(inventory.get("call_graph_edges", [])),
+            "execution_flows_count": len(inventory.get("execution_flows", [])),
+            "scoped_source_excerpts_count": len(scoped_source_excerpts),
             "excluded_dirs_count": len(inventory.get("excluded_dirs", [])),
             "excluded_files_count": len(inventory.get("excluded_files", [])),
             "excluded_dirs": inventory.get("excluded_dirs", []),
@@ -2532,6 +3037,9 @@ class CodeIntelligence:
             "repository_inventory": inventory,
             "formatted_inventory": formatted_inventory,
             "reading_order": inventory["reading_order"],
+            "execution_flows": inventory.get("execution_flows", []),
+            "call_graph_edges": inventory.get("call_graph_edges", []),
+            "scoped_source_excerpts": scoped_source_excerpts,
             "graphify_context": graphify_ctx,
             "graphify_report": graphify_report_summary,
             "memory_architecture": memory_arch,
