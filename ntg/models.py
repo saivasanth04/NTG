@@ -6,7 +6,7 @@ from email.utils import parsedate_to_datetime
 import re
 import threading
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from ntg.config import (
     CIRCUIT_BREAKER_HALF_OPEN_PROBES,
@@ -550,6 +550,7 @@ class Deployment:
     is_stale: bool = False
     stale_reason: Optional[str] = None
     last_discovered_at: float = 0.0
+    _active_probe_request_id: Optional[str] = field(default=None, repr=False, compare=False)
     _state_lock: threading.RLock = field(default_factory=threading.RLock, repr=False, compare=False)
 
     @property
@@ -766,7 +767,7 @@ class Deployment:
         """Alias for is_eligible."""
         return self.is_eligible(now)
 
-    def claim_half_open_probe(self) -> bool:
+    def claim_half_open_probe(self, request_id: Optional[str] = None) -> bool:
         """Atomically claim the single allowed controlled probe in HALF_OPEN state (Rule 3, 11).
 
         Returns True if the probe was successfully claimed, False if not in HALF_OPEN or probe already claimed.
@@ -774,19 +775,25 @@ class Deployment:
         with self._state_lock:
             if self.circuit_state == CircuitState.HALF_OPEN and self.half_open_probes < self.max_half_open_probes:
                 self.half_open_probes += 1
+                self._active_probe_request_id = request_id
                 return True
             return False
 
-    def release_half_open_probe(self) -> None:
+    def release_half_open_probe(self, request_id: Optional[str] = None) -> None:
         """Release a claimed probe slot if the probe request was not dispatched."""
         with self._state_lock:
+            if request_id is not None and self._active_probe_request_id is not None:
+                if self._active_probe_request_id != request_id:
+                    # Belongs to a different request probe reservation
+                    return
             if self.half_open_probes > 0:
                 self.half_open_probes -= 1
+            self._active_probe_request_id = None
 
-    def admit_to_request_pool(self, now: Optional[float] = None) -> bool:
+    def admit_to_request_pool(self, now: Optional[float] = None, request_id: Optional[str] = None) -> bool:
         """Atomically admit deployment into an active request pool (Task 11 / Final Correctness).
 
-        For HALF_OPEN deployments, atomically claims a single probe slot before admission.
+        For HALF_OPEN deployments, atomically claims a single probe slot tied to request_id before admission.
         Returns False if probe cannot be claimed, circuit is OPEN, quota is exhausted, or credentials missing.
         """
         current_time = now if now is not None else time.time()
@@ -803,6 +810,7 @@ class Deployment:
             if self.circuit_state == CircuitState.HALF_OPEN:
                 if self.half_open_probes < self.max_half_open_probes:
                     self.half_open_probes += 1
+                    self._active_probe_request_id = request_id
                     return True
                 return False
             return True
@@ -825,6 +833,7 @@ class Deployment:
                 # Failed probe in HALF_OPEN: immediately return to OPEN with backoff recovery time (Rule 5)
                 self.circuit_state = CircuitState.OPEN
                 self.half_open_probes = 0
+                self._active_probe_request_id = None
                 backoff_cooldown = cooldown * 2.0
                 self.circuit_open_until = now + backoff_cooldown
                 self.state_reason = f"Probe request failed while in HALF_OPEN; circuit OPEN until {utc_string(self.circuit_open_until)}"
@@ -832,6 +841,7 @@ class Deployment:
                 # Reached consecutive failure threshold: trip circuit to OPEN (Rule 2)
                 self.circuit_state = CircuitState.OPEN
                 self.half_open_probes = 0
+                self._active_probe_request_id = None
                 self.circuit_open_until = now + cooldown
                 self.state_reason = f"Consecutive failure threshold reached ({self.consecutive_failures}); circuit OPEN until {utc_string(self.circuit_open_until)}"
 
@@ -841,6 +851,7 @@ class Deployment:
             self.consecutive_failures = 0
             self.circuit_open_until = 0.0
             self.half_open_probes = 0
+            self._active_probe_request_id = None
             now = time.time()
             self.state_updated_at = now
             if self.circuit_state in (CircuitState.HALF_OPEN, CircuitState.AUTH_FAILED, CircuitState.OPEN):
@@ -873,10 +884,35 @@ class Deployment:
                 if server_recovered or quota_recovered or fallback_recovered:
                     self.circuit_state = CircuitState.HALF_OPEN
                     self.half_open_probes = 0
+                    self._active_probe_request_id = None
                     self.state_reason = "Recovery condition reached; entering HALF_OPEN for controlled probe"
                     self.state_updated_at = current_time
 
             return self.is_eligible(current_time)
+
+    def routing_config_fingerprint(self) -> Tuple[Any, ...]:
+        """Return a tuple capturing all routing-relevant configuration and state (Item 4).
+
+        Changes to credentials, weights, API base, circuit state, quota reset timestamps,
+        tags, or context window immediately change this fingerprint, triggering pool refresh.
+        """
+        return (
+            self.id,
+            self.provider,
+            self.account,
+            self.model,
+            self.litellm_model,
+            self.api_key,
+            self.api_base,
+            self.weight,
+            self.circuit_state.value,
+            self.circuit_open_until,
+            self.quota.reset_at,
+            self.quota.rpm_remaining,
+            self.quota.rpd_remaining,
+            tuple(sorted(self.capabilities.to_tags())),
+            self.capabilities.context_window,
+        )
 
     def to_litellm_dict(self, group_override: Optional[str] = None) -> Dict[str, Any]:
         """Converts deployment into LiteLLM router dictionary format with tags and weights."""
