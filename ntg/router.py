@@ -58,19 +58,26 @@ class NTGTelemetryLogger(CustomLogger):
         super().__init__()
         self.router = router
 
-    def log_pre_api_call(self, model: Any, messages: Any, kwargs: Any = None) -> None:
-        """LiteLLM pre-API call callback."""
-        pass
-
-    def log_success_event(self, kwargs: dict, response_obj: Any, start_time: Any, end_time: Any) -> None:
-        """Handle upstream success callback."""
-        dep_id = kwargs.get("litellm_params", {}).get("model_info", {}).get("id")
+    def _extract_deployment(self, kwargs: Optional[dict] = None, response_obj: Any = None) -> tuple[Optional[str], Optional[Deployment]]:
+        """Extract deployment ID and Deployment instance from event kwargs or response object."""
+        if not kwargs and response_obj is None:
+            return None, None
+        kw = kwargs or {}
+        dep_id = (
+            kw.get("litellm_params", {}).get("model_info", {}).get("id")
+            or kw.get("model_info", {}).get("id")
+            or kw.get("litellm_params", {}).get("metadata", {}).get("model_info", {}).get("id")
+            or kw.get("litellm_params", {}).get("metadata", {}).get("deployment_id")
+            or kw.get("metadata", {}).get("deployment_id")
+        )
         if not dep_id:
-            dep_id = kwargs.get("model_info", {}).get("id")
+            cand_name = kw.get("litellm_params", {}).get("metadata", {}).get("deployment_model_name")
+            if cand_name and cand_name in self.router.deployment_map:
+                dep_id = cand_name
         if not dep_id:
-            dep_id = kwargs.get("litellm_params", {}).get("metadata", {}).get("deployment_id")
-        if not dep_id:
-            dep_id = kwargs.get("metadata", {}).get("deployment_id")
+            cand_group = kw.get("litellm_params", {}).get("metadata", {}).get("model_group")
+            if cand_group and cand_group in self.router.deployment_map:
+                dep_id = cand_group
 
         if not dep_id and response_obj is not None:
             hidden = getattr(response_obj, "_hidden_params", {}) or {}
@@ -79,10 +86,45 @@ class NTGTelemetryLogger(CustomLogger):
                 if not dep_id and isinstance(hidden.get("model_info"), dict):
                     dep_id = hidden.get("model_info", {}).get("id")
 
+        exc = kw.get("exception")
+        if not exc and isinstance(response_obj, Exception):
+            exc = response_obj
+        if not dep_id and exc and hasattr(exc, "model_id"):
+            dep_id = getattr(exc, "model_id")
+
         deployment = self.router.deployment_map.get(dep_id) if dep_id else None
+        return dep_id, deployment
+
+    def log_pre_api_call(self, model: Any, messages: Any, kwargs: Any = None) -> None:
+        """LiteLLM pre-API call callback: records attempt dispatch per actual upstream call."""
+        kw = kwargs if isinstance(kwargs, dict) else {}
+        call_id = kw.get("litellm_call_id")
+        _, deployment = self._extract_deployment(kw)
+        if deployment:
+            recorded = getattr(self.router._request_context, "recorded_call_ids", None)
+            if recorded is not None and isinstance(recorded, set):
+                if call_id and call_id in recorded:
+                    return
+                if call_id:
+                    recorded.add(call_id)
+            self.router._record_request_attempt(deployment)
+
+    def log_success_event(self, kwargs: dict, response_obj: Any, start_time: Any, end_time: Any) -> None:
+        """Handle upstream success callback."""
+        call_id = kwargs.get("litellm_call_id") if isinstance(kwargs, dict) else None
+        _, deployment = self._extract_deployment(kwargs, response_obj)
 
         if deployment:
-            self.router._record_request_attempt(deployment)
+            recorded = getattr(self.router._request_context, "recorded_call_ids", None)
+            if recorded is not None and isinstance(recorded, set):
+                if call_id and call_id not in recorded:
+                    recorded.add(call_id)
+                    self.router._record_request_attempt(deployment)
+                elif not call_id:
+                    self.router._record_request_attempt(deployment)
+            else:
+                self.router._record_request_attempt(deployment)
+
             deployment.metrics.record_success()
             deployment.record_success()
 
@@ -114,25 +156,23 @@ class NTGTelemetryLogger(CustomLogger):
 
     def log_failure_event(self, kwargs: dict, response_obj: Any, start_time: Any, end_time: Any) -> None:
         """Handle upstream failure callback with granular error classification."""
-        dep_id = kwargs.get("litellm_params", {}).get("model_info", {}).get("id")
-        if not dep_id:
-            dep_id = kwargs.get("model_info", {}).get("id")
-        if not dep_id:
-            dep_id = kwargs.get("litellm_params", {}).get("metadata", {}).get("deployment_id")
-        if not dep_id:
-            dep_id = kwargs.get("metadata", {}).get("deployment_id")
+        call_id = kwargs.get("litellm_call_id") if isinstance(kwargs, dict) else None
+        _, deployment = self._extract_deployment(kwargs, response_obj)
 
-        exc = kwargs.get("exception")
+        exc = kwargs.get("exception") if isinstance(kwargs, dict) else None
         if not exc and isinstance(response_obj, Exception):
             exc = response_obj
 
-        if not dep_id and exc and hasattr(exc, "model_id"):
-            dep_id = getattr(exc, "model_id")
-
-        deployment = self.router.deployment_map.get(dep_id) if dep_id else None
-
         if deployment:
-            self.router._record_request_attempt(deployment)
+            recorded = getattr(self.router._request_context, "recorded_call_ids", None)
+            if recorded is not None and isinstance(recorded, set):
+                if call_id and call_id not in recorded:
+                    recorded.add(call_id)
+                    self.router._record_request_attempt(deployment)
+                elif not call_id:
+                    self.router._record_request_attempt(deployment)
+            else:
+                self.router._record_request_attempt(deployment)
 
             if exc:
                 info = parse_provider_error(exc, provider=deployment.provider)
@@ -180,6 +220,9 @@ class NTGTelemetryLogger(CustomLogger):
                     deployment.state_reason = sanitize_secret(f"Model unavailable: {info.message}", deployment.api_key)
                     self.router.state_manager.record_quarantine(
                         deployment.id, deployment.state_reason, state=CircuitState.QUARANTINED
+                    )
+                    self.router.state_manager.record_circuit_state(
+                        deployment.id, CircuitState.QUARANTINED, reason=deployment.state_reason
                     )
 
                 # NTG Authoritative Rate Limit / Quota Exhaustion handling (429, daily, rpm, etc.)
@@ -237,6 +280,14 @@ class NTGTelemetryLogger(CustomLogger):
                             recovery_time=deployment.circuit_open_until,
                         )
             else:
+                deployment.record_failure()
+                if deployment.circuit_state == CircuitState.OPEN:
+                    self.router.state_manager.record_circuit_state(
+                        deployment.id,
+                        CircuitState.OPEN,
+                        reason=deployment.state_reason or "Qualifying upstream failure",
+                        recovery_time=deployment.circuit_open_until,
+                    )
                 deployment.metrics.record_failure()
 
             self.router.state_manager.record_metrics(deployment.id, deployment.metrics)
@@ -559,6 +610,8 @@ class UnifiedNTGRouter:
         self.telemetry_logger = NTGTelemetryLogger(self)
         litellm.callbacks = [cb for cb in litellm.callbacks if not isinstance(cb, NTGTelemetryLogger)]
         litellm.callbacks.append(self.telemetry_logger)
+        litellm.input_callback = [cb for cb in litellm.input_callback if not isinstance(cb, NTGTelemetryLogger)]
+        litellm.input_callback.append(self.telemetry_logger)
 
     def _sync_router_model_pool(self) -> None:
         """Fast, thread-safe synchronization of the shared LiteLLM model pool.
@@ -1028,7 +1081,8 @@ class UnifiedNTGRouter:
                 if not dep.admit_to_request_pool(ts, request_id=request_id):
                     continue
                 if dep.circuit_state == CircuitState.HALF_OPEN and claimed_probes is not None:
-                    claimed_probes.append(dep)
+                    if dep not in claimed_probes:
+                        claimed_probes.append(dep)
             else:
                 if not dep.is_available(ts):
                     continue
@@ -1187,16 +1241,14 @@ class UnifiedNTGRouter:
                                 if not d.admit_to_request_pool(ts, request_id=request_id):
                                     continue
                                 if d.circuit_state == CircuitState.HALF_OPEN and claimed_probes is not None:
-                                    claimed_probes.append(d)
+                                    if d not in claimed_probes:
+                                        claimed_probes.append(d)
                             else:
                                 if not d.is_available(ts):
                                     continue
 
                             if d.id not in clean_dst:
                                 clean_dst.append(d.id)
-
-                        if not candidates:
-                            clean_dst.append(dst)
 
                     if clean_dst:
                         validated.append({src: clean_dst})
@@ -1320,6 +1372,7 @@ class UnifiedNTGRouter:
         claimed_probes: List[Deployment] = []
         request_id = uuid.uuid4().hex[:8]
         self._request_context.attempted_deployments = []
+        self._request_context.recorded_call_ids = set()
 
         # Build request pool and capability-safe provider group fallbacks
         selected_dep, fallbacks, eligible = self._build_request_pool_and_fallbacks(
@@ -1382,7 +1435,11 @@ class UnifiedNTGRouter:
 
         except Exception as error:
             attempted = getattr(self._request_context, "attempted_deployments", [])
-            target_dep = selected_dep if (selected_dep and selected_dep in attempted) else (attempted[0] if attempted else None)
+            target_dep = None
+            if selected_dep and selected_dep in attempted:
+                target_dep = selected_dep
+            elif len(attempted) == 1:
+                target_dep = attempted[0]
             if target_dep:
                 target_dep.record_user_request()
                 self.state_manager.record_metrics(target_dep.id, target_dep.metrics)
@@ -1399,7 +1456,10 @@ class UnifiedNTGRouter:
             for dep in claimed_probes:
                 if dep.id not in attempted_ids:
                     dep.release_half_open_probe(request_id=request_id)
+                elif dep.circuit_state == CircuitState.HALF_OPEN and getattr(dep, "_active_probe_request_id", None) == request_id:
+                    dep.release_half_open_probe(request_id=request_id)
             self._request_context.attempted_deployments = []
+            self._request_context.recorded_call_ids = set()
 
     def completion(
         self,
@@ -1437,6 +1497,7 @@ class UnifiedNTGRouter:
         claimed_probes: List[Deployment] = []
         request_id = uuid.uuid4().hex[:8]
         self._request_context.attempted_deployments = []
+        self._request_context.recorded_call_ids = set()
 
         # Build request pool and capability-safe provider group fallbacks
         selected_dep, fallbacks, eligible = self._build_request_pool_and_fallbacks(
@@ -1482,7 +1543,11 @@ class UnifiedNTGRouter:
             return response
         except Exception:
             attempted = getattr(self._request_context, "attempted_deployments", [])
-            target_dep = selected_dep if (selected_dep and selected_dep in attempted) else (attempted[0] if attempted else None)
+            target_dep = None
+            if selected_dep and selected_dep in attempted:
+                target_dep = selected_dep
+            elif len(attempted) == 1:
+                target_dep = attempted[0]
             if target_dep:
                 target_dep.record_user_request()
                 self.state_manager.record_metrics(target_dep.id, target_dep.metrics)
@@ -1493,7 +1558,10 @@ class UnifiedNTGRouter:
             for dep in claimed_probes:
                 if dep.id not in attempted_ids:
                     dep.release_half_open_probe(request_id=request_id)
+                elif dep.circuit_state == CircuitState.HALF_OPEN and getattr(dep, "_active_probe_request_id", None) == request_id:
+                    dep.release_half_open_probe(request_id=request_id)
             self._request_context.attempted_deployments = []
+            self._request_context.recorded_call_ids = set()
 
 
 # Maintain backwards compatibility

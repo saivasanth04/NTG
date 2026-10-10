@@ -773,18 +773,21 @@ class Deployment:
         Returns True if the probe was successfully claimed, False if not in HALF_OPEN or probe already claimed.
         """
         with self._state_lock:
-            if self.circuit_state == CircuitState.HALF_OPEN and self.half_open_probes < self.max_half_open_probes:
-                self.half_open_probes += 1
-                self._active_probe_request_id = request_id
+            if self.circuit_state != CircuitState.HALF_OPEN:
+                return False
+            if request_id is not None and self._active_probe_request_id == request_id:
                 return True
-            return False
+            if self.half_open_probes >= self.max_half_open_probes or self._active_probe_request_id is not None:
+                return False
+            self.half_open_probes += 1
+            self._active_probe_request_id = request_id
+            return True
 
     def release_half_open_probe(self, request_id: Optional[str] = None) -> None:
         """Release a claimed probe slot if the probe request was not dispatched."""
         with self._state_lock:
-            if request_id is not None and self._active_probe_request_id is not None:
-                if self._active_probe_request_id != request_id:
-                    # Belongs to a different request probe reservation
+            if self._active_probe_request_id is not None:
+                if request_id is None or self._active_probe_request_id != request_id:
                     return
             if self.half_open_probes > 0:
                 self.half_open_probes -= 1
@@ -808,11 +811,13 @@ class Deployment:
             if self.circuit_state == CircuitState.OPEN:
                 return False
             if self.circuit_state == CircuitState.HALF_OPEN:
-                if self.half_open_probes < self.max_half_open_probes:
-                    self.half_open_probes += 1
-                    self._active_probe_request_id = request_id
+                if request_id is not None and self._active_probe_request_id == request_id:
                     return True
-                return False
+                if self.half_open_probes >= self.max_half_open_probes or self._active_probe_request_id is not None:
+                    return False
+                self.half_open_probes += 1
+                self._active_probe_request_id = request_id
+                return True
             return True
 
     def record_failure(
@@ -922,6 +927,13 @@ class Deployment:
             "api_key": self.api_key,
             "tags": self.capabilities.to_tags(),
             "weight": self.weight,
+            "model_info": {
+                "id": self.id,
+                "provider": self.provider,
+                "account": self.account,
+                "model": self.model,
+                "logical_model": self.logical_model,
+            },
             "metadata": {
                 "deployment_id": self.id,
                 "provider": self.provider,
