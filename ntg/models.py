@@ -3,6 +3,7 @@
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
+import hashlib
 import re
 import threading
 import time
@@ -829,50 +830,119 @@ class Deployment:
                 return self.claim_half_open_probe(request_id=request_id)
             return True
 
+    def transition_to_healthy(
+        self,
+        reason: str = "Recovered to HEALTHY",
+        request_id: Optional[str] = None,
+    ) -> None:
+        """Atomically transition deployment to HEALTHY state under _state_lock."""
+        with self._state_lock:
+            self.consecutive_failures = 0
+            self.circuit_open_until = 0.0
+            if request_id:
+                self._active_probe_request_ids.discard(request_id)
+            else:
+                self._active_probe_request_ids.clear()
+            self.half_open_probes = len(self._active_probe_request_ids)
+            self.circuit_state = CircuitState.HEALTHY
+            self.state_reason = reason
+            self.state_updated_at = time.time()
+            self.auth_failed_key_hash = None
+            self.auth_probe_backoff = 300.0
+
+    def transition_to_open(
+        self,
+        cooldown_seconds: float,
+        reason: str,
+        reset_at: Optional[float] = None,
+        request_id: Optional[str] = None,
+    ) -> None:
+        """Atomically trip circuit breaker to OPEN state under _state_lock."""
+        with self._state_lock:
+            now = time.time()
+            self.circuit_state = CircuitState.OPEN
+            self._active_probe_request_ids.clear()
+            self.half_open_probes = 0
+            if reset_at is not None and reset_at > 0:
+                self.quota.reset_at = reset_at
+                self.quota.retry_after = cooldown_seconds
+                self.circuit_open_until = max(now + cooldown_seconds, reset_at)
+            else:
+                self.circuit_open_until = now + cooldown_seconds
+            self.state_reason = reason
+            self.state_updated_at = now
+
+    def transition_to_half_open(
+        self,
+        reason: str = "Recovery condition reached; entering HALF_OPEN for controlled probe",
+    ) -> None:
+        """Atomically transition circuit breaker to HALF_OPEN under _state_lock."""
+        with self._state_lock:
+            self.circuit_state = CircuitState.HALF_OPEN
+            self._active_probe_request_ids.clear()
+            self.half_open_probes = 0
+            self.state_reason = reason
+            self.state_updated_at = time.time()
+
+    def transition_to_quarantine(
+        self,
+        reason: str,
+        state: CircuitState = CircuitState.QUARANTINED,
+        failed_key: Optional[str] = None,
+    ) -> None:
+        """Atomically quarantine deployment under _state_lock."""
+        with self._state_lock:
+            self.circuit_state = state
+            self._active_probe_request_ids.clear()
+            self.half_open_probes = 0
+            key_to_hash = failed_key or self.api_key or ""
+            if key_to_hash:
+                self.auth_failed_key_hash = hashlib.sha256(key_to_hash.encode("utf-8")).hexdigest()
+            self.state_reason = sanitize_secret(reason, self.api_key)
+            self.state_updated_at = time.time()
+
     def record_failure(
         self,
         max_failures: Optional[int] = None,
         recovery_time: Optional[float] = None,
+        request_id: Optional[str] = None,
     ) -> None:
         """Record qualifying upstream failure and update circuit breaker state (Rule 2, 5, 11)."""
         threshold = max_failures if max_failures is not None else self.max_consecutive_failures
         cooldown = recovery_time if recovery_time is not None else self.recovery_time
 
         with self._state_lock:
-            self.consecutive_failures += 1
             now = time.time()
-            self.state_updated_at = now
+            if request_id:
+                self._active_probe_request_ids.discard(request_id)
+                self.half_open_probes = len(self._active_probe_request_ids)
 
             if self.circuit_state == CircuitState.HALF_OPEN:
                 # Failed probe in HALF_OPEN: immediately return to OPEN with backoff recovery time (Rule 5)
-                self.circuit_state = CircuitState.OPEN
-                self._active_probe_request_ids.clear()
-                self.half_open_probes = 0
                 backoff_cooldown = cooldown * 2.0
-                self.circuit_open_until = now + backoff_cooldown
-                self.state_reason = f"Probe request failed while in HALF_OPEN; circuit OPEN until {utc_string(self.circuit_open_until)}"
-            elif self.consecutive_failures >= threshold:
-                # Reached consecutive failure threshold: trip circuit to OPEN (Rule 2)
-                self.circuit_state = CircuitState.OPEN
-                self._active_probe_request_ids.clear()
-                self.half_open_probes = 0
-                self.circuit_open_until = now + cooldown
-                self.state_reason = f"Consecutive failure threshold reached ({self.consecutive_failures}); circuit OPEN until {utc_string(self.circuit_open_until)}"
+                open_until = now + backoff_cooldown
+                self.transition_to_open(
+                    cooldown_seconds=backoff_cooldown,
+                    reason=f"Probe request failed while in HALF_OPEN; circuit OPEN until {utc_string(open_until)}",
+                    request_id=request_id,
+                )
+            else:
+                self.consecutive_failures += 1
+                self.state_updated_at = now
+                if self.consecutive_failures >= threshold:
+                    open_until = now + cooldown
+                    self.transition_to_open(
+                        cooldown_seconds=cooldown,
+                        reason=f"Consecutive failure threshold reached ({self.consecutive_failures}); circuit OPEN until {utc_string(open_until)}",
+                        request_id=request_id,
+                    )
 
-    def record_success(self) -> None:
+    def record_success(self, request_id: Optional[str] = None) -> None:
         """Record upstream success and restore circuit to HEALTHY (Rule 4, 11)."""
-        with self._state_lock:
-            self.consecutive_failures = 0
-            self.circuit_open_until = 0.0
-            self._active_probe_request_ids.clear()
-            self.half_open_probes = 0
-            now = time.time()
-            self.state_updated_at = now
-            if self.circuit_state in (CircuitState.HALF_OPEN, CircuitState.AUTH_FAILED, CircuitState.OPEN):
-                self.circuit_state = CircuitState.HEALTHY
-                self.state_reason = "Probe succeeded; recovered to HEALTHY"
-            self.auth_failed_key_hash = None
-            self.auth_probe_backoff = 300.0
+        self.transition_to_healthy(
+            reason="Probe succeeded; recovered to HEALTHY",
+            request_id=request_id,
+        )
 
     def refresh(self, now: Optional[float] = None) -> bool:
         """Evaluate circuit breaker, quota recovery, and dynamic key replacement (Rule 3, 11)."""
@@ -881,13 +951,9 @@ class Deployment:
         with self._state_lock:
             # Dynamic Key Replacement: if api_key changed since auth quarantine, lift quarantine!
             if self.circuit_state == CircuitState.AUTH_FAILED and self.auth_failed_key_hash:
-                import hashlib
                 curr_hash = hashlib.sha256(self.api_key.encode("utf-8")).hexdigest()
                 if curr_hash != self.auth_failed_key_hash:
-                    self.circuit_state = CircuitState.HEALTHY
-                    self.state_reason = "API key updated; authentication quarantine lifted"
-                    self.auth_failed_key_hash = None
-                    self.auth_probe_backoff = 300.0
+                    self.transition_to_healthy(reason="API key updated; authentication quarantine lifted")
 
             # Circuit OPEN -> HALF_OPEN evaluation (Rule 3)
             if self.circuit_state == CircuitState.OPEN:
@@ -896,11 +962,7 @@ class Deployment:
                 fallback_recovered = bool(not self.circuit_open_until and not self.quota.reset_at and (current_time - self.state_updated_at) >= self.recovery_time)
 
                 if server_recovered or quota_recovered or fallback_recovered:
-                    self.circuit_state = CircuitState.HALF_OPEN
-                    self._active_probe_request_ids.clear()
-                    self.half_open_probes = 0
-                    self.state_reason = "Recovery condition reached; entering HALF_OPEN for controlled probe"
-                    self.state_updated_at = current_time
+                    self.transition_to_half_open(reason="Recovery condition reached; entering HALF_OPEN for controlled probe")
 
             return self.is_eligible(current_time)
 
@@ -909,14 +971,16 @@ class Deployment:
 
         Changes to credentials, weights, API base, circuit state, quota reset timestamps,
         tags, or context window immediately change this fingerprint, triggering pool refresh.
+        Never exposes raw secrets.
         """
+        key_hash = hashlib.sha256(self.api_key.encode("utf-8")).hexdigest() if self.api_key else ""
         return (
             self.id,
             self.provider,
             self.account,
             self.model,
             self.litellm_model,
-            self.api_key,
+            key_hash,
             self.api_base,
             self.weight,
             self.circuit_state.value,
@@ -924,6 +988,8 @@ class Deployment:
             self.quota.reset_at,
             self.quota.rpm_remaining,
             self.quota.rpd_remaining,
+            self.available,
+            self.is_stale,
             tuple(sorted(self.capabilities.to_tags())),
             self.capabilities.context_window,
         )

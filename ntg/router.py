@@ -9,6 +9,7 @@ import threading
 import time
 from typing import Any, Callable, Dict, List, Optional, Set
 import uuid
+import weakref
 
 import litellm
 from litellm import RetryPolicy, Router
@@ -61,10 +62,14 @@ class ActiveRequest:
     """Request-level coordination tracking for concurrent attempts and probe management."""
 
     request_id: str
+    router_id: str
     selected_dep: Optional[Deployment] = None
     attempted_deployments: List[Deployment] = field(default_factory=list)
     recorded_attempt_ids: Set[str] = field(default_factory=set)
-    attempt_count: int = 0
+    active_dispatch_id: Optional[str] = None
+    dispatch_counter: int = 0
+    dispatched_at: float = 0.0
+    user_request_recorded: bool = False
     lock: threading.Lock = field(default_factory=threading.Lock)
 
 
@@ -77,26 +82,45 @@ class NTGTelemetryLogger(CustomLogger):
 
     def __init__(self, router: UnifiedNTGRouter):
         super().__init__()
-        self.router = router
+        self._router_ref = weakref.ref(router)
 
-    def _get_request_identity(self, kwargs: Optional[dict]) -> tuple[Optional[str], str]:
-        """Extract request ID and attempt ID from event kwargs, generating a unique ID if missing."""
+    @property
+    def router(self) -> Optional[UnifiedNTGRouter]:
+        return self._router_ref()
+
+    def _get_request_identity(self, kwargs: Optional[dict]) -> tuple[Optional[str], Optional[str], Optional[ActiveRequest]]:
+        """Extract request ID, attempt ID, and ActiveRequest from event kwargs.
+
+        Guarantees router isolation: if metadata contains ntg_router_id and it does not match
+        this router instance, returns (None, None, None) immediately.
+        """
+        router = self.router
+        if router is None:
+            return None, None, None
+
         kw = kwargs or {}
+        req_router_id = (
+            kw.get("litellm_params", {}).get("metadata", {}).get("ntg_router_id")
+            or kw.get("metadata", {}).get("ntg_router_id")
+        )
+        if req_router_id and req_router_id != router.router_id:
+            return None, None, None
+
         req_id = (
             kw.get("litellm_params", {}).get("metadata", {}).get("ntg_request_id")
             or kw.get("metadata", {}).get("ntg_request_id")
         )
         if not req_id:
-            req_id = getattr(self.router._request_context, "active_request_id", None)
-        call_id = kw.get("litellm_call_id") or kw.get("ntg_attempt_id")
-        if not call_id:
-            call_id = uuid.uuid4().hex[:12]
-            kw["ntg_attempt_id"] = call_id
-        return req_id, call_id
+            req_id = getattr(router._request_context, "active_request_id", None)
+
+        active_req = router._get_active_request(req_id) if req_id else None
+        call_id = kw.get("litellm_call_id")
+        return req_id, call_id, active_req
 
     def _extract_deployment(self, kwargs: Optional[dict] = None, response_obj: Any = None) -> tuple[Optional[str], Optional[Deployment]]:
         """Extract deployment ID and Deployment instance from event kwargs or response object."""
-        if not kwargs and response_obj is None:
+        router = self.router
+        if router is None or (not kwargs and response_obj is None):
             return None, None
         kw = kwargs or {}
 
@@ -127,277 +151,363 @@ class NTGTelemetryLogger(CustomLogger):
             cand_ids.append(getattr(exc, "model_id"))
 
         for cand in cand_ids:
-            if cand and cand in self.router.deployment_map:
-                return cand, self.router.deployment_map[cand]
+            if cand and cand in router.deployment_map:
+                return cand, router.deployment_map[cand]
 
         # Check if candidate matches a LiteLLM-generated internal hash in router.model_list
-        if hasattr(self.router, "router") and hasattr(self.router.router, "model_list"):
+        if hasattr(router, "router") and hasattr(router.router, "model_list"):
             for cand in cand_ids:
                 if not cand:
                     continue
-                for entry in self.router.router.model_list:
+                for entry in router.router.model_list:
                     if entry.get("model_info", {}).get("id") == cand:
                         dep_id = (
                             entry.get("litellm_params", {}).get("metadata", {}).get("deployment_id")
                             or entry.get("litellm_params", {}).get("model_info", {}).get("id")
                         )
-                        if dep_id and dep_id in self.router.deployment_map:
-                            return dep_id, self.router.deployment_map[dep_id]
+                        if dep_id and dep_id in router.deployment_map:
+                            return dep_id, router.deployment_map[dep_id]
 
         return None, None
 
     def log_pre_api_call(self, model: Any, messages: Any, kwargs: Any = None) -> None:
         """LiteLLM pre-API call callback: records attempt dispatch per actual upstream call."""
-        kw = kwargs if isinstance(kwargs, dict) else {}
-        req_id, call_id = self._get_request_identity(kw)
-        _, deployment = self._extract_deployment(kw)
+        router = self.router
+        if router is None:
+            return
 
-        active_req = self.router._get_active_request(req_id)
-        if active_req:
-            with active_req.lock:
-                if call_id in active_req.recorded_attempt_ids:
-                    return
-                active_req.recorded_attempt_ids.add(call_id)
+        try:
+            kw = kwargs if isinstance(kwargs, dict) else {}
+            req_id, call_id, active_req = self._get_request_identity(kw)
+            if not req_id and not call_id:
+                return
+
+            _, deployment = self._extract_deployment(kw)
+
+            if active_req:
+                with active_req.lock:
+                    if call_id:
+                        attempt_id = call_id
+                    else:
+                        active_req.dispatch_counter += 1
+                        attempt_id = f"{active_req.request_id}_dispatch_{active_req.dispatch_counter}"
+                        active_req.active_dispatch_id = attempt_id
+                        if isinstance(kw, dict):
+                            kw["ntg_attempt_id"] = attempt_id
+
+                    if attempt_id in active_req.recorded_attempt_ids:
+                        return
+                    active_req.recorded_attempt_ids.add(attempt_id)
+                    active_req.dispatched_at = time.time()
+                    if deployment:
+                        active_req.attempted_deployments.append(deployment)
+            else:
+                recorded = getattr(router._request_context, "recorded_call_ids", None)
+                if recorded is not None and isinstance(recorded, set):
+                    if call_id and call_id in recorded:
+                        return
+                    if call_id:
+                        recorded.add(call_id)
                 if deployment:
-                    active_req.attempted_deployments.append(deployment)
-        else:
-            recorded = getattr(self.router._request_context, "recorded_call_ids", None)
-            if recorded is not None and isinstance(recorded, set):
-                if call_id in recorded:
-                    return
-                recorded.add(call_id)
-            if deployment:
-                attempts = getattr(self.router._request_context, "attempted_deployments", None)
-                if attempts is not None and isinstance(attempts, list):
-                    attempts.append(deployment)
+                    attempts = getattr(router._request_context, "attempted_deployments", None)
+                    if attempts is not None and isinstance(attempts, list):
+                        attempts.append(deployment)
 
-        if deployment:
-            deployment.record_attempt()
-            self.router.state_manager.record_metrics(deployment.id, deployment.metrics)
-        else:
-            self.router.unknown_metrics.record_attempt()
-            self.router.state_manager.record_metrics("unknown", self.router.unknown_metrics)
+            if deployment:
+                deployment.record_attempt()
+                router.state_manager.record_metrics(deployment.id, deployment.metrics)
+            else:
+                router.unknown_metrics.record_attempt()
+                router.state_manager.record_metrics("unknown", router.unknown_metrics)
+        except Exception as e:
+            logger.warning("Error in NTGTelemetryLogger.log_pre_api_call: %s", e)
 
     def log_success_event(self, kwargs: dict, response_obj: Any, start_time: Any, end_time: Any) -> None:
         """Handle upstream success callback."""
-        req_id, call_id = self._get_request_identity(kwargs if isinstance(kwargs, dict) else None)
-        _, deployment = self._extract_deployment(kwargs, response_obj)
+        router = self.router
+        if router is None:
+            return
 
-        active_req = self.router._get_active_request(req_id)
-        if active_req:
-            with active_req.lock:
-                if call_id not in active_req.recorded_attempt_ids:
-                    active_req.recorded_attempt_ids.add(call_id)
-                    if deployment:
-                        active_req.attempted_deployments.append(deployment)
-                        deployment.record_attempt()
-                        self.router.state_manager.record_metrics(deployment.id, deployment.metrics)
+        try:
+            kw = kwargs if isinstance(kwargs, dict) else {}
+            req_id, call_id, active_req = self._get_request_identity(kw)
+            if not req_id and not call_id:
+                return
+
+            _, deployment = self._extract_deployment(kw, response_obj)
+
+            if active_req:
+                with active_req.lock:
+                    if call_id:
+                        attempt_id = call_id
+                    elif kw.get("ntg_attempt_id"):
+                        attempt_id = kw["ntg_attempt_id"]
+                    elif active_req.active_dispatch_id:
+                        attempt_id = active_req.active_dispatch_id
+                        active_req.active_dispatch_id = None
                     else:
-                        self.router.unknown_metrics.record_attempt()
-                        self.router.state_manager.record_metrics("unknown", self.router.unknown_metrics)
-        else:
-            recorded = getattr(self.router._request_context, "recorded_call_ids", None)
-            if recorded is not None and isinstance(recorded, set):
-                if call_id not in recorded:
-                    recorded.add(call_id)
+                        active_req.dispatch_counter += 1
+                        attempt_id = f"{active_req.request_id}_dispatch_{active_req.dispatch_counter}"
+
+                    if attempt_id not in active_req.recorded_attempt_ids:
+                        active_req.recorded_attempt_ids.add(attempt_id)
+                        if deployment:
+                            active_req.attempted_deployments.append(deployment)
+                            deployment.record_attempt()
+                            router.state_manager.record_metrics(deployment.id, deployment.metrics)
+                        else:
+                            router.unknown_metrics.record_attempt()
+                            router.state_manager.record_metrics("unknown", router.unknown_metrics)
+            else:
+                recorded = getattr(router._request_context, "recorded_call_ids", None)
+                if recorded is not None and isinstance(recorded, set):
+                    if call_id and call_id in recorded:
+                        pass
+                    elif call_id:
+                        recorded.add(call_id)
+                        if deployment:
+                            router._record_request_attempt(deployment)
+                        else:
+                            router.unknown_metrics.record_attempt()
+                elif not call_id:
                     if deployment:
-                        self.router._record_request_attempt(deployment)
+                        router._record_request_attempt(deployment)
                     else:
-                        self.router.unknown_metrics.record_attempt()
-            elif not call_id:
-                if deployment:
-                    self.router._record_request_attempt(deployment)
-                else:
-                    self.router.unknown_metrics.record_attempt()
+                        router.unknown_metrics.record_attempt()
 
-        if deployment:
-            deployment.metrics.record_success()
-            deployment.record_success()
+            if deployment:
+                deployment.metrics.record_success()
+                deployment.record_success(request_id=req_id)
 
-            # Parse headers from response or kwargs to update normalized quota metadata
-            headers = None
-            if response_obj is not None:
-                headers = getattr(response_obj, "_response_headers", None) or getattr(response_obj, "headers", None)
-            if not headers and isinstance(kwargs, dict):
-                headers = kwargs.get("response_headers")
+                headers = None
+                if response_obj is not None:
+                    headers = getattr(response_obj, "_response_headers", None) or getattr(response_obj, "headers", None)
+                if not headers and isinstance(kw, dict):
+                    headers = kw.get("response_headers")
 
-            if headers:
-                deployment.quota.update_from_headers(
-                    headers,
-                    provider=deployment.provider,
-                    model=deployment.model,
-                )
-                self.router.state_manager.record_quota(deployment.id, deployment.quota)
+                if headers:
+                    deployment.quota.update_from_headers(
+                        headers,
+                        provider=deployment.provider,
+                        model=deployment.model,
+                    )
+                    router.state_manager.record_quota(deployment.id, deployment.quota)
 
-            # Record healthy circuit state and update persisted state
-            self.router.state_manager.record_circuit_state(deployment.id, CircuitState.HEALTHY)
-            self.router.state_manager.record_metrics(deployment.id, deployment.metrics)
+                router.state_manager.record_circuit_state(deployment.id, CircuitState.HEALTHY)
+                router.state_manager.record_metrics(deployment.id, deployment.metrics)
 
-            # Request-local deployment attribution stamped directly onto response instance
-            if response_obj is not None:
-                try:
-                    setattr(response_obj, "_ntg_deployment", deployment)
-                except Exception:
-                    pass
-        else:
-            self.router.unknown_metrics.record_success()
-            self.router.state_manager.record_metrics("unknown", self.router.unknown_metrics)
+                if response_obj is not None:
+                    try:
+                        setattr(response_obj, "_ntg_deployment", deployment)
+                    except Exception:
+                        pass
+            else:
+                router.unknown_metrics.record_success()
+                router.state_manager.record_metrics("unknown", router.unknown_metrics)
+        except Exception as e:
+            logger.warning("Error in NTGTelemetryLogger.log_success_event: %s", e)
 
     def log_failure_event(self, kwargs: dict, response_obj: Any, start_time: Any, end_time: Any) -> None:
         """Handle upstream failure callback with granular error classification."""
-        req_id, call_id = self._get_request_identity(kwargs if isinstance(kwargs, dict) else None)
-        _, deployment = self._extract_deployment(kwargs, response_obj)
-
-        exc = kwargs.get("exception") if isinstance(kwargs, dict) else None
-        if not exc and isinstance(response_obj, Exception):
-            exc = response_obj
-
-        active_req = self.router._get_active_request(req_id)
-        if active_req:
-            with active_req.lock:
-                if call_id not in active_req.recorded_attempt_ids:
-                    active_req.recorded_attempt_ids.add(call_id)
-                    if deployment:
-                        active_req.attempted_deployments.append(deployment)
-                        deployment.record_attempt()
-                        self.router.state_manager.record_metrics(deployment.id, deployment.metrics)
-                    else:
-                        self.router.unknown_metrics.record_attempt()
-                        self.router.state_manager.record_metrics("unknown", self.router.unknown_metrics)
-        else:
-            recorded = getattr(self.router._request_context, "recorded_call_ids", None)
-            if recorded is not None and isinstance(recorded, set):
-                if call_id not in recorded:
-                    recorded.add(call_id)
-                    if deployment:
-                        self.router._record_request_attempt(deployment)
-                    else:
-                        self.router.unknown_metrics.record_attempt()
-            elif not call_id:
-                if deployment:
-                    self.router._record_request_attempt(deployment)
-                else:
-                    self.router.unknown_metrics.record_attempt()
-
-        if not deployment:
-            self.router.unknown_metrics.record_failure()
-            self.router.state_manager.record_metrics("unknown", self.router.unknown_metrics)
+        router = self.router
+        if router is None:
             return
 
-        if exc:
-            info = parse_provider_error(exc, provider=deployment.provider)
+        try:
+            kw = kwargs if isinstance(kwargs, dict) else {}
+            req_id, call_id, active_req = self._get_request_identity(kw)
+            if not req_id and not call_id:
+                return
 
-            # Update normalized quota metadata (Rule 4, 8)
-            deployment.update_quota(
-                rpm_limit=info.rpm_limit,
-                rpm_remaining=info.rpm_remaining,
-                rpd_limit=info.rpd_limit,
-                rpd_remaining=info.rpd_remaining,
-                reset_at=info.reset_timestamp,
-                retry_after=info.cooldown_seconds,
-                quota_scope=info.quota_scope,
-                limit_type=info.limit_type,
+            _, deployment = self._extract_deployment(kw, response_obj)
+            exc = kw.get("exception") if isinstance(kw, dict) else None
+            if not exc and isinstance(response_obj, Exception):
+                exc = response_obj
+
+            if active_req:
+                with active_req.lock:
+                    if call_id:
+                        attempt_id = call_id
+                    elif kw.get("ntg_attempt_id"):
+                        attempt_id = kw["ntg_attempt_id"]
+                    elif active_req.active_dispatch_id:
+                        attempt_id = active_req.active_dispatch_id
+                        active_req.active_dispatch_id = None
+                    else:
+                        active_req.dispatch_counter += 1
+                        attempt_id = f"{active_req.request_id}_dispatch_{active_req.dispatch_counter}"
+
+                    if attempt_id not in active_req.recorded_attempt_ids:
+                        active_req.recorded_attempt_ids.add(attempt_id)
+                        if deployment:
+                            active_req.attempted_deployments.append(deployment)
+                            deployment.record_attempt()
+                            router.state_manager.record_metrics(deployment.id, deployment.metrics)
+                        else:
+                            router.unknown_metrics.record_attempt()
+                            router.state_manager.record_metrics("unknown", router.unknown_metrics)
+            else:
+                recorded = getattr(router._request_context, "recorded_call_ids", None)
+                if recorded is not None and isinstance(recorded, set):
+                    if call_id and call_id in recorded:
+                        pass
+                    elif call_id:
+                        recorded.add(call_id)
+                        if deployment:
+                            router._record_request_attempt(deployment)
+                        else:
+                            router.unknown_metrics.record_attempt()
+                elif not call_id:
+                    if deployment:
+                        router._record_request_attempt(deployment)
+                    else:
+                        router.unknown_metrics.record_attempt()
+
+            if not deployment:
+                router.unknown_metrics.record_failure()
+                router.state_manager.record_metrics("unknown", router.unknown_metrics)
+                return
+
+            # Check if this failure callback is from an older dispatch than deployment's current state
+            dispatched_at = 0.0
+            if active_req and active_req.dispatched_at > 0:
+                dispatched_at = active_req.dispatched_at
+            elif isinstance(start_time, (int, float)) and start_time > 0:
+                dispatched_at = float(start_time)
+            elif hasattr(start_time, "timestamp"):
+                try:
+                    dispatched_at = start_time.timestamp()
+                except Exception:
+                    pass
+            elif isinstance(kw.get("start_time"), (int, float)):
+                dispatched_at = float(kw["start_time"])
+
+            is_late_callback = bool(
+                dispatched_at > 0
+                and deployment.state_updated_at > dispatched_at
+                and deployment.circuit_state == CircuitState.HEALTHY
             )
-            self.router.state_manager.record_quota(deployment.id, deployment.quota)
 
-            # Error categorization & metrics
-            if info.category in (CATEGORY_PROVIDER_LIMIT, CATEGORY_DAILY_QUOTA, CATEGORY_UNKNOWN_LIMIT):
-                deployment.metrics.record_rate_limit()
-                deployment.metrics.record_failure()
-            elif info.category == CATEGORY_AUTH_ERROR:
-                deployment.metrics.record_auth_failure()
-                deployment.metrics.record_failure()
-            else:
-                deployment.metrics.record_failure()
+            if exc:
+                info = parse_provider_error(exc, provider=deployment.provider)
 
-            # NTG Confirmed Authentication Failure Quarantine (Rule 1, 2, 8)
-            if info.category == CATEGORY_AUTH_ERROR:
-                deployment.half_open_probes = 0
-                if hasattr(deployment, "_active_probe_request_ids"):
-                    deployment._active_probe_request_ids.clear()
-                safe_reason = sanitize_secret(f"Authentication failure: {info.message}", deployment.api_key)
-                self.router._propagate_account_auth_quarantine(
-                    provider=deployment.provider,
-                    account=deployment.account,
-                    reason=safe_reason,
-                    failed_key=deployment.api_key,
-                )
-
-            # NTG General Quarantine (e.g. 404 Model Not Found)
-            elif info.should_quarantine:
-                deployment.circuit_state = CircuitState.QUARANTINED
-                deployment.half_open_probes = 0
-                if hasattr(deployment, "_active_probe_request_ids"):
-                    deployment._active_probe_request_ids.clear()
-                deployment.state_reason = sanitize_secret(f"Model unavailable: {info.message}", deployment.api_key)
-                self.router.state_manager.record_quarantine(
-                    deployment.id, deployment.state_reason, state=CircuitState.QUARANTINED
-                )
-                self.router.state_manager.record_circuit_state(
-                    deployment.id, CircuitState.QUARANTINED, reason=deployment.state_reason
-                )
-
-            # NTG Authoritative Rate Limit / Quota Exhaustion handling (429, daily, rpm, etc.)
-            elif info.status_code == 429 or info.category in (
-                CATEGORY_DAILY_QUOTA,
-                CATEGORY_PROVIDER_LIMIT,
-                CATEGORY_UNKNOWN_LIMIT,
-            ):
-                deployment.circuit_state = CircuitState.OPEN
-                deployment.half_open_probes = 0
-                if hasattr(deployment, "_active_probe_request_ids"):
-                    deployment._active_probe_request_ids.clear()
-                deployment.quota.reset_at = info.reset_timestamp
-                deployment.quota.retry_after = info.cooldown_seconds
-                deployment.state_reason = (
-                    f"Daily quota exhausted: {info.message}"
-                    if info.category == CATEGORY_DAILY_QUOTA
-                    else f"Rate limit reached ({info.limit_type}): {info.message}"
-                )
-                self.router.state_manager.record_cooldown(
-                    deployment.id,
-                    cooldown_seconds_or_until=deployment.quota.reset_at,
-                    reason_or_limit_type=info.limit_type or "429",
-                    reset_timestamp=deployment.quota.reset_at,
+                # Update normalized quota metadata
+                deployment.update_quota(
+                    rpm_limit=info.rpm_limit,
+                    rpm_remaining=info.rpm_remaining,
+                    rpd_limit=info.rpd_limit,
+                    rpd_remaining=info.rpd_remaining,
+                    reset_at=info.reset_timestamp,
+                    retry_after=info.cooldown_seconds,
                     quota_scope=info.quota_scope,
+                    limit_type=info.limit_type,
                 )
-                self.router.state_manager.record_circuit_state(
-                    deployment.id, CircuitState.OPEN, reason=deployment.state_reason
-                )
+                router.state_manager.record_quota(deployment.id, deployment.quota)
 
-                if info.quota_scope in (QuotaScope.ACCOUNT, QuotaScope.PROVIDER):
-                    self.router._propagate_account_quota_exhaustion(
-                        deployment.provider,
-                        deployment.account,
-                        deployment.quota.reset_at,
-                        info.message,
+                # Error categorization & metrics
+                if info.category in (CATEGORY_PROVIDER_LIMIT, CATEGORY_DAILY_QUOTA, CATEGORY_UNKNOWN_LIMIT):
+                    deployment.metrics.record_rate_limit()
+                    deployment.metrics.record_failure()
+                elif info.category == CATEGORY_AUTH_ERROR:
+                    deployment.metrics.record_auth_failure()
+                    deployment.metrics.record_failure()
+                else:
+                    deployment.metrics.record_failure()
+
+                if is_late_callback:
+                    # Late callback from previous cycle: do not regress newer healthy state
+                    router.state_manager.record_metrics(deployment.id, deployment.metrics)
+                    return
+
+                # NTG Confirmed Authentication Failure Quarantine
+                if info.category == CATEGORY_AUTH_ERROR:
+                    safe_reason = sanitize_secret(f"Authentication failure: {info.message}", deployment.api_key)
+                    router._propagate_account_auth_quarantine(
+                        provider=deployment.provider,
+                        account=deployment.account,
+                        reason=safe_reason,
+                        failed_key=deployment.api_key,
                     )
 
-            elif info.category == CATEGORY_REQUEST_ERROR:
-                pass
+                # NTG General Quarantine (e.g. 404 Model Not Found)
+                elif info.should_quarantine:
+                    safe_reason = sanitize_secret(f"Model unavailable: {info.message}", deployment.api_key)
+                    deployment.transition_to_quarantine(reason=safe_reason, state=CircuitState.QUARANTINED)
+                    router.state_manager.record_quarantine(
+                        deployment.id, deployment.state_reason, state=CircuitState.QUARANTINED
+                    )
+                    router.state_manager.record_circuit_state(
+                        deployment.id, CircuitState.QUARANTINED, reason=deployment.state_reason
+                    )
+                    router._sync_router_model_pool()
 
-            else:
-                deployment.record_failure()
-                if deployment.circuit_state == CircuitState.OPEN:
-                    self.router.state_manager.record_circuit_state(
+                # NTG Authoritative Rate Limit / Quota Exhaustion handling
+                elif info.status_code == 429 or info.category in (
+                    CATEGORY_DAILY_QUOTA,
+                    CATEGORY_PROVIDER_LIMIT,
+                    CATEGORY_UNKNOWN_LIMIT,
+                ):
+                    rate_reason = (
+                        f"Daily quota exhausted: {info.message}"
+                        if info.category == CATEGORY_DAILY_QUOTA
+                        else f"Rate limit reached ({info.limit_type}): {info.message}"
+                    )
+                    deployment.transition_to_open(
+                        cooldown_seconds=info.cooldown_seconds,
+                        reason=rate_reason,
+                        reset_at=info.reset_timestamp,
+                        request_id=req_id,
+                    )
+                    router.state_manager.record_cooldown(
                         deployment.id,
-                        CircuitState.OPEN,
-                        reason=deployment.state_reason or "Qualifying upstream failure",
-                        recovery_time=deployment.circuit_open_until,
+                        cooldown_seconds_or_until=deployment.quota.reset_at,
+                        reason_or_limit_type=info.limit_type or "429",
+                        reset_timestamp=deployment.quota.reset_at,
+                        quota_scope=info.quota_scope,
                     )
-        else:
-            deployment.record_failure()
-            if deployment.circuit_state == CircuitState.OPEN:
-                self.router.state_manager.record_circuit_state(
-                    deployment.id,
-                    CircuitState.OPEN,
-                    reason=deployment.state_reason or "Qualifying upstream failure",
-                    recovery_time=deployment.circuit_open_until,
-                )
-            deployment.metrics.record_failure()
+                    router.state_manager.record_circuit_state(
+                        deployment.id, CircuitState.OPEN, reason=deployment.state_reason
+                    )
 
-        self.router.state_manager.record_metrics(deployment.id, deployment.metrics)
+                    if info.quota_scope in (QuotaScope.ACCOUNT, QuotaScope.PROVIDER):
+                        router._propagate_account_quota_exhaustion(
+                            deployment.provider,
+                            deployment.account,
+                            deployment.quota.reset_at,
+                            info.message,
+                        )
+                    else:
+                        router._sync_router_model_pool()
 
+                elif info.category == CATEGORY_REQUEST_ERROR:
+                    pass
+
+                else:
+                    deployment.record_failure(request_id=req_id)
+                    if deployment.circuit_state == CircuitState.OPEN:
+                        router.state_manager.record_circuit_state(
+                            deployment.id,
+                            CircuitState.OPEN,
+                            reason=deployment.state_reason or "Qualifying upstream failure",
+                            recovery_time=deployment.circuit_open_until,
+                        )
+                        router._sync_router_model_pool()
+            else:
+                deployment.metrics.record_failure()
+                if not is_late_callback:
+                    deployment.record_failure(request_id=req_id)
+                    if deployment.circuit_state == CircuitState.OPEN:
+                        router.state_manager.record_circuit_state(
+                            deployment.id,
+                            CircuitState.OPEN,
+                            reason=deployment.state_reason or "Qualifying upstream failure",
+                            recovery_time=deployment.circuit_open_until,
+                        )
+                        router._sync_router_model_pool()
+
+            router.state_manager.record_metrics(deployment.id, deployment.metrics)
+        except Exception as e:
+            logger.warning("Error in NTGTelemetryLogger.log_failure_event: %s", e)
 
     async def async_log_pre_api_call(self, model: Any, messages: Any, kwargs: Any = None) -> None:
         """Async LiteLLM pre-API call callback: delegates to log_pre_api_call."""
@@ -716,23 +826,71 @@ class UnifiedNTGRouter:
         self._active_requests_lock = threading.Lock()
         self.unknown_metrics = DeploymentMetrics()
 
+        self.router_id = uuid.uuid4().hex[:8]
+
         # 7. Register telemetry and circuit breaker callback via public litellm.callbacks contract
         self.telemetry_logger = NTGTelemetryLogger(self)
-        litellm.callbacks = [
-            cb for cb in litellm.callbacks
-            if not (isinstance(cb, NTGTelemetryLogger) and getattr(cb, "router", None) is self)
-        ]
+
+        def _keep_cb(cb: Any) -> bool:
+            if not isinstance(cb, NTGTelemetryLogger):
+                return True
+            owner = getattr(cb, "router", None)
+            if owner is None or owner is self:
+                return False
+            return True
+
+        litellm.callbacks = [cb for cb in litellm.callbacks if _keep_cb(cb)]
         litellm.callbacks.append(self.telemetry_logger)
-        litellm.input_callback = [
-            cb for cb in litellm.input_callback
-            if not (isinstance(cb, NTGTelemetryLogger) and getattr(cb, "router", None) is self)
-        ]
+        litellm.input_callback = [cb for cb in litellm.input_callback if _keep_cb(cb)]
         litellm.input_callback.append(self.telemetry_logger)
+
+    def close(self) -> None:
+        """Deregister callbacks and release resources."""
+        if hasattr(self, "telemetry_logger") and self.telemetry_logger:
+            litellm.callbacks = [cb for cb in litellm.callbacks if cb is not self.telemetry_logger]
+            litellm.input_callback = [cb for cb in litellm.input_callback if cb is not self.telemetry_logger]
+        with self._active_requests_lock:
+            self._active_requests.clear()
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
+
+    def add_deployment(self, deployment: Deployment) -> None:
+        """Add a deployment to the router and synchronize the LiteLLM model pool."""
+        self.state_manager.apply_to_deployment(deployment)
+        deployment.metrics = self.state_manager.get_metrics(deployment.id)
+        if deployment not in self.deployments:
+            self.deployments.append(deployment)
+        self.deployment_map[deployment.id] = deployment
+        self._sync_router_model_pool()
+
+    def remove_deployment(self, deployment_id: str) -> bool:
+        """Remove a deployment from the router and synchronize the LiteLLM model pool."""
+        initial_len = len(self.deployments)
+        self.deployments = [d for d in self.deployments if d.id != deployment_id]
+        self.deployment_map.pop(deployment_id, None)
+        if len(self.deployments) < initial_len:
+            self._sync_router_model_pool()
+            return True
+        return False
+
+    def update_deployment(self, deployment: Deployment) -> bool:
+        """Update an existing deployment and synchronize the LiteLLM model pool."""
+        for i, d in enumerate(self.deployments):
+            if d.id == deployment.id:
+                self.deployments[i] = deployment
+                self.deployment_map[deployment.id] = deployment
+                self._sync_router_model_pool()
+                return True
+        return False
 
     def _register_active_request(self, request_id: str, selected_dep: Optional[Deployment] = None) -> ActiveRequest:
         """Register active request context for cross-thread attempt coordination."""
         with self._active_requests_lock:
-            req = ActiveRequest(request_id=request_id, selected_dep=selected_dep)
+            req = ActiveRequest(request_id=request_id, router_id=self.router_id, selected_dep=selected_dep)
             self._active_requests[request_id] = req
             return req
 
@@ -762,13 +920,15 @@ class UnifiedNTGRouter:
             if self._last_pool_fingerprint == pool_fingerprint:
                 return
 
+            self.deployment_map = {dep.id: dep for dep in self.deployments}
+
             models: List[Dict[str, Any]] = []
             registered_pairs: Set[tuple[str, str]] = set()
 
             for dep in self.deployments:
                 if not dep.api_key or not dep.api_key.strip():
                     continue
-                if dep.is_quarantined:
+                if dep.is_quarantined or not dep.available:
                     continue
 
                 litellm_dict = dep.to_litellm_dict()
@@ -821,12 +981,11 @@ class UnifiedNTGRouter:
         """
         for dep in self.deployments:
             if dep.provider == provider and dep.account == account:
-                dep.circuit_state = CircuitState.AUTH_FAILED
-                dep.half_open_probes = 0
-                key_to_hash = failed_key or dep.api_key or ""
-                if key_to_hash:
-                    dep.auth_failed_key_hash = hashlib.sha256(key_to_hash.encode("utf-8")).hexdigest()
-                dep.state_reason = sanitize_secret(reason, dep.api_key)
+                dep.transition_to_quarantine(
+                    reason=reason,
+                    state=CircuitState.AUTH_FAILED,
+                    failed_key=failed_key,
+                )
                 self.state_manager.record_quarantine(
                     dep.id,
                     dep.state_reason,
@@ -837,6 +996,7 @@ class UnifiedNTGRouter:
                     CircuitState.AUTH_FAILED,
                     reason=dep.state_reason,
                 )
+        self._sync_router_model_pool()
 
     def _probe_deployment_credentials(self, deployment: Deployment) -> bool:
         """Probe deployment credentials with a minimal lightweight request."""
@@ -894,17 +1054,15 @@ class UnifiedNTGRouter:
         success = probe(dep)
 
         if success:
-            dep.circuit_state = CircuitState.HEALTHY
-            dep.state_reason = "Credentials revalidated; returned to service"
-            dep.auth_failed_key_hash = None
-            dep.auth_probe_backoff = 300.0
-            dep.consecutive_failures = 0
+            dep.transition_to_healthy(reason="Credentials revalidated; returned to service")
             self.state_manager.record_success(dep.id)
             self.state_manager.record_circuit_state(dep.id, CircuitState.HEALTHY, reason=dep.state_reason)
+            self._sync_router_model_pool()
             return True
         else:
-            dep.auth_probe_backoff = min(3600.0, dep.auth_probe_backoff * 2.0)
-            dep.state_reason = "Revalidation probe failed: credentials invalid"
+            with dep._state_lock:
+                dep.auth_probe_backoff = min(3600.0, dep.auth_probe_backoff * 2.0)
+                dep.state_reason = "Revalidation probe failed: credentials invalid"
             self.state_manager.record_circuit_state(dep.id, CircuitState.AUTH_FAILED, reason=dep.state_reason)
             return False
 
@@ -929,11 +1087,7 @@ class UnifiedNTGRouter:
         results: Dict[str, bool] = {}
         for dep in account_deps:
             if success:
-                dep.circuit_state = CircuitState.HEALTHY
-                dep.state_reason = "Account credentials revalidated; returned to service"
-                dep.auth_failed_key_hash = None
-                dep.auth_probe_backoff = 300.0
-                dep.consecutive_failures = 0
+                dep.transition_to_healthy(reason="Account credentials revalidated; returned to service")
                 self.state_manager.record_success(dep.id)
                 self.state_manager.record_circuit_state(dep.id, CircuitState.HEALTHY, reason=dep.state_reason)
                 results[dep.id] = True
@@ -941,6 +1095,7 @@ class UnifiedNTGRouter:
                 results[dep.id] = False
 
         if success:
+            self._sync_router_model_pool()
             try:
                 self.rediscover_models(provider=provider, account=account, force=True)
             except Exception:
@@ -1034,6 +1189,7 @@ class UnifiedNTGRouter:
                 except Exception as err:
                     results["failed"][f"{MODEL_GROUP_GEMINI}_{acc_name}"] = sanitize_secret(str(err), key)
 
+        self._sync_router_model_pool()
         return results
 
     def reset_auth_quarantine(
@@ -1052,14 +1208,12 @@ class UnifiedNTGRouter:
             if account and dep.account != account:
                 continue
             if dep.is_quarantined:
-                dep.circuit_state = CircuitState.HEALTHY
-                dep.state_reason = "Authentication quarantine reset administratively"
-                dep.auth_failed_key_hash = None
-                dep.auth_probe_backoff = 300.0
-                dep.consecutive_failures = 0
+                dep.transition_to_healthy(reason="Authentication quarantine reset administratively")
                 self.state_manager.record_success(dep.id)
                 self.state_manager.record_circuit_state(dep.id, CircuitState.HEALTHY, reason=dep.state_reason)
                 reset_count += 1
+        if reset_count > 0:
+            self._sync_router_model_pool()
         return reset_count
 
     def _propagate_account_quota_exhaustion(
@@ -1075,14 +1229,18 @@ class UnifiedNTGRouter:
         the exhausted account's deployments are excluded from future candidate pools until reset.
         LiteLLM manages its own routing-level cooldowns without internal cache tampering.
         """
+        now = time.time()
+        cooldown = max(0.0, reset_at - now)
         for dep in self.deployments:
             if dep.provider == provider and dep.account == account:
-                dep.circuit_state = CircuitState.OPEN
-                dep.half_open_probes = 0
-                dep.quota.reset_at = reset_at
-                dep.state_reason = reason
+                dep.transition_to_open(
+                    cooldown_seconds=cooldown,
+                    reason=reason,
+                    reset_at=reset_at,
+                )
                 self.state_manager.record_cooldown(dep.id, reset_at, "account_quota")
-                self.state_manager.record_circuit_state(dep.id, CircuitState.OPEN)
+                self.state_manager.record_circuit_state(dep.id, CircuitState.OPEN, reason=reason)
+        self._sync_router_model_pool()
 
     def _propagate_account_cooldown(
         self,
@@ -1312,12 +1470,27 @@ class UnifiedNTGRouter:
             chosen_id = chosen.get("model_info", {}).get("id") or chosen.get("model_name")
             selected_dep = self.deployment_map.get(chosen_id, candidates[0])
 
+        # Safe revalidation: verify that selected_dep is still eligible
+        if not selected_dep.is_eligible(ts):
+            still_eligible = [d for d in candidates if d.is_eligible(ts)]
+            if still_eligible:
+                selected_dep = still_eligible[0]
+            else:
+                return None, None, []
+
         if user_specified_dests is not None:
             remaining_fallbacks = [dst for dst in user_specified_dests if dst != selected_dep.id]
         else:
             remaining_fallbacks = [d.id for d in fallback_pool if d.id != selected_dep.id]
 
-        fallbacks = [{selected_dep.id: remaining_fallbacks}] if remaining_fallbacks else None
+        seen_fb = set()
+        clean_fallbacks = []
+        for dst in remaining_fallbacks:
+            if dst not in seen_fb and dst != selected_dep.id:
+                seen_fb.add(dst)
+                clean_fallbacks.append(dst)
+
+        fallbacks = [{selected_dep.id: clean_fallbacks}] if clean_fallbacks else None
 
         return selected_dep, fallbacks, primary_eligible
 
@@ -1351,6 +1524,7 @@ class UnifiedNTGRouter:
         - authentication quarantine (CircuitState.QUARANTINED)
         - quota exhaustion or cooldown timers
         - request capability requirements.
+        Rejects unknown sources or destinations with ValueError.
         """
         ts = now if now is not None else time.time()
         dep_by_id = {d.id: d for d in self.deployments}
@@ -1359,16 +1533,24 @@ class UnifiedNTGRouter:
             dep_by_group.setdefault(d.logical_model, []).append(d)
             dep_by_group.setdefault(d.model, []).append(d)
 
+        valid_sources_and_dests = set(dep_by_id.keys()) | set(dep_by_group.keys()) | {
+            "auto", "ntg-auto", MODEL_GROUP_AUTO, MODEL_GROUP_NTG_AUTO
+        }
+
         validated: List[Dict[str, List[str]]] = []
         if isinstance(user_fallbacks, list):
             for item in user_fallbacks:
                 if not isinstance(item, dict):
-                    continue
+                    raise ValueError(f"Invalid fallback mapping: expected dict, got {type(item).__name__}")
                 for src, dst_list in item.items():
+                    if src not in valid_sources_and_dests:
+                        continue
                     if not isinstance(dst_list, list):
                         continue
                     clean_dst: List[str] = []
                     for dst in dst_list:
+                        if dst not in valid_sources_and_dests:
+                            continue
                         candidates: List[Deployment] = []
                         if dst in dep_by_id:
                             candidates = [dep_by_id[dst]]
@@ -1479,6 +1661,42 @@ class UnifiedNTGRouter:
         # Never guess or invent attribution
         return None
 
+    def _record_user_request_metric(
+        self,
+        active_req: Optional[ActiveRequest],
+        fulfilling_dep: Optional[Deployment],
+        selected_dep: Optional[Deployment],
+    ) -> None:
+        """Atomically increment user_requests metric exactly once for this public request."""
+        if active_req:
+            with active_req.lock:
+                if active_req.user_request_recorded:
+                    return
+                active_req.user_request_recorded = True
+
+            attempted = (
+                active_req.attempted_deployments
+                if active_req.attempted_deployments
+                else getattr(self._request_context, "attempted_deployments", [])
+            )
+        else:
+            attempted = getattr(self._request_context, "attempted_deployments", [])
+
+        target_dep = None
+        if fulfilling_dep:
+            target_dep = fulfilling_dep
+        elif selected_dep and selected_dep in attempted and len(attempted) == 1:
+            target_dep = selected_dep
+        elif len(attempted) == 1:
+            target_dep = attempted[0]
+
+        if target_dep:
+            target_dep.record_user_request()
+            self.state_manager.record_metrics(target_dep.id, target_dep.metrics)
+        else:
+            self.unknown_metrics.increment_user_requests()
+            self.state_manager.record_metrics("unknown", self.unknown_metrics)
+
     def ask(
         self,
         prompt: str,
@@ -1532,6 +1750,8 @@ class UnifiedNTGRouter:
         if not selected_dep:
             for dep in claimed_probes:
                 dep.release_half_open_probe(request_id=request_id)
+            self.unknown_metrics.increment_user_requests()
+            self.state_manager.record_metrics("unknown", self.unknown_metrics)
             print_divider("NO ELIGIBLE DEPLOYMENTS")
             print(f"No available deployments satisfy request for model group '{target_model}'")
             print(f"Required capabilities: {reqs.describe()}")
@@ -1551,6 +1771,7 @@ class UnifiedNTGRouter:
             call_kwargs["fallbacks"] = fallbacks
         meta = dict(call_kwargs.get("metadata", {}) or {})
         meta["ntg_request_id"] = request_id
+        meta["ntg_router_id"] = self.router_id
         call_kwargs["metadata"] = meta
 
         active_req = self._register_active_request(request_id, selected_dep)
@@ -1566,21 +1787,7 @@ class UnifiedNTGRouter:
 
             # Retrieve fulfilling deployment strictly from verified response metadata
             deployment = self._get_response_deployment(response, eligible)
-            attempted = active_req.attempted_deployments if active_req.attempted_deployments else getattr(self._request_context, "attempted_deployments", [])
-
-            if deployment:
-                deployment.record_user_request()
-                self.state_manager.record_metrics(deployment.id, deployment.metrics)
-            elif selected_dep and selected_dep in attempted:
-                selected_dep.record_user_request()
-                self.state_manager.record_metrics(selected_dep.id, selected_dep.metrics)
-            elif len(attempted) == 1:
-                target_dep = attempted[0]
-                target_dep.record_user_request()
-                self.state_manager.record_metrics(target_dep.id, target_dep.metrics)
-            else:
-                self.unknown_metrics.increment_user_requests()
-                self.state_manager.record_metrics("unknown", self.unknown_metrics)
+            self._record_user_request_metric(active_req, deployment, selected_dep)
 
             if hasattr(response, "choices") and response.choices:
                 print("\n" + str(response.choices[0].message.content))
@@ -1591,18 +1798,7 @@ class UnifiedNTGRouter:
             return response
 
         except Exception as error:
-            attempted = active_req.attempted_deployments if active_req.attempted_deployments else getattr(self._request_context, "attempted_deployments", [])
-            target_dep = None
-            if selected_dep and selected_dep in attempted:
-                target_dep = selected_dep
-            elif len(attempted) == 1:
-                target_dep = attempted[0]
-            if target_dep:
-                target_dep.record_user_request()
-                self.state_manager.record_metrics(target_dep.id, target_dep.metrics)
-            else:
-                self.unknown_metrics.increment_user_requests()
-                self.state_manager.record_metrics("unknown", self.unknown_metrics)
+            self._record_user_request_metric(active_req, None, selected_dep)
 
             print_divider("ALL ELIGIBLE DEPLOYMENTS EXHAUSTED")
             print(f"Request failed across healthy deployments for model group '{target_model}'.")
@@ -1611,6 +1807,7 @@ class UnifiedNTGRouter:
             return None
 
         finally:
+            self._record_user_request_metric(active_req, None, selected_dep)
             attempted = active_req.attempted_deployments if active_req.attempted_deployments else getattr(self._request_context, "attempted_deployments", [])
             attempted_ids = {d.id for d in attempted}
             for dep in claimed_probes:
@@ -1676,6 +1873,8 @@ class UnifiedNTGRouter:
         if not selected_dep:
             for dep in claimed_probes:
                 dep.release_half_open_probe(request_id=request_id)
+            self.unknown_metrics.increment_user_requests()
+            self.state_manager.record_metrics("unknown", self.unknown_metrics)
             raise NoEligibleDeploymentsError(
                 f"No eligible deployments for model='{target_model}' satisfying requirements: "
                 f"{reqs.describe()}."
@@ -1687,6 +1886,7 @@ class UnifiedNTGRouter:
             call_kwargs["fallbacks"] = fallbacks
         meta = dict(call_kwargs.get("metadata", {}) or {})
         meta["ntg_request_id"] = request_id
+        meta["ntg_router_id"] = self.router_id
         call_kwargs["metadata"] = meta
 
         active_req = self._register_active_request(request_id, selected_dep)
@@ -1701,38 +1901,14 @@ class UnifiedNTGRouter:
             )
 
             deployment = self._get_response_deployment(response, eligible)
-            attempted = active_req.attempted_deployments if active_req.attempted_deployments else getattr(self._request_context, "attempted_deployments", [])
-
-            if deployment:
-                deployment.record_user_request()
-                self.state_manager.record_metrics(deployment.id, deployment.metrics)
-            elif selected_dep and selected_dep in attempted:
-                selected_dep.record_user_request()
-                self.state_manager.record_metrics(selected_dep.id, selected_dep.metrics)
-            elif len(attempted) == 1:
-                target_dep = attempted[0]
-                target_dep.record_user_request()
-                self.state_manager.record_metrics(target_dep.id, target_dep.metrics)
-            else:
-                self.unknown_metrics.increment_user_requests()
-                self.state_manager.record_metrics("unknown", self.unknown_metrics)
+            self._record_user_request_metric(active_req, deployment, selected_dep)
 
             return response
         except Exception:
-            attempted = active_req.attempted_deployments if active_req.attempted_deployments else getattr(self._request_context, "attempted_deployments", [])
-            target_dep = None
-            if selected_dep and selected_dep in attempted:
-                target_dep = selected_dep
-            elif len(attempted) == 1:
-                target_dep = attempted[0]
-            if target_dep:
-                target_dep.record_user_request()
-                self.state_manager.record_metrics(target_dep.id, target_dep.metrics)
-            else:
-                self.unknown_metrics.increment_user_requests()
-                self.state_manager.record_metrics("unknown", self.unknown_metrics)
+            self._record_user_request_metric(active_req, None, selected_dep)
             raise
         finally:
+            self._record_user_request_metric(active_req, None, selected_dep)
             attempted = active_req.attempted_deployments if active_req.attempted_deployments else getattr(self._request_context, "attempted_deployments", [])
             attempted_ids = {d.id for d in attempted}
             for dep in claimed_probes:
