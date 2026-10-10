@@ -1,7 +1,12 @@
 """Architecture-aware AI coding agent, code intelligence, planning, and verification."""
 
 from ntg.agent.code_intelligence import CodeIntelligence
-from ntg.agent.orchestrator import ArchitectureAwareAgent, CodingAgent, query_directory
+from ntg.agent.orchestrator import (
+    ArchitectureAwareAgent,
+    CodingAgent,
+    query_directory,
+    query_directory_structured,
+)
 from ntg.agent.planner import (
     approve_plan,
     build_change_plan,
@@ -26,6 +31,7 @@ __all__ = [
     "ArchitectureAwareAgent",
     "CodingAgent",
     "query_directory",
+    "query_directory_structured",
     "CodeIntelligence",
     "extract_response_content",
     "build_planning_prompt",

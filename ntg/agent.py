@@ -7,6 +7,7 @@ from ntg.agent.orchestrator import (
     ArchitectureAwareAgent,
     CodingAgent,
     query_directory,
+    query_directory_structured,
 )
 from ntg.agent.planner import (
     approve_plan,
@@ -34,6 +35,7 @@ __all__ = [
     "CodeIntelligence",
     "CodeVerifier",
     "query_directory",
+    "query_directory_structured",
     "extract_response_content",
     "build_planning_prompt",
     "build_query_prompt",
@@ -49,4 +51,3 @@ __all__ = [
     "run_verification_command",
     "inspect_git_diff",
 ]
-

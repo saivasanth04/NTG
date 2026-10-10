@@ -1,11 +1,13 @@
-from ntg import ArchitectureAwareAgent, query_directory
+from typing import Any
+
+from ntg import ArchitectureAwareAgent, query_directory, query_directory_structured
 
 
 def answer_from_directory(directory: str, query: str, strict: bool = True) -> str:
     """
     1. Builds/verifies the Graphify knowledge graph, Codebase Memory MCP index, and AST inventory for `directory`.
     2. Routes the architecture-grounded prompt through UnifiedNTGRouter (Groq/Gemini/OpenRouter/etc.).
-    3. Validates file coverage and factual grounding, and returns the final answer with diagnostics.
+    3. Validates file coverage, AST description grounding, and dependency reading order, and returns the final answer string.
     """
     return query_directory(
         directory=directory,
@@ -13,8 +15,27 @@ def answer_from_directory(directory: str, query: str, strict: bool = True) -> st
         model="auto",              # or "groq", "gemini", "openrouter", "nvidia", "cohere"
         capabilities=["coding"],   # routes to coding-capable deployments
         auto_build_graph=True,     # automatically indexes/refreshes the directory when needed
-        strict=strict,             # refuses to mark answer complete if critical indexing/retrieval fails
+        strict=strict,             # refuses to mark answer complete if critical indexing/retrieval/validation fails
         include_diagnostics=True,  # appends verified index status, coverage, and retrieval diagnostics
+    )
+
+
+def structured_answer_from_directory(
+    directory: str,
+    query: str,
+    strict: bool = True,
+) -> dict[str, Any]:
+    """Retrieve the full structured result from `ArchitectureAwareAgent.ask()`, including
+    `answer`, `complete`, `status`, `validation`, `index_status`, `coverage`, and `errors`.
+    """
+    return query_directory_structured(
+        directory=directory,
+        query=query,
+        model="auto",
+        capabilities=["coding"],
+        auto_build_graph=True,
+        strict=strict,
+        include_diagnostics=True,
     )
 
 

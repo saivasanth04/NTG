@@ -72,6 +72,7 @@ class ArchitectureAwareAgent:
         self.default_capabilities = (
             list(default_capabilities) if default_capabilities is not None else None
         )
+        self.last_result: dict[str, Any] | None = None
 
     @property
     def router(self) -> UnifiedNTGRouter | Any:
@@ -219,7 +220,9 @@ class ArchitectureAwareAgent:
             if ".git" in rel_parts:
                 raise ValueError(f"Refusing to modify .git directory: {raw_path}")
 
-            resolved_writes.append((target, str(rel_path).replace("\\", "/"), new_content))
+            resolved_writes.append(
+                (target, str(rel_path).replace("\\", "/"), new_content)
+            )
 
         changed_rel_paths: list[str] = []
         for target_path, rel_str, content in resolved_writes:
@@ -319,6 +322,19 @@ class ArchitectureAwareAgent:
     ) -> dict[str, Any]:
         """Answer a natural-language query about `self.repo_root` using Graphify,
         Codebase Memory MCP, deterministic AST inventory, and UnifiedNTGRouter.
+
+        Returns a structured dictionary containing:
+        - `answer`: Finalized grounded answer string (with degraded banner/diagnostics if incomplete)
+        - `raw_answer`: Raw LLM response string prior to supplementation/diagnostics
+        - `complete`: Boolean indicating whether all index, coverage, description, and ordering checks passed
+        - `status`: `"complete"` when `complete=True`, `"degraded"` when critical retrieval/indexing failed,
+          or `"incomplete"` when answer coverage/grounding/ordering checks reported warnings
+        - `validation`: Detailed validation dictionary (`description_validation`, `ordering_validation`,
+          `unsupported_claims`, `ungrounded_descriptions`, `ordering_violations`, `uncertainty_notes`, etc.)
+        - `initial_validation`: Pre-supplementation validation dictionary
+        - `index_status`: Per-index freshness and SHA-256 fingerprint verification status
+        - `coverage`: Repository file coverage and exclusion counts
+        - `errors`: List of retrieval or indexing error strings
         """
         if not isinstance(query, str) or not query.strip():
             raise ValueError("query must be a non-empty string.")
@@ -355,14 +371,21 @@ class ArchitectureAwareAgent:
             query=query,
             context=context,
         )
-        return {
+        if final_validation["complete"]:
+            overall_status = "complete"
+        elif final_validation["critical_retrieval_failed"]:
+            overall_status = "degraded"
+        else:
+            overall_status = "incomplete"
+
+        result = {
             "repo_root": str(self.repo_root),
             "project": context.get("project"),
             "query": query,
             "answer": answer,
             "raw_answer": raw_answer,
             "complete": final_validation["complete"],
-            "status": "complete" if final_validation["complete"] else "incomplete",
+            "status": overall_status,
             "validation": final_validation,
             "initial_validation": initial_validation,
             "index_status": context.get("index_status"),
@@ -371,6 +394,34 @@ class ArchitectureAwareAgent:
             "context": context,
             "response": response,
         }
+        self.last_result = result
+        return result
+
+
+def query_directory_structured(
+    directory: str | Path,
+    query: str,
+    symbol_pattern: str | None = None,
+    model: str | None = None,
+    capabilities: list[str] | None = None,
+    auto_build_graph: bool = True,
+    strict: bool = False,
+    include_diagnostics: bool = False,
+) -> dict[str, Any]:
+    """Query any target directory and return the full structured result dictionary from
+    `ArchitectureAwareAgent.ask()`, including `answer`, `complete`, `status`, `validation`,
+    `index_status`, `coverage`, and `errors`.
+    """
+    agent = ArchitectureAwareAgent(repo_root=directory)
+    return agent.ask(
+        query=query,
+        symbol_pattern=symbol_pattern,
+        model=model,
+        capabilities=capabilities,
+        auto_build_graph=auto_build_graph,
+        strict=strict,
+        include_diagnostics=include_diagnostics,
+    )
 
 
 def query_directory(
@@ -382,12 +433,17 @@ def query_directory(
     auto_build_graph: bool = True,
     strict: bool = False,
     include_diagnostics: bool = False,
-) -> str:
-    """Query any target directory using NTG's CodeIntelligence and UnifiedNTGRouter
-    and return the verified answer text.
+    return_structured: bool = False,
+) -> str | dict[str, Any]:
+    """Query any target directory using NTG's CodeIntelligence and UnifiedNTGRouter.
+
+    By default (`return_structured=False`), returns the finalized answer string (`str`)
+    to preserve backward compatibility for existing callers.
+    Pass `return_structured=True` (or call `query_directory_structured()`) to retrieve
+    the full structured result dictionary from `ArchitectureAwareAgent.ask()`.
     """
-    agent = ArchitectureAwareAgent(repo_root=directory)
-    result = agent.ask(
+    result = query_directory_structured(
+        directory=directory,
         query=query,
         symbol_pattern=symbol_pattern,
         model=model,
@@ -396,8 +452,9 @@ def query_directory(
         strict=strict,
         include_diagnostics=include_diagnostics,
     )
+    if return_structured:
+        return result
     return result["answer"]
 
 
 CodingAgent = ArchitectureAwareAgent
-
