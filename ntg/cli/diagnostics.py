@@ -5,8 +5,9 @@ from __future__ import annotations
 import time
 from typing import Any, Dict, List, Optional
 
-from ntg.config import DEFAULT_LOGICAL_MODEL
-from ntg.models import CircuitState, Deployment, sanitize_secret, utc_string
+from ntg.core.config import DEFAULT_LOGICAL_MODEL
+from ntg.core.models import CircuitState, Deployment
+from ntg.core.utils import sanitize_secret, utc_string
 
 
 def print_divider(title: Optional[str] = None, width: int = 70) -> None:
@@ -67,7 +68,7 @@ def print_banner(
 
 
 def print_account_status(deployments: List[Deployment]) -> None:
-    """Displays formatted status table of all configured deployments across providers."""
+    """Display formatted status table of all configured deployments across providers."""
     now = time.time()
     for dep in deployments:
         dep.refresh(now)
@@ -133,7 +134,7 @@ def print_request_execution(
     deployment: Deployment,
     response_model: Optional[str] = None,
 ) -> None:
-    """Prints execution summary after a request."""
+    """Print execution summary after a request."""
     print(f"\nFulfilling deployment: {deployment.display_name}")
     print(f"Provider             : {deployment.provider.title()}")
     print(f"Logical model        : {deployment.logical_model}")
@@ -148,7 +149,7 @@ def print_request_execution(
 
 
 def print_rate_limit_details(info: Dict[str, Any]) -> None:
-    """Prints diagnostic rate-limit information extracted from response metadata."""
+    """Print diagnostic rate-limit information extracted from response metadata."""
     print_divider("RATE LIMIT / DIAGNOSTIC DETAILS")
     fields = [
         ("category", "Classification"),

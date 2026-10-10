@@ -1,6 +1,6 @@
-"""NTG - Multi-Provider LiteLLM Smart Router."""
+"""NTG - Architecture-Aware AI Coding Agent & Multi-Provider LiteLLM Smart Router."""
 
-from ntg.config import (
+from ntg.core import (
     COHERE_ACTUAL_MODEL,
     COHERE_KEYS,
     COHERE_LITELLM_MODEL,
@@ -27,64 +27,78 @@ from ntg.config import (
     OPENROUTER_FREE_MODEL,
     OPENROUTER_KEYS,
     OPENROUTER_LITELLM_MODEL,
+    PROJECT_ROOT,
     PROVIDER_FALLBACKS,
-)
-from ntg.diagnostics import print_account_status, print_banner, print_request_execution
-from ntg.discovery import (
-    build_all_deployments,
-    build_cohere_deployments,
-    build_gemini_deployments,
-    build_groq_deployments,
-    build_nvidia_deployments,
-    build_openrouter_deployments,
-    discover_groq_models,
-)
-from ntg.exceptions import (
-    ParsedErrorInfo,
-    classify_gemini_error,
-    classify_openrouter_error,
-    classify_provider_error,
-    extract_error_payload,
-    parse_provider_error,
-)
-from ntg.models import (
     Account,
     CircuitState,
     Deployment,
     DeploymentMetrics,
     GeminiDeployment,
     ModelCapabilities,
+    ParsedErrorInfo,
     QuotaInfo,
     QuotaScope,
+    classify_gemini_error,
+    classify_openrouter_error,
+    classify_provider_error,
+    extract_error_payload,
+    parse_duration_string,
+    parse_provider_error,
+    parse_reset_header,
+    sanitize_secret,
     utc_string,
 )
-from ntg.agent import ArchitectureAwareAgent, CodingAgent
-from ntg.code_intelligence import CodeIntelligence
-from ntg.planner import (
+from ntg.providers import (
+    DiscoveryErrorCategory,
+    build_all_deployments,
+    build_cohere_deployments,
+    build_gemini_deployments,
+    build_groq_deployments,
+    build_nvidia_deployments,
+    build_openrouter_deployments,
+    classify_discovery_error,
+    discover_gemini_models,
+    discover_groq_models,
+)
+from ntg.router import (
+    ActiveRequest,
+    NTGTelemetryLogger,
+    NoEligibleDeploymentsError,
+    OpenRouterFallbackRouter,
+    RequestRequirements,
+    StateManager,
+    UnifiedNTGRouter,
+    extract_request_requirements,
+)
+from ntg.agent import (
+    ArchitectureAwareAgent,
+    CodeIntelligence,
+    CodeVerifier,
+    CodingAgent,
     approve_plan,
     build_change_plan,
     build_planning_prompt,
+    build_query_prompt,
+    inspect_git_diff,
+    query_directory,
     record_files_changed,
     record_validation_result,
     reject_plan,
     require_approved_plan,
-)
-from ntg.router import (
-    NoEligibleDeploymentsError,
-    OpenRouterFallbackRouter,
-    RequestRequirements,
-    UnifiedNTGRouter,
-    extract_request_requirements,
-)
-from ntg.state import StateManager
-from ntg.verifier import (
-    CodeVerifier,
-    inspect_git_diff,
     run_verification_command,
     verify_python_syntax,
 )
+from ntg.cli import (
+    print_account_status,
+    print_banner,
+    print_divider,
+    print_rate_limit_details,
+    print_request_execution,
+    run_cli,
+)
 
 __all__ = [
+    "PROJECT_ROOT",
     "Deployment",
     "Account",
     "GeminiDeployment",
@@ -98,10 +112,13 @@ __all__ = [
     "NoEligibleDeploymentsError",
     "RequestRequirements",
     "extract_request_requirements",
+    "ActiveRequest",
+    "NTGTelemetryLogger",
     "UnifiedNTGRouter",
     "OpenRouterFallbackRouter",
     "CodeIntelligence",
     "build_planning_prompt",
+    "build_query_prompt",
     "build_change_plan",
     "approve_plan",
     "reject_plan",
@@ -114,6 +131,7 @@ __all__ = [
     "inspect_git_diff",
     "ArchitectureAwareAgent",
     "CodingAgent",
+    "query_directory",
     "OPENROUTER_ACTUAL_MODEL",
     "OPENROUTER_FREE_MODEL",
     "OPENROUTER_LITELLM_MODEL",
@@ -141,6 +159,8 @@ __all__ = [
     "DEFAULT_KEYS",
     "DEFAULT_GEMINI_KEYS",
     "GEMINI_API_KEY",
+    "DiscoveryErrorCategory",
+    "classify_discovery_error",
     "build_all_deployments",
     "build_openrouter_deployments",
     "build_groq_deployments",
@@ -148,13 +168,20 @@ __all__ = [
     "build_cohere_deployments",
     "build_gemini_deployments",
     "discover_groq_models",
+    "discover_gemini_models",
     "extract_error_payload",
     "classify_openrouter_error",
     "classify_gemini_error",
     "classify_provider_error",
     "parse_provider_error",
+    "parse_duration_string",
+    "parse_reset_header",
+    "sanitize_secret",
     "print_account_status",
     "print_banner",
+    "print_divider",
+    "print_rate_limit_details",
     "print_request_execution",
+    "run_cli",
     "utc_string",
 ]

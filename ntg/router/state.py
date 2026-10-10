@@ -7,19 +7,13 @@ import logging
 import os
 import threading
 import time
-from enum import Enum
 from typing import Any, Dict, List, Optional
 
-logger = logging.getLogger("ntg.state")
+from ntg.core.config import PROJECT_ROOT
+from ntg.core.models import CircuitState, DeploymentMetrics, QuotaInfo
+from ntg.core.utils import sanitize_secret
 
-
-class CircuitState(str, Enum):
-    HEALTHY = "HEALTHY"
-    OPEN = "OPEN"
-    HALF_OPEN = "HALF_OPEN"
-    QUARANTINED = "QUARANTINED"
-    AUTH_FAILED = "AUTH_FAILED"
-
+logger = logging.getLogger("ntg.router.state")
 
 FORBIDDEN_KEY_PATTERNS = {
     "api_key",
@@ -59,44 +53,37 @@ SAFE_EXACT_KEYS = {
 }
 
 
-def _clean_for_persistence(obj: Any) -> Any:
-    """Recursively scrub secrets, credentials, and request bodies before saving (Rules 1, 2, 3)."""
+def clean_for_persistence(obj: Any) -> Any:
+    """Recursively scrub secrets, credentials, and request bodies before saving."""
     if isinstance(obj, dict):
         cleaned: Dict[str, Any] = {}
         for k, v in obj.items():
             k_str = str(k).lower()
             if k_str in SAFE_EXACT_KEYS:
-                cleaned[k] = _clean_for_persistence(v)
+                cleaned[k] = clean_for_persistence(v)
             elif any(pat in k_str for pat in FORBIDDEN_KEY_PATTERNS):
-                # Rule 1, 2, 3: Omit secret keys, authorization headers, and request content
                 continue
             else:
-                cleaned[k] = _clean_for_persistence(v)
+                cleaned[k] = clean_for_persistence(v)
         return cleaned
     elif isinstance(obj, list):
-        return [_clean_for_persistence(item) for item in obj]
+        return [clean_for_persistence(item) for item in obj]
     elif isinstance(obj, str):
-        try:
-            from ntg.models import sanitize_secret
-            return sanitize_secret(obj)
-        except ImportError:
-            return obj
+        return sanitize_secret(obj)
     return obj
+
+
+_clean_for_persistence = clean_for_persistence
 
 
 class StateManager:
     """Manages persistent deployment circuit breaker, metrics, and quota state across restarts.
 
     Guarantees:
-    - Never persists API keys, Authorization headers, or request content (Rules 1, 2, 3).
-    - Loads state on startup and discards expired cooldowns (Rules 4, 5).
-    - Handles missing or corrupted state files without crashing (Rules 6, 7).
-    - Thread-safe atomic writes via temporary file replacement and in-memory RLock (Rule 10).
-    - Architecture: Designed for single-process, multi-threaded routing architectures. Thread safety
-      is enforced by an in-memory RLock, while atomic file replacement (os.replace) prevents corruption.
-      Multi-process deployments sharing state across independent worker processes require an external
-      distributed coordinator or lock.
-    - Integrates with the existing Deployment model as the source of truth (Rule 9).
+    - Never persists API keys, Authorization headers, or request content.
+    - Loads state on startup and discards expired cooldowns.
+    - Handles missing or corrupted state files without crashing.
+    - Thread-safe atomic writes via temporary file replacement and in-memory RLock.
     """
 
     def __init__(self, state_file: Optional[str] = None):
@@ -104,15 +91,14 @@ class StateManager:
         if state_file:
             self.state_file = state_file
         else:
-            base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-            ntg_dir = os.path.join(base_dir, ".ntg")
-            os.makedirs(ntg_dir, exist_ok=True)
-            self.state_file = os.path.join(ntg_dir, "state.json")
+            ntg_dir = PROJECT_ROOT / ".ntg"
+            ntg_dir.mkdir(parents=True, exist_ok=True)
+            self.state_file = str(ntg_dir / "state.json")
 
         self.state_data: Dict[str, Any] = self._load()
 
     def _load(self) -> Dict[str, Any]:
-        """Load state data safely from file, discarding expired information (Rules 4, 5, 6, 7)."""
+        """Load state data safely from file, discarding expired information."""
         data: Dict[str, Any] = {}
         if os.path.exists(self.state_file):
             try:
@@ -132,14 +118,12 @@ class StateManager:
                 except Exception:
                     pass
 
-        # Populate baseline structure if missing or corrupt
         for section in ("deployments", "accounts", "discovery_cache", "metrics", "quota"):
             if section not in data or not isinstance(data[section], dict):
                 data[section] = {}
 
         now = time.time()
 
-        # Rule 5: Discard expired cooldown and reset information on startup
         deployments = data.get("deployments", {})
         for dep_id, entry in list(deployments.items()):
             if not isinstance(entry, dict):
@@ -147,7 +131,6 @@ class StateManager:
             if entry.get("circuit_state") == CircuitState.OPEN.value:
                 open_until = entry.get("circuit_open_until", 0.0) or entry.get("reset_at", 0.0)
                 if open_until > 0 and now >= open_until:
-                    # Expired cooldown: discard expired cooldown information
                     entry.pop("reset_at", None)
                     entry.pop("circuit_open_until", None)
                     entry["circuit_state"] = CircuitState.HALF_OPEN.value
@@ -165,16 +148,15 @@ class StateManager:
         return data
 
     def save(self) -> None:
-        """Persist current state data atomically and safely (Rules 1, 2, 3, 10)."""
+        """Persist current state data atomically and safely."""
         with self._lock:
             temp_file = None
             try:
                 os.makedirs(os.path.dirname(self.state_file), exist_ok=True)
-                clean_data = _clean_for_persistence(self.state_data)
+                clean_data = clean_for_persistence(self.state_data)
                 clean_data["version"] = 1
                 clean_data["updated_at"] = time.time()
 
-                # Process- and thread-unique temp file to avoid concurrent collisions
                 temp_file = f"{self.state_file}.tmp.{os.getpid()}.{threading.get_ident()}"
                 with open(temp_file, "w", encoding="utf-8") as f:
                     json.dump(clean_data, f, indent=2)
@@ -192,7 +174,7 @@ class StateManager:
                         pass
 
     def snapshot_deployment(self, deployment: Any) -> None:
-        """Persist runtime state directly from a Deployment instance (Rule 9)."""
+        """Persist runtime state directly from a Deployment instance."""
         with self._lock:
             dep_id = getattr(deployment, "id", str(deployment))
             now = time.time()
@@ -225,10 +207,7 @@ class StateManager:
             self.save()
 
     def get_cached_discovery(self, key: str) -> List[Any]:
-        """Retrieve last-known-good models for a provider account.
-
-        Handles both legacy list cache entries and rich metadata dict entries.
-        """
+        """Retrieve last-known-good models for a provider account."""
         with self._lock:
             cache = self.state_data.get("discovery_cache", {})
             entry = cache.get(key)
@@ -325,7 +304,7 @@ class StateManager:
         error_type: str = "temporary_failure",
         last_error: Optional[str] = None,
     ) -> Optional[List[Any]]:
-        """Mark cached discovery as stale instead of deleting it (Rules 1, 2). Returns cached models."""
+        """Mark cached discovery as stale instead of deleting it. Returns cached models."""
         with self._lock:
             if "discovery_cache" not in self.state_data:
                 self.state_data["discovery_cache"] = {}
@@ -425,7 +404,7 @@ class StateManager:
         reset_timestamp: Optional[float] = None,
         quota_scope: str = "deployment",
     ) -> None:
-        """Persist cooldown for deployment ID or instance (strictly persistence, no live mutations)."""
+        """Persist cooldown for deployment ID or instance."""
         with self._lock:
             dep_id = getattr(dep_or_id, "id", str(dep_or_id))
             now = time.time()
@@ -434,7 +413,11 @@ class StateManager:
                 reset_at = cooldown_seconds_or_until
             else:
                 cooldown_secs = max(1.0, cooldown_seconds_or_until)
-                reset_at = reset_timestamp if reset_timestamp and reset_timestamp > now else (now + cooldown_secs)
+                reset_at = (
+                    reset_timestamp
+                    if reset_timestamp and reset_timestamp > now
+                    else (now + cooldown_secs)
+                )
 
             if "deployments" not in self.state_data:
                 self.state_data["deployments"] = {}
@@ -456,7 +439,7 @@ class StateManager:
         reason: str,
         state: CircuitState = CircuitState.AUTH_FAILED,
     ) -> None:
-        """Persist quarantine state for deployment ID (strictly persistence, no live mutations)."""
+        """Persist quarantine state for deployment ID."""
         with self._lock:
             dep_id = getattr(dep_or_id, "id", str(dep_or_id))
             now = time.time()
@@ -474,7 +457,7 @@ class StateManager:
             self.save()
 
     def record_metrics(self, dep_id: str, metrics: Any) -> None:
-        """Record telemetry metrics for a deployment ID (Rules 6, 8, 10)."""
+        """Record telemetry metrics for a deployment ID."""
         with self._lock:
             if "metrics" not in self.state_data:
                 self.state_data["metrics"] = {}
@@ -482,21 +465,28 @@ class StateManager:
                 self.state_data["metrics"][dep_id] = metrics.to_dict()
             elif hasattr(metrics, "__dict__"):
                 self.state_data["metrics"][dep_id] = {
-                    k.lstrip("_"): v for k, v in metrics.__dict__.items() if not k.startswith("_lock")
+                    k.lstrip("_"): v
+                    for k, v in metrics.__dict__.items()
+                    if not k.startswith("_lock")
                 }
             elif isinstance(metrics, dict):
                 self.state_data["metrics"][dep_id] = dict(metrics)
             self.save()
 
-    def get_metrics(self, dep_id: str) -> Any:
+    def get_metrics(self, dep_id: str) -> DeploymentMetrics:
         """Get restored DeploymentMetrics for a deployment ID."""
         with self._lock:
-            from ntg.models import DeploymentMetrics
-
             raw = self.state_data.get("metrics", {}).get(dep_id, {})
             if raw and isinstance(raw, dict):
                 clean = {}
-                for k in ("user_requests", "upstream_attempts", "successes", "failures", "rate_limits", "auth_failures"):
+                for k in (
+                    "user_requests",
+                    "upstream_attempts",
+                    "successes",
+                    "failures",
+                    "rate_limits",
+                    "auth_failures",
+                ):
                     if k in raw:
                         clean[k] = raw[k]
                 if "auth_failures" not in clean and "auth_errors" in raw:
@@ -504,7 +494,7 @@ class StateManager:
                 return DeploymentMetrics(**clean)
             return DeploymentMetrics()
 
-    def record_quota(self, dep_id: str, quota: Any = None, **kwargs) -> None:
+    def record_quota(self, dep_id: str, quota: Any = None, **kwargs: Any) -> None:
         """Record normalized quota metadata for a deployment ID."""
         with self._lock:
             if "quota" not in self.state_data:
@@ -520,11 +510,9 @@ class StateManager:
                 self.state_data["quota"][dep_id] = data
                 self.save()
 
-    def get_quota(self, dep_id: str) -> Any:
+    def get_quota(self, dep_id: str) -> QuotaInfo:
         """Get restored QuotaInfo for a deployment ID."""
         with self._lock:
-            from ntg.models import QuotaInfo
-
             raw = self.state_data.get("quota", {}).get(dep_id, {})
             if raw and isinstance(raw, dict):
                 return QuotaInfo(
@@ -547,7 +535,7 @@ class StateManager:
             return QuotaInfo()
 
     def record_success(self, dep_or_id: Any) -> None:
-        """Persist recovery / healthy state for deployment (strictly persistence, no live mutations)."""
+        """Persist recovery / healthy state for deployment."""
         with self._lock:
             dep_id = getattr(dep_or_id, "id", str(dep_or_id))
             deps = self.state_data.get("deployments", {})
@@ -562,13 +550,14 @@ class StateManager:
     def apply_to_deployment(self, deployment: Any) -> None:
         """Apply persisted state (quarantine, cooldown, circuit breaker, quota) to a deployment."""
         with self._lock:
-            # Restore persisted quota
             if deployment.id in self.state_data.get("quota", {}):
                 deployment.quota = self.get_quota(deployment.id)
 
-            # Restore metrics if deployment has zero counters
             if hasattr(deployment, "metrics") and deployment.id in self.state_data.get("metrics", {}):
-                if deployment.metrics.user_requests == 0 and deployment.metrics.upstream_attempts == 0:
+                if (
+                    deployment.metrics.user_requests == 0
+                    and deployment.metrics.upstream_attempts == 0
+                ):
                     deployment.metrics = self.get_metrics(deployment.id)
 
             deps = self.state_data.get("deployments", {})
@@ -578,25 +567,31 @@ class StateManager:
 
             now = time.time()
             saved_updated_at = saved.get("state_updated_at", 0.0)
-            if getattr(deployment, "state_updated_at", 0.0) > saved_updated_at and saved_updated_at > 0:
-                # Live state is newer than persisted state: do not overwrite newer live state
+            if (
+                getattr(deployment, "state_updated_at", 0.0) > saved_updated_at
+                and saved_updated_at > 0
+            ):
                 return
 
             circuit_str = saved.get("circuit_state", CircuitState.HEALTHY.value)
             reset_at = saved.get("reset_at", 0.0)
             open_until = saved.get("circuit_open_until", 0.0) or reset_at
 
-            # Handle quarantine and authentication failure
-            if circuit_str in (CircuitState.QUARANTINED.value, CircuitState.AUTH_FAILED.value):
+            if circuit_str in (
+                CircuitState.QUARANTINED.value,
+                CircuitState.AUTH_FAILED.value,
+            ):
                 try:
                     deployment.circuit_state = CircuitState(circuit_str)
                 except ValueError:
                     deployment.circuit_state = CircuitState.AUTH_FAILED
-                deployment.state_reason = saved.get("state_reason", "Quarantined due to authentication error")
+                deployment.state_reason = saved.get(
+                    "state_reason",
+                    "Quarantined due to authentication error",
+                )
                 deployment.state_updated_at = saved_updated_at or now
                 return
 
-            # Handle circuit HEALTHY
             if circuit_str == CircuitState.HEALTHY.value:
                 deployment.circuit_state = CircuitState.HEALTHY
                 deployment.circuit_open_until = 0.0
@@ -604,7 +599,6 @@ class StateManager:
                 deployment.state_updated_at = saved_updated_at or now
                 return
 
-            # Handle circuit HALF_OPEN
             if circuit_str == CircuitState.HALF_OPEN.value:
                 deployment.circuit_state = CircuitState.HALF_OPEN
                 deployment.circuit_open_until = 0.0
@@ -615,20 +609,23 @@ class StateManager:
                     deployment._active_probe_request_ids.clear()
                 return
 
-            # Handle circuit OPEN (server breaker or quota cooldown)
             if circuit_str == CircuitState.OPEN.value:
                 if open_until > 0 and now < open_until:
                     deployment.circuit_state = CircuitState.OPEN
                     deployment.circuit_open_until = open_until
                     if reset_at > 0:
                         deployment.quota.reset_at = reset_at
-                    deployment.state_reason = saved.get("state_reason", "Circuit breaker OPEN / cooldown active")
+                    deployment.state_reason = saved.get(
+                        "state_reason",
+                        "Circuit breaker OPEN / cooldown active",
+                    )
                     deployment.state_updated_at = saved_updated_at or now
                 else:
-                    # Transition to HALF_OPEN for controlled probing (Rule 3)
                     deployment.circuit_state = CircuitState.HALF_OPEN
                     deployment.circuit_open_until = 0.0
-                    deployment.state_reason = "Recovery condition reached; entering HALF_OPEN for controlled probe"
+                    deployment.state_reason = (
+                        "Recovery condition reached; entering HALF_OPEN for controlled probe"
+                    )
                     deployment.state_updated_at = now
                     deployment.half_open_probes = 0
                     if hasattr(deployment, "_active_probe_request_ids"):

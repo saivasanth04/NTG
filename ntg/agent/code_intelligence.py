@@ -41,7 +41,6 @@ class CodeIntelligence:
                 stdin=subprocess.DEVNULL,
             )
         except TypeError:
-            # Compatibility with minimal test runner stubs that do not accept stdin
             result = subprocess.run(
                 args,
                 cwd=self.repo_root,
@@ -52,10 +51,11 @@ class CodeIntelligence:
                 shell=False,
             )
         except FileNotFoundError as exc:
-            # On Windows, npm/pip wrappers (.CMD/.EXE) require path resolution when shell=False
             resolved = shutil.which(args[0])
             if not resolved:
-                raise RuntimeError(f"Required code intelligence executable not found: {args[0]}") from exc
+                raise RuntimeError(
+                    f"Required code intelligence executable not found: {args[0]}"
+                ) from exc
             result = subprocess.run(
                 [resolved, *args[1:]],
                 cwd=self.repo_root,
@@ -70,8 +70,7 @@ class CodeIntelligence:
         if result.returncode != 0:
             err_detail = (result.stderr or result.stdout or "").strip()[-2000:]
             raise RuntimeError(
-                f"Code intelligence command failed ({result.returncode}): "
-                f"{err_detail}"
+                f"Code intelligence command failed ({result.returncode}): {err_detail}"
             )
 
         return result.stdout
@@ -91,9 +90,7 @@ class CodeIntelligence:
             raise ValueError("Question cannot be empty.")
 
         if not self.graph_file.is_file():
-            raise RuntimeError(
-                "Graphify graph is missing. Build it before querying."
-            )
+            raise RuntimeError("Graphify graph is missing. Build it before querying.")
 
         cmd = ["graphify", "query", question, "--budget", str(budget)]
         if dfs:
@@ -106,9 +103,7 @@ class CodeIntelligence:
             raise ValueError("Node name cannot be empty.")
 
         if not self.graph_file.is_file():
-            raise RuntimeError(
-                "Graphify graph is missing. Build it before querying."
-            )
+            raise RuntimeError("Graphify graph is missing. Build it before querying.")
 
         return self._run(["graphify", "explain", node.strip()])
 
@@ -120,9 +115,7 @@ class CodeIntelligence:
             raise ValueError("Target node cannot be empty.")
 
         if not self.graph_file.is_file():
-            raise RuntimeError(
-                "Graphify graph is missing. Build it before querying."
-            )
+            raise RuntimeError("Graphify graph is missing. Build it before querying.")
 
         return self._run(["graphify", "path", source.strip(), target.strip()])
 
@@ -181,10 +174,15 @@ class CodeIntelligence:
 
         return self._run(
             [
-                "codebase-memory-mcp", "cli", "search_graph",
-                "--project", project,
-                "--name-pattern", symbol_pattern,
-                "--format", "json",
+                "codebase-memory-mcp",
+                "cli",
+                "search_graph",
+                "--project",
+                project,
+                "--name-pattern",
+                symbol_pattern,
+                "--format",
+                "json",
             ]
         )
 
@@ -199,7 +197,11 @@ class CodeIntelligence:
             "--mode",
             mode,
         ]
-        target_name = project.strip() if isinstance(project, str) and project.strip() else self.default_project
+        target_name = (
+            project.strip()
+            if isinstance(project, str) and project.strip()
+            else self.default_project
+        )
         if target_name:
             cmd.extend(["--name", target_name])
 
@@ -215,7 +217,9 @@ class CodeIntelligence:
     def resolve_memory_project(self, preferred_project: str | None = None) -> str:
         """Resolve the indexed project name corresponding to repo_root in Codebase Memory MCP."""
         try:
-            out = self._run(["codebase-memory-mcp", "cli", "list_projects", "--format", "json"])
+            out = self._run(
+                ["codebase-memory-mcp", "cli", "list_projects", "--format", "json"]
+            )
             data = json.loads(out)
             projects = data.get("projects", []) if isinstance(data, dict) else []
             for entry in projects:
@@ -238,7 +242,11 @@ class CodeIntelligence:
             pass
 
         return (
-            (preferred_project.strip() if isinstance(preferred_project, str) and preferred_project.strip() else None)
+            (
+                preferred_project.strip()
+                if isinstance(preferred_project, str) and preferred_project.strip()
+                else None
+            )
             or self.default_project
             or self.repo_root.name
         )
@@ -399,16 +407,24 @@ class CodeIntelligence:
             errors.append(f"graphify_query: {err}")
 
         resolved_proj = self.resolve_memory_project(project)
+        try:
+            arch_ctx = self.memory_architecture(resolved_proj)
+        except Exception as err:
+            if auto_build:
+                try:
+                    self.memory_index(project=project)
+                    resolved_proj = self.resolve_memory_project(project)
+                    arch_ctx = self.memory_architecture(resolved_proj)
+                except Exception as retry_err:
+                    errors.append(f"memory_architecture: {retry_err}")
+            else:
+                errors.append(f"memory_architecture: {err}")
+
         if symbol_pattern and symbol_pattern.strip():
             try:
                 memory_ctx = self.memory_query(resolved_proj, symbol_pattern.strip())
             except Exception as err:
                 errors.append(f"memory_query: {err}")
-
-        try:
-            arch_ctx = self.memory_architecture(resolved_proj)
-        except Exception as err:
-            errors.append(f"memory_architecture: {err}")
 
         return {
             "question": question,

@@ -1,4 +1,3 @@
-
 """Architecture-aware change planner and human-in-the-loop approval lifecycle."""
 
 from __future__ import annotations
@@ -15,7 +14,6 @@ def extract_response_content(planning_response: Any) -> str:
     if isinstance(planning_response, str):
         return planning_response
 
-    # Standard LiteLLM / OpenAI ModelResponse object
     choices = getattr(planning_response, "choices", None)
     if choices is not None:
         if not choices:
@@ -32,7 +30,6 @@ def extract_response_content(planning_response: Any) -> str:
             content = msg.get("content") if isinstance(msg, dict) else getattr(msg, "content", "")
             return str(content) if content is not None else ""
 
-    # Dictionary-shaped response
     if isinstance(planning_response, dict):
         if "choices" in planning_response and planning_response["choices"]:
             first = planning_response["choices"][0]
@@ -47,15 +44,16 @@ def extract_response_content(planning_response: Any) -> str:
             val = planning_response["plan"]
             return str(val) if val is not None else ""
 
-    raise ValueError("Unsupported planning_response format; expected LiteLLM response, dict, or str.")
+    raise ValueError(
+        "Unsupported planning_response format; expected LiteLLM response, dict, or str."
+    )
 
 
 def build_planning_prompt(
     request: str,
     context: dict[str, Any] | None = None,
 ) -> str:
-    """
-    Construct an architecture-aware planning prompt combining the user request
+    """Construct an architecture-aware planning prompt combining the user request
     with structural context from Graphify and Codebase Memory MCP.
     """
     if not isinstance(request, str) or not request.strip():
@@ -71,6 +69,48 @@ def build_planning_prompt(
         "4. Verification & Post-Change Knowledge Sync Strategy",
         "",
         f"## User Request\n{request.strip()}",
+    ]
+
+    if context:
+        graphify_ctx = context.get("graphify_context")
+        if graphify_ctx:
+            sections.append(f"## Graphify Knowledge Graph Context\n{graphify_ctx}")
+
+        arch_ctx = context.get("memory_architecture")
+        if arch_ctx:
+            formatted_arch = (
+                json.dumps(arch_ctx, indent=2)
+                if isinstance(arch_ctx, (dict, list))
+                else str(arch_ctx)
+            )
+            sections.append(f"## Codebase Memory Architecture Overview\n{formatted_arch}")
+
+        symbols_ctx = context.get("memory_symbols")
+        if symbols_ctx:
+            formatted_symbols = (
+                json.dumps(symbols_ctx, indent=2)
+                if isinstance(symbols_ctx, (dict, list))
+                else str(symbols_ctx)
+            )
+            sections.append(f"## Matching Codebase Symbols\n{formatted_symbols}")
+
+    return "\n\n".join(sections)
+
+
+def build_query_prompt(
+    query: str,
+    context: dict[str, Any] | None = None,
+) -> str:
+    """Construct an architecture-grounded prompt for answering a query about a directory."""
+    if not isinstance(query, str) or not query.strip():
+        raise ValueError("query must be a non-empty string.")
+
+    sections: list[str] = [
+        "You are an architecture-aware AI codebase assistant.",
+        "Use the repository knowledge-graph and symbol context below to answer the user's question accurately and concisely.",
+        "Reference specific files, modules, classes, and functions from the codebase context where relevant.",
+        "",
+        f"## User Question\n{query.strip()}",
     ]
 
     if context:
@@ -124,8 +164,7 @@ def build_change_plan(
 
 
 def approve_plan(plan: dict[str, Any]) -> dict[str, Any]:
-    """
-    Explicitly approve a plan after a human has reviewed it.
+    """Explicitly approve a plan after a human has reviewed it.
     Calling this function alone does not edit source files.
     """
     if not isinstance(plan, dict):
@@ -156,7 +195,12 @@ def require_approved_plan(plan: dict[str, Any]) -> None:
     """Guard that raises PermissionError unless the plan has been explicitly approved."""
     if not isinstance(plan, dict):
         raise ValueError("plan must be a dictionary.")
-    if not plan.get("approved") or plan.get("status") not in ("approved", "executed", "verified", "verification_failed"):
+    if not plan.get("approved") or plan.get("status") not in (
+        "approved",
+        "executed",
+        "verified",
+        "verification_failed",
+    ):
         raise PermissionError("Plan must be explicitly approved before executing changes.")
 
 
@@ -187,4 +231,3 @@ def record_validation_result(
     if plan.get("approved"):
         plan["status"] = "verified" if all_passed else "verification_failed"
     return plan
-

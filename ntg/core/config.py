@@ -1,18 +1,23 @@
-"""Configuration settings for multi-provider LiteLLM router."""
+"""Core configuration settings and environment loader for NTG."""
+
+from __future__ import annotations
 
 import os
-from typing import Dict, List, Optional
+from pathlib import Path
+from typing import Dict, List
+
+PROJECT_ROOT: Path = Path(__file__).resolve().parents[2]
 
 
-def _load_env_file(filepath: str = ".env") -> None:
+def load_env_file(filepath: str | Path = ".env") -> None:
     """Lightweight .env file loader without external dependencies."""
-    if not os.path.exists(filepath):
-        base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        filepath = os.path.join(base_dir, ".env")
+    candidate = Path(filepath)
+    if not candidate.exists():
+        candidate = PROJECT_ROOT / ".env"
 
-    if os.path.exists(filepath):
+    if candidate.exists():
         try:
-            with open(filepath, "r", encoding="utf-8") as f:
+            with candidate.open("r", encoding="utf-8") as f:
                 for line in f:
                     line = line.strip()
                     if line and not line.startswith("#") and "=" in line:
@@ -25,11 +30,14 @@ def _load_env_file(filepath: str = ".env") -> None:
             pass
 
 
-# Load environment variables if present
-_load_env_file()
+# Backward-compatible private alias
+_load_env_file = load_env_file
+
+# Load environment variables on import if present
+load_env_file()
 
 
-def _get_env_key(key_candidates: List[str]) -> str:
+def get_env_key(key_candidates: List[str]) -> str:
     """Check a list of environment variable names and return the first non-empty value."""
     for key in key_candidates:
         val = os.getenv(key, "").strip().strip("'\"")
@@ -37,6 +45,8 @@ def _get_env_key(key_candidates: List[str]) -> str:
             return val
     return ""
 
+
+_get_env_key = get_env_key
 
 # Logical model group identifiers
 MODEL_GROUP_AUTO: str = "auto"
@@ -54,7 +64,7 @@ DEFAULT_LOGICAL_MODEL: str = MODEL_GROUP_AUTO
 DEFAULT_NUM_RETRIES: int = 1
 MAX_RETRY_BUDGET: int = 2
 
-# Simple deployment circuit breaker configuration
+# Deployment circuit breaker configuration
 CIRCUIT_BREAKER_MAX_FAILURES: int = int(os.getenv("NTG_CIRCUIT_BREAKER_MAX_FAILURES", "3"))
 CIRCUIT_BREAKER_RECOVERY_TIME: float = float(os.getenv("NTG_CIRCUIT_BREAKER_RECOVERY_TIME", "30.0"))
 CIRCUIT_BREAKER_HALF_OPEN_PROBES: int = 1
@@ -80,42 +90,46 @@ COHERE_LITELLM_MODEL: str = f"cohere/{COHERE_ACTUAL_MODEL}"
 # Load OpenRouter API keys (up to 5 accounts)
 OPENROUTER_KEYS: Dict[str, str] = {}
 for i in range(1, 6):
-    key_val = _get_env_key([f"OPENROUTER_API_KEY_{i}", f"OpenRouter_API_KEY_{i}"])
-    OPENROUTER_KEYS[f"account_{i}"] = key_val
+    OPENROUTER_KEYS[f"account_{i}"] = get_env_key([
+        f"OPENROUTER_API_KEY_{i}",
+        f"OpenRouter_API_KEY_{i}",
+    ])
 
 # Load Groq API keys (up to 5 accounts)
 GROQ_KEYS: Dict[str, str] = {}
 for i in range(1, 6):
-    key_val = _get_env_key([
-        f"Grok_API_KEY_{i}",
-        f"GROK_API_KEY_{i}",
+    GROQ_KEYS[f"account_{i}"] = get_env_key([
         f"GROQ_API_KEY_{i}",
         f"Groq_API_KEY_{i}",
+        f"Grok_API_KEY_{i}",
+        f"GROK_API_KEY_{i}",
     ])
-    GROQ_KEYS[f"account_{i}"] = key_val
 
 # Load NVIDIA NIM API keys (up to 4 accounts)
 NVIDIA_KEYS: Dict[str, str] = {}
 for i in range(1, 5):
-    key_val = _get_env_key([
-        f"Nvida_API_KEY_{i}",
-        f"NVIDA_API_KEY_{i}",
+    NVIDIA_KEYS[f"account_{i}"] = get_env_key([
         f"NVIDIA_API_KEY_{i}",
         f"Nvidia_API_KEY_{i}",
+        f"Nvida_API_KEY_{i}",
+        f"NVIDA_API_KEY_{i}",
     ])
-    NVIDIA_KEYS[f"account_{i}"] = key_val
 
 # Load Cohere API keys (up to 5 accounts)
 COHERE_KEYS: Dict[str, str] = {}
 for i in range(1, 6):
-    key_val = _get_env_key([f"Cohere_API_KEY_{i}", f"COHERE_API_KEY_{i}"])
-    COHERE_KEYS[f"account_{i}"] = key_val
+    COHERE_KEYS[f"account_{i}"] = get_env_key([
+        f"COHERE_API_KEY_{i}",
+        f"Cohere_API_KEY_{i}",
+    ])
 
 # Load Gemini API keys (up to 4 accounts)
 GEMINI_KEYS: Dict[str, str] = {}
 for i in range(1, 5):
-    key_val = _get_env_key([f"Gemini_API_KEY_{i}", f"GEMINI_API_KEY_{i}"])
-    GEMINI_KEYS[f"account_{i}"] = key_val
+    GEMINI_KEYS[f"account_{i}"] = get_env_key([
+        f"GEMINI_API_KEY_{i}",
+        f"Gemini_API_KEY_{i}",
+    ])
 
 # Backward-compatible references
 DEFAULT_KEYS: Dict[str, str] = {k: v for k, v in OPENROUTER_KEYS.items() if v}

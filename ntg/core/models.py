@@ -1,15 +1,15 @@
-"""Provider-neutral data models, capability representation, and metrics."""
+"""Provider-neutral domain models, circuit state, capability representation, and metrics."""
+
+from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from email.utils import parsedate_to_datetime
+from enum import Enum
 import hashlib
-import re
 import threading
 import time
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-from ntg.config import (
+from ntg.core.config import (
     CIRCUIT_BREAKER_HALF_OPEN_PROBES,
     CIRCUIT_BREAKER_MAX_FAILURES,
     CIRCUIT_BREAKER_RECOVERY_TIME,
@@ -18,139 +18,22 @@ from ntg.config import (
     OPENROUTER_ACTUAL_MODEL,
     OPENROUTER_LITELLM_MODEL,
 )
-from ntg.state import CircuitState
+from ntg.core.utils import (
+    parse_duration_string,
+    parse_reset_header,
+    sanitize_secret,
+    utc_string,
+)
 
 
-def parse_duration_string(val: str) -> Optional[float]:
-    """Parse duration strings like '6m0s', '12s', '250ms', '1.5s', '1h30m' into seconds."""
-    if not val or not isinstance(val, str):
-        return None
-    val = val.strip().rstrip(".,;:!?()[]{}").strip().lower()
+class CircuitState(str, Enum):
+    """Lifecycle states of a deployment's circuit breaker."""
 
-    try:
-        return max(1.0, float(val))
-    except ValueError:
-        pass
-
-    ms_match = re.fullmatch(r"(\d+(?:\.\d+)?)\s*ms", val)
-    if ms_match:
-        return max(0.5, float(ms_match.group(1)) / 1000.0)
-
-    pattern = r"^(?:(\d+(?:\.\d+)?)\s*h)?\s*(?:(\d+(?:\.\d+)?)\s*m)?\s*(?:(\d+(?:\.\d+)?)\s*s)?$"
-    m = re.match(pattern, val)
-    if m and (m.group(1) or m.group(2) or m.group(3)):
-        hours = float(m.group(1) or 0)
-        minutes = float(m.group(2) or 0)
-        seconds = float(m.group(3) or 0)
-        total = hours * 3600.0 + minutes * 60.0 + seconds
-        return max(1.0, total)
-
-    return None
-
-
-def parse_reset_header(raw: Any) -> tuple[Optional[float], Optional[float]]:
-    """Parse a reset header or metadata value into (reset_timestamp, cooldown_seconds).
-
-    Supports:
-    - Numeric epoch microseconds (> 1e14)
-    - Numeric epoch milliseconds (> 1e11)
-    - Numeric epoch seconds (> 1e8)
-    - Numeric relative seconds (<= 1e7)
-    - Duration strings ('6m0s', '250ms', '1.5s', '1h30m')
-    - ISO-8601 datetime strings ('2026-10-08T00:50:00Z', '2026-10-08T00:50:00+00:00')
-    - HTTP date format (RFC 2822 / RFC 7231, e.g. 'Wed, 21 Oct 2026 07:28:00 GMT')
-    """
-    if raw is None:
-        return None, None
-
-    now = time.time()
-
-    # Fast path for int / float
-    if isinstance(raw, (int, float)):
-        num = float(raw)
-        if num > 1e14:
-            ts = num / 1e6
-            return ts, max(0.5, ts - now)
-        elif num > 1e11:
-            ts = num / 1000.0
-            return ts, max(0.5, ts - now)
-        elif num > 1e8:
-            ts = num
-            return ts, max(0.5, ts - now)
-        elif num >= 0:
-            cd = max(0.5, num)
-            return now + cd, cd
-        return None, None
-
-    if isinstance(raw, datetime):
-        ts = raw.timestamp()
-        return ts, max(0.5, ts - now)
-
-    raw_str = str(raw).strip().rstrip(".,;:!?()[]{}").strip()
-    if not raw_str:
-        return None, None
-
-    # 1. Check for duration string first (e.g. 6m0s or 500ms or 1.5s)
-    if re.search(r"[a-z]", raw_str.lower()):
-        dur = parse_duration_string(raw_str)
-        if dur is not None:
-            return now + dur, max(0.5, dur)
-
-    # 2. Check numeric string values
-    try:
-        num = float(raw_str)
-        if num > 1e14:
-            ts = num / 1e6
-            return ts, max(0.5, ts - now)
-        elif num > 1e11:
-            ts = num / 1000.0
-            return ts, max(0.5, ts - now)
-        elif num > 1e8:
-            ts = num
-            return ts, max(0.5, ts - now)
-        elif num >= 0:
-            cd = max(0.5, num)
-            return now + cd, cd
-    except ValueError:
-        pass
-
-    # 3. Check ISO-8601 datetime format
-    try:
-        iso_str = raw_str.replace("Z", "+00:00")
-        dt = datetime.fromisoformat(iso_str)
-        ts = dt.timestamp()
-        return ts, max(0.5, ts - now)
-    except Exception:
-        pass
-
-    # 4. Check HTTP date format (RFC 2822 / RFC 7231)
-    try:
-        dt = parsedate_to_datetime(raw_str)
-        ts = dt.timestamp()
-        return ts, max(0.5, ts - now)
-    except Exception:
-        pass
-
-    return None, None
-
-
-def utc_string(timestamp: Optional[float] = None) -> str:
-    """Format Unix timestamp (or current time) as an ISO-8601 UTC string."""
-    ts = timestamp if timestamp is not None else time.time()
-    return datetime.fromtimestamp(ts, timezone.utc).isoformat()
-
-
-def sanitize_secret(message: Any, secret: Optional[str] = None) -> str:
-    """Redact raw API keys and secret tokens from strings."""
-    if not message:
-        return ""
-    text = str(message)
-    if secret and secret.strip() and len(secret.strip()) >= 3:
-        text = text.replace(secret.strip(), "***REDACTED***")
-    text = re.sub(r"(Bearer\s+)[A-Za-z0-9_\-\.]{8,}", r"\1***REDACTED***", text, flags=re.IGNORECASE)
-    text = re.sub(r"(sk-[a-zA-Z0-9_\-]{8,})", r"***REDACTED***", text)
-    text = re.sub(r"(key[=:\"'\s]+)[A-Za-z0-9_\-]{16,}", r"\1***REDACTED***", text, flags=re.IGNORECASE)
-    return text
+    HEALTHY = "HEALTHY"
+    OPEN = "OPEN"
+    HALF_OPEN = "HALF_OPEN"
+    QUARANTINED = "QUARANTINED"
+    AUTH_FAILED = "AUTH_FAILED"
 
 
 @dataclass
@@ -233,6 +116,7 @@ class ModelCapabilities:
 
 class QuotaScope:
     """Allowed quota scope values representing known boundary of limits."""
+
     PROVIDER = "provider"
     ACCOUNT = "account"
     MODEL = "model"
@@ -293,6 +177,8 @@ class QuotaInfo:
         """Parse HTTP response headers to update normalized quota without inventing values."""
         if not headers:
             return
+
+        now = time.time()
 
         def _get_h(names: List[str]) -> Optional[str]:
             if not isinstance(headers, dict) and not hasattr(headers, "items"):
@@ -375,9 +261,9 @@ class QuotaInfo:
 
 
 class DeploymentMetrics:
-    """Accurate separation of user requests and upstream attempts (Task 14).
+    """Accurate separation of user requests and upstream attempts.
 
-    Thread-safe atomic counters to prevent race conditions under concurrent requests (Rules 6, 8).
+    Thread-safe atomic counters to prevent race conditions under concurrent requests.
     """
 
     def __init__(
@@ -690,21 +576,21 @@ class Deployment:
         self.state_reason = val
 
     def record_user_request(self, count: int = 1) -> int:
-        """Atomically record one user request on this deployment (Rule 1, 6, 8)."""
+        """Atomically record one user request on this deployment."""
         return self.metrics.increment_user_requests(count)
 
     def record_attempt(self, count: int = 1) -> int:
-        """Atomically record one upstream provider attempt (Rule 2, 6, 8)."""
+        """Atomically record one upstream provider attempt."""
         return self.metrics.record_attempt(count)
 
     @property
     def user_requests(self) -> int:
-        """User requests count (Rule 1)."""
+        """User requests count."""
         return self.metrics.user_requests
 
     @property
     def upstream_attempts(self) -> int:
-        """Upstream attempts count (Rule 2)."""
+        """Upstream attempts count."""
         return self.metrics.upstream_attempts
 
     @property
@@ -755,23 +641,20 @@ class Deployment:
         """Check if deployment is eligible to receive traffic.
 
         Behavior:
-        - HEALTHY: eligible normally (Rule 1).
-        - OPEN: temporarily excluded after repeated qualifying failures (Rule 2).
-        - HALF_OPEN: allows exactly one controlled probe (Rule 3).
-        - AUTH_FAILED / QUARANTINED: excluded until revalidated/reset (Rule 6).
+        - HEALTHY: eligible normally.
+        - OPEN: temporarily excluded after repeated qualifying failures.
+        - HALF_OPEN: allows controlled probing.
+        - AUTH_FAILED / QUARANTINED: excluded until revalidated/reset.
         """
         if not self.api_key or not self.api_key.strip():
             return False
         if self.circuit_state in (CircuitState.QUARANTINED, CircuitState.AUTH_FAILED):
             return False
         current_time = now if now is not None else time.time()
-        # If quota reset_at is active and has not elapsed, deployment is unavailable (Rule 7)
         if self.quota.reset_at and current_time < self.quota.reset_at:
             return False
-        # If circuit breaker is OPEN, deployment is excluded (Rule 2)
         if self.circuit_state == CircuitState.OPEN:
             return False
-        # If circuit is HALF_OPEN, allow controlled probes up to max_half_open_probes (Rule 3)
         if self.circuit_state == CircuitState.HALF_OPEN:
             with self._state_lock:
                 if len(self._active_probe_request_ids) >= self.max_half_open_probes:
@@ -784,7 +667,7 @@ class Deployment:
         return self.is_eligible(now)
 
     def claim_half_open_probe(self, request_id: Optional[str] = None) -> bool:
-        """Atomically claim a controlled probe slot in HALF_OPEN state (Rule 3, 11).
+        """Atomically claim a controlled probe slot in HALF_OPEN state.
 
         Returns True if the probe was successfully claimed or already claimed by this request_id,
         False if not in HALF_OPEN or probe capacity is exhausted.
@@ -810,7 +693,7 @@ class Deployment:
             self.half_open_probes = len(self._active_probe_request_ids)
 
     def admit_to_request_pool(self, now: Optional[float] = None, request_id: Optional[str] = None) -> bool:
-        """Atomically admit deployment into an active request pool (Task 11 / Final Correctness).
+        """Atomically admit deployment into an active request pool.
 
         For HALF_OPEN deployments, atomically claims a single probe slot tied to request_id before admission.
         Returns False if probe cannot be claimed, circuit is OPEN, quota is exhausted, or credentials missing.
@@ -907,7 +790,7 @@ class Deployment:
         recovery_time: Optional[float] = None,
         request_id: Optional[str] = None,
     ) -> None:
-        """Record qualifying upstream failure and update circuit breaker state (Rule 2, 5, 11)."""
+        """Record qualifying upstream failure and update circuit breaker state."""
         threshold = max_failures if max_failures is not None else self.max_consecutive_failures
         cooldown = recovery_time if recovery_time is not None else self.recovery_time
 
@@ -918,7 +801,6 @@ class Deployment:
                 self.half_open_probes = len(self._active_probe_request_ids)
 
             if self.circuit_state == CircuitState.HALF_OPEN:
-                # Failed probe in HALF_OPEN: immediately return to OPEN with backoff recovery time (Rule 5)
                 backoff_cooldown = cooldown * 2.0
                 open_until = now + backoff_cooldown
                 self.transition_to_open(
@@ -938,28 +820,25 @@ class Deployment:
                     )
 
     def record_success(self, request_id: Optional[str] = None) -> None:
-        """Record upstream success and restore circuit to HEALTHY (Rule 4, 11)."""
+        """Record upstream success and restore circuit to HEALTHY."""
         self.transition_to_healthy(
             reason="Probe succeeded; recovered to HEALTHY",
             request_id=request_id,
         )
 
     def refresh(self, now: Optional[float] = None) -> bool:
-        """Evaluate circuit breaker, quota recovery, and dynamic key replacement (Rule 3, 11)."""
+        """Evaluate circuit breaker, quota recovery, and dynamic key replacement."""
         current_time = now if now is not None else time.time()
 
         with self._state_lock:
-            # Dynamic Key Replacement: if api_key changed since auth quarantine, lift quarantine!
             if self.circuit_state == CircuitState.AUTH_FAILED and self.auth_failed_key_hash:
                 curr_hash = hashlib.sha256(self.api_key.encode("utf-8")).hexdigest()
                 if curr_hash != self.auth_failed_key_hash:
                     self.transition_to_healthy(reason="API key updated; authentication quarantine lifted")
 
-            # Clean up expired quota timestamp if elapsed
             if self.quota.reset_at and current_time >= self.quota.reset_at:
                 self.quota.reset_at = None
 
-            # Circuit OPEN -> HALF_OPEN evaluation (Rule 3)
             if self.circuit_state == CircuitState.OPEN:
                 is_circuit_cooled = bool(not self.circuit_open_until or current_time >= self.circuit_open_until)
                 is_quota_cooled = bool(not self.quota.reset_at or current_time >= self.quota.reset_at)
@@ -974,7 +853,7 @@ class Deployment:
             return self.is_eligible(current_time)
 
     def routing_config_fingerprint(self) -> Tuple[Any, ...]:
-        """Return a tuple capturing all routing-relevant configuration and state (Item 4).
+        """Return a tuple capturing all routing-relevant configuration and state.
 
         Changes to credentials, weights, API base, circuit state, quota reset timestamps,
         tags, or context window immediately change this fingerprint, triggering pool refresh.
@@ -1002,7 +881,7 @@ class Deployment:
         )
 
     def to_litellm_dict(self, group_override: Optional[str] = None) -> Dict[str, Any]:
-        """Converts deployment into LiteLLM router dictionary format with tags and weights."""
+        """Convert deployment into LiteLLM router dictionary format with tags and weights."""
         group_name = group_override if group_override else self.logical_model
         litellm_params: Dict[str, Any] = {
             "model": self.litellm_model,
