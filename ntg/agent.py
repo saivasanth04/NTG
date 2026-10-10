@@ -14,10 +14,12 @@ from ntg.agent.planner import (
     build_planning_prompt,
     build_query_prompt,
     extract_response_content,
+    finalize_grounded_answer,
     record_files_changed,
     record_validation_result,
     reject_plan,
     require_approved_plan,
+    validate_query_answer,
 )
 from ntg.agent.verifier import (
     CodeVerifier,
@@ -35,6 +37,8 @@ __all__ = [
     "extract_response_content",
     "build_planning_prompt",
     "build_query_prompt",
+    "validate_query_answer",
+    "finalize_grounded_answer",
     "build_change_plan",
     "approve_plan",
     "reject_plan",

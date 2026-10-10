@@ -12,25 +12,59 @@ import subprocess
 import sys
 from typing import Any
 
-_IGNORED_DIRS: frozenset[str] = frozenset(
+_IGNORED_DIRS_REASONS: dict[str, str] = {
+    ".git": "Git version-control metadata directory",
+    "__pycache__": "Python bytecode cache directory",
+    "venv": "Python virtual environment directory",
+    ".venv": "Python virtual environment directory",
+    "env": "Python virtual environment directory",
+    ".env": "Environment directory",
+    "node_modules": "Node.js dependency directory",
+    ".ntg": "NTG runtime router state and discovery cache directory",
+    "graphify-out": "Generated Graphify output and AST cache directory",
+    ".codebase-memory": "Codebase Memory MCP local index directory",
+    ".pytest_cache": "Pytest cache directory",
+    ".mypy_cache": "Mypy type-checking cache directory",
+    ".ruff_cache": "Ruff linter cache directory",
+    "build": "Build artifact directory",
+    "dist": "Distribution artifact directory",
+    ".idea": "IDE configuration directory",
+    ".vscode": "Editor configuration directory",
+}
+
+_IGNORED_DIRS: frozenset[str] = frozenset(_IGNORED_DIRS_REASONS.keys())
+
+_SECRET_FILENAMES: frozenset[str] = frozenset(
     {
-        ".git",
-        "__pycache__",
-        "venv",
-        ".venv",
-        "env",
         ".env",
-        "node_modules",
-        ".ntg",
-        "graphify-out",
-        ".codebase-memory",
-        ".pytest_cache",
-        ".mypy_cache",
-        ".ruff_cache",
-        "build",
-        "dist",
-        ".idea",
-        ".vscode",
+        ".env.local",
+        ".env.development",
+        ".env.production",
+    }
+)
+
+_BINARY_OR_CACHE_EXTENSIONS: frozenset[str] = frozenset(
+    {
+        ".pyc",
+        ".pyo",
+        ".pyd",
+        ".so",
+        ".dll",
+        ".exe",
+        ".bin",
+        ".db",
+        ".sqlite",
+        ".sqlite3",
+        ".whl",
+        ".tar",
+        ".gz",
+        ".zip",
+        ".png",
+        ".jpg",
+        ".jpeg",
+        ".gif",
+        ".ico",
+        ".pdf",
     }
 )
 
@@ -45,6 +79,25 @@ _CONFIG_DOC_FILENAMES: frozenset[str] = frozenset(
         "setup.cfg",
         "Makefile",
         "Dockerfile",
+        "LICENSE",
+        "MANIFEST.in",
+    }
+)
+
+_CONFIG_DOC_EXTENSIONS: frozenset[str] = frozenset(
+    {
+        ".md",
+        ".rst",
+        ".txt",
+        ".toml",
+        ".yaml",
+        ".yml",
+        ".json",
+        ".ini",
+        ".cfg",
+        ".sh",
+        ".ps1",
+        ".bat",
     }
 )
 
@@ -214,6 +267,99 @@ class CodeIntelligence:
         return result.stdout
 
     # ------------------------------------------------------------------
+    # Repository Discovery & Exclusions
+    # ------------------------------------------------------------------
+
+    def _discover_repo_files_with_exclusions(
+        self,
+    ) -> tuple[list[Path], list[Path], list[dict[str, str]], list[dict[str, str]]]:
+        """Discover `(python_files, config_doc_files, excluded_dirs, excluded_files)` under `self.repo_root`."""
+        py_files: list[Path] = []
+        other_files: list[Path] = []
+        excluded_dirs: list[dict[str, str]] = []
+        excluded_files: list[dict[str, str]] = []
+        seen_excluded_dirs: set[str] = set()
+
+        for current_root, dirs, files in os.walk(self.repo_root):
+            root_path = Path(current_root)
+            kept_dirs: list[str] = []
+            for d in sorted(dirs):
+                d_path = root_path / d
+                rel_d = d_path.relative_to(self.repo_root).as_posix()
+                if d in _IGNORED_DIRS:
+                    # Record top-level or package-level excluded directories concisely
+                    key = d if d == "__pycache__" else rel_d
+                    if key not in seen_excluded_dirs:
+                        seen_excluded_dirs.add(key)
+                        excluded_dirs.append(
+                            {
+                                "path": "**/__pycache__" if d == "__pycache__" else rel_d,
+                                "reason": _IGNORED_DIRS_REASONS.get(d, "Excluded directory"),
+                            }
+                        )
+                    continue
+                if d.endswith(".egg-info"):
+                    if rel_d not in seen_excluded_dirs:
+                        seen_excluded_dirs.add(rel_d)
+                        excluded_dirs.append(
+                            {"path": rel_d, "reason": "Packaging egg-info metadata directory"}
+                        )
+                    continue
+                kept_dirs.append(d)
+            dirs[:] = kept_dirs
+
+            for fname in sorted(files):
+                fpath = root_path / fname
+                rel_f = fpath.relative_to(self.repo_root).as_posix()
+                rel_parts = fpath.relative_to(self.repo_root).parts
+                if any(p in _IGNORED_DIRS or p.endswith(".egg-info") for p in rel_parts[:-1]):
+                    continue
+
+                lower_name = fname.lower()
+                suffix = fpath.suffix.lower()
+
+                if lower_name in _SECRET_FILENAMES or (
+                    lower_name.startswith(".env.") and lower_name != ".env.example"
+                ):
+                    excluded_files.append(
+                        {
+                            "path": rel_f,
+                            "reason": "Excluded secret/environment credential file",
+                        }
+                    )
+                    continue
+
+                if suffix in _BINARY_OR_CACHE_EXTENSIONS:
+                    excluded_files.append(
+                        {
+                            "path": rel_f,
+                            "reason": f"Excluded binary or compiled artifact ({suffix})",
+                        }
+                    )
+                    continue
+
+                if suffix == ".py":
+                    py_files.append(fpath)
+                elif fname in _CONFIG_DOC_FILENAMES or suffix in _CONFIG_DOC_EXTENSIONS:
+                    other_files.append(fpath)
+                else:
+                    excluded_files.append(
+                        {
+                            "path": rel_f,
+                            "reason": "Non-source/non-configuration file",
+                        }
+                    )
+
+        py_files.sort(key=lambda p: p.relative_to(self.repo_root).as_posix())
+        other_files.sort(key=lambda p: p.relative_to(self.repo_root).as_posix())
+        return py_files, other_files, excluded_dirs, excluded_files
+
+    def _discover_repo_files(self) -> tuple[list[Path], list[Path]]:
+        """Return sorted lists of `(python_files, config_and_doc_files)` under `self.repo_root`."""
+        py_files, other_files, _, _ = self._discover_repo_files_with_exclusions()
+        return py_files, other_files
+
+    # ------------------------------------------------------------------
     # Graphify Operations & Freshness / Contamination Validation
     # ------------------------------------------------------------------
 
@@ -227,38 +373,11 @@ class CodeIntelligence:
         """Path to the Graphify markdown report file."""
         return self.repo_root / "graphify-out" / "GRAPH_REPORT.md"
 
-    def _discover_repo_files(self) -> tuple[list[Path], list[Path]]:
-        """Return sorted lists of `(python_files, config_and_doc_files)` under `self.repo_root`."""
-        py_files: list[Path] = []
-        other_files: list[Path] = []
-
-        for current_root, dirs, files in os.walk(self.repo_root):
-            dirs[:] = sorted(
-                d
-                for d in dirs
-                if d not in _IGNORED_DIRS and not d.endswith(".egg-info")
-            )
-            root_path = Path(current_root)
-            for fname in sorted(files):
-                fpath = root_path / fname
-                rel_parts = fpath.relative_to(self.repo_root).parts
-                if any(p in _IGNORED_DIRS or p.endswith(".egg-info") for p in rel_parts):
-                    continue
-                if fname.endswith(".py"):
-                    py_files.append(fpath)
-                elif fname in _CONFIG_DOC_FILENAMES or (
-                    len(rel_parts) == 1 and fname.lower().endswith(".md")
-                ):
-                    other_files.append(fpath)
-
-        py_files.sort(key=lambda p: p.relative_to(self.repo_root).as_posix())
-        other_files.sort(key=lambda p: p.relative_to(self.repo_root).as_posix())
-        return py_files, other_files
-
     def inspect_graphify_status(self) -> dict[str, Any]:
         """Validate `graphify-out/graph.json` against the current repository root and files."""
         status: dict[str, Any] = {
             "graph_file": str(self.graph_file),
+            "verified": True,
             "exists": self.graph_file.is_file(),
             "valid": False,
             "fresh": False,
@@ -307,7 +426,7 @@ class CodeIntelligence:
 
         nodes = raw_data.get("nodes", [])
         edges = raw_data.get("links", raw_data.get("edges", []))
-        status["valid"] = True
+        status["valid"] = len(nodes) > 0
         status["node_count"] = len(nodes)
         status["edge_count"] = len(edges) if isinstance(edges, list) else 0
 
@@ -334,6 +453,7 @@ class CodeIntelligence:
                 rel_sf = resolved_sf.relative_to(self.repo_root).as_posix()
             except ValueError:
                 deleted_files.add(norm_sf)
+                status["mismatched_root"] = True
                 continue
 
             graph_source_files.add(rel_sf)
@@ -362,7 +482,6 @@ class CodeIntelligence:
             if not content:
                 continue
 
-            # Check if file defines classes/functions or executable statements
             has_ast_symbols = False
             try:
                 tree = ast.parse(content)
@@ -414,7 +533,8 @@ class CodeIntelligence:
                 )
 
         needs_refresh = bool(
-            status["contaminated"]
+            not status["valid"]
+            or status["contaminated"]
             or status["mismatched_root"]
             or deleted_files
             or missing_files
@@ -495,7 +615,7 @@ class CodeIntelligence:
         return self._run(cmd, timeout=90)
 
     def ensure_graphify_graph(self, force_refresh: bool = False) -> Path:
-        """Ensure `graphify-out/graph.json` exists and is fresh and uncontaminated."""
+        """Ensure `graphify-out/graph.json` exists and is verified fresh and uncontaminated."""
         status = self.inspect_graphify_status()
         if force_refresh or status["needs_refresh"]:
             if status.get("contaminated"):
@@ -509,6 +629,10 @@ class CodeIntelligence:
             if post_status["deleted_files"]:
                 raise RuntimeError(
                     f"Graphify graph still contains deleted files after rebuild: {post_status['deleted_files']}"
+                )
+            if post_status["missing_files"]:
+                raise RuntimeError(
+                    f"Graphify graph is missing repository files after rebuild: {post_status['missing_files']}"
                 )
         return self.graph_file
 
@@ -552,7 +676,7 @@ class CodeIntelligence:
         return self._run(cmd)
 
     # ------------------------------------------------------------------
-    # Codebase Memory MCP Operations
+    # Codebase Memory MCP Operations & Index Integrity Validation
     # ------------------------------------------------------------------
 
     def list_memory_projects(self) -> list[dict[str, Any]]:
@@ -604,7 +728,11 @@ class CodeIntelligence:
         matching_names.sort(key=len)
         return True, matching_names[0]
 
-    def resolve_memory_project(self, preferred_project: str | None = None) -> str:
+    def resolve_memory_project(
+        self,
+        preferred_project: str | None = None,
+        projects: list[dict[str, Any]] | None = None,
+    ) -> str:
         """Resolve the indexed project name corresponding to `self.repo_root` in Codebase Memory MCP.
         Never silently selects an unrelated project belonging to a different directory.
         """
@@ -616,11 +744,11 @@ class CodeIntelligence:
         canonical_slug = _canonical_project_slug(self.repo_root)
 
         try:
-            projects = self.list_memory_projects()
+            proj_list = projects if projects is not None else self.list_memory_projects()
             matching_repo_projects: list[str] = []
             unrelated_project_names: set[str] = set()
 
-            for entry in projects:
+            for entry in proj_list:
                 root_str = entry.get("root_path")
                 name = entry.get("name")
                 if not isinstance(name, str) or not name.strip():
@@ -661,6 +789,208 @@ class CodeIntelligence:
         if self.default_project:
             return self.default_project
         return canonical_slug
+
+    def inspect_memory_status(self, project: str | None = None) -> dict[str, Any]:
+        """Validate the Codebase Memory MCP index against `self.repo_root` and current source files."""
+        canonical_slug = _canonical_project_slug(self.repo_root)
+        status: dict[str, Any] = {
+            "project": project or self.default_project or canonical_slug,
+            "canonical_project": canonical_slug,
+            "verified": True,
+            "exists": False,
+            "indexed": False,
+            "valid": False,
+            "fresh": False,
+            "needs_refresh": True,
+            "contaminated": False,
+            "mismatched_root": False,
+            "indexed_files": [],
+            "deleted_files": [],
+            "missing_files": [],
+            "stale_files": [],
+            "reasons": [],
+        }
+
+        try:
+            projects = self.list_memory_projects()
+        except Exception as exc:
+            status["reasons"].append(f"Failed to list Codebase Memory projects: {exc}")
+            return status
+
+        matching_entries: list[dict[str, Any]] = []
+        pref = project.strip() if isinstance(project, str) and project.strip() else None
+
+        for entry in projects:
+            root_str = entry.get("root_path")
+            name = entry.get("name")
+            if not isinstance(name, str) or not name.strip():
+                continue
+            clean_name = name.strip()
+            if isinstance(root_str, str) and root_str.strip():
+                try:
+                    resolved_entry_root = Path(root_str).resolve()
+                    if resolved_entry_root == self.repo_root:
+                        matching_entries.append(entry)
+                    elif pref and clean_name == pref:
+                        status["mismatched_root"] = True
+                        status["contaminated"] = True
+                        status["reasons"].append(
+                            f"Preferred project '{pref}' points to unrelated root {resolved_entry_root} instead of {self.repo_root}"
+                        )
+                except Exception:
+                    continue
+
+        if not matching_entries:
+            status["reasons"].append(
+                f"Repository root {self.repo_root} is not indexed in Codebase Memory MCP"
+            )
+            return status
+
+        resolved_proj = self.resolve_memory_project(project, projects=projects)
+        status["project"] = resolved_proj
+        status["exists"] = True
+        status["indexed"] = True
+
+        try:
+            raw_files = self.memory_query(
+                resolved_proj,
+                ".*",
+                limit=500,
+                label="File",
+            )
+            file_data = json.loads(raw_files)
+            raw_modules = self.memory_query(
+                resolved_proj,
+                ".*",
+                limit=500,
+                label="Module",
+            )
+            mod_data = json.loads(raw_modules)
+        except Exception as exc:
+            status["reasons"].append(f"Failed to query File/Module nodes for '{resolved_proj}': {exc}")
+            return status
+
+        if not isinstance(mod_data, dict) or not isinstance(mod_data.get("groups"), list):
+            status["reasons"].append(f"Unexpected Module query payload for '{resolved_proj}'")
+            return status
+
+        indexed_files: set[str] = set()
+        deleted_files: set[str] = set()
+        stale_files: set[str] = set()
+        indexed_line_counts: dict[str, int] = {}
+
+        combined_groups: list[Any] = []
+        if isinstance(file_data, dict) and isinstance(file_data.get("groups"), list):
+            combined_groups.extend(file_data["groups"])
+        combined_groups.extend(mod_data.get("groups", []))
+
+        for grp in combined_groups:
+            if not isinstance(grp, dict):
+                continue
+            rel_file = grp.get("file")
+            if not isinstance(rel_file, str) or not rel_file.strip():
+                continue
+            norm_rel = rel_file.strip().replace("\\", "/")
+            indexed_files.add(norm_rel)
+
+            rows = grp.get("rows")
+            if isinstance(rows, list) and rows and isinstance(rows[0], list) and len(rows[0]) >= 3:
+                line_range = str(rows[0][2] or "")
+                if "-" in line_range:
+                    try:
+                        end_line = int(line_range.split("-")[-1])
+                        indexed_line_counts[norm_rel] = end_line
+                    except ValueError:
+                        pass
+
+            disk_path = (self.repo_root / norm_rel).resolve()
+            try:
+                disk_path.relative_to(self.repo_root)
+            except ValueError:
+                deleted_files.add(norm_rel)
+                status["mismatched_root"] = True
+                continue
+
+            if not disk_path.is_file():
+                deleted_files.add(norm_rel)
+
+        py_files, _ = self._discover_repo_files()
+        missing_files: list[str] = []
+
+        for py_path in py_files:
+            rel_py = py_path.relative_to(self.repo_root).as_posix()
+            try:
+                text = py_path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+
+            if not text.strip():
+                continue
+
+            if rel_py not in indexed_files:
+                missing_files.append(rel_py)
+            elif rel_py in indexed_line_counts:
+                disk_lines = len(text.splitlines())
+                idx_lines = indexed_line_counts[rel_py]
+                if abs(disk_lines - idx_lines) > 1:
+                    stale_files.add(rel_py)
+
+        status["valid"] = len(indexed_files) > 0
+        status["indexed_files"] = sorted(indexed_files)
+        status["deleted_files"] = sorted(deleted_files)
+        status["missing_files"] = sorted(missing_files)
+        status["stale_files"] = sorted(stale_files)
+
+        if deleted_files:
+            status["contaminated"] = True
+            status["reasons"].append(
+                f"Codebase Memory index references {len(deleted_files)} deleted file(s): {', '.join(sorted(deleted_files)[:8])}"
+            )
+        if missing_files:
+            status["reasons"].append(
+                f"Codebase Memory index is missing {len(missing_files)} current Python file(s): {', '.join(sorted(missing_files)[:8])}"
+            )
+        if stale_files:
+            status["reasons"].append(
+                f"Codebase Memory index has outdated line counts for {len(stale_files)} modified file(s): {', '.join(sorted(stale_files)[:8])}"
+            )
+
+        needs_refresh = bool(
+            not status["valid"]
+            or status["contaminated"]
+            or status["mismatched_root"]
+            or deleted_files
+            or missing_files
+            or stale_files
+        )
+        status["needs_refresh"] = needs_refresh
+        status["fresh"] = status["valid"] and not needs_refresh
+        return status
+
+    def ensure_memory_index(
+        self,
+        project: str | None = None,
+        force_refresh: bool = False,
+    ) -> dict[str, Any]:
+        """Ensure Codebase Memory MCP index for `self.repo_root` exists, is fresh, and is verified."""
+        status = self.inspect_memory_status(project)
+        if force_refresh or status["needs_refresh"]:
+            self.memory_index(project=project, mode="fast")
+            post_status = self.inspect_memory_status(project)
+            if not post_status["valid"]:
+                raise RuntimeError(
+                    f"Codebase Memory indexing did not produce a valid index: {'; '.join(post_status['reasons'])}"
+                )
+            if post_status["deleted_files"]:
+                raise RuntimeError(
+                    f"Codebase Memory index still contains deleted files after re-index: {post_status['deleted_files']}"
+                )
+            if post_status["missing_files"]:
+                raise RuntimeError(
+                    f"Codebase Memory index is missing files after re-index: {post_status['missing_files']}"
+                )
+            return post_status
+        return status
 
     def memory_query(
         self,
@@ -843,9 +1173,9 @@ class CodeIntelligence:
             no_ext = rel[:-3] if rel.endswith(".py") else rel
             parts = no_ext.split("/")
             if parts[-1] == "__init__":
-                pkg_Parts = parts[:-1]
-                if pkg_Parts:
-                    mod_to_rel[".".join(pkg_Parts)] = rel
+                pkg_parts = parts[:-1]
+                if pkg_parts:
+                    mod_to_rel[".".join(pkg_parts)] = rel
             else:
                 mod_to_rel[".".join(parts)] = rel
         return mod_to_rel
@@ -895,7 +1225,6 @@ class CodeIntelligence:
                         internal.add(target_rel)
                     matched_internal = True
 
-            # Also check parent packages if base_mod is a deep symbol reference
             if not matched_internal and "." in base_mod:
                 parts = base_mod.split(".")
                 for i in range(len(parts) - 1, 0, -1):
@@ -950,6 +1279,7 @@ class CodeIntelligence:
             "external_dependencies": [],
             "depended_on_by": [],
             "is_entry_point": rel_path in ("main.py", "test.py") or rel_path.endswith("__main__.py"),
+            "parse_error": None,
         }
 
         if not source.strip():
@@ -959,6 +1289,7 @@ class CodeIntelligence:
         try:
             tree = ast.parse(source)
         except SyntaxError as exc:
+            info["parse_error"] = f"SyntaxError at line {exc.lineno}: {exc.msg}"
             info["summary"] = f"Python source file (syntax error at line {exc.lineno})."
             return info
 
@@ -1002,20 +1333,6 @@ class CodeIntelligence:
                         "line": node.lineno,
                     }
                 )
-            elif isinstance(node, ast.Import):
-                names = [alias.name for alias in node.names]
-                int_d, ext_d = self._resolve_import_targets(
-                    rel_path, None, names, 0, mod_to_rel
-                )
-                internal_deps.update(int_d)
-                external_deps.update(ext_d)
-            elif isinstance(node, ast.ImportFrom):
-                names = [alias.name for alias in node.names]
-                int_d, ext_d = self._resolve_import_targets(
-                    rel_path, node.module, names, node.level or 0, mod_to_rel
-                )
-                internal_deps.update(int_d)
-                external_deps.update(ext_d)
             elif isinstance(node, ast.Assign):
                 for target in node.targets:
                     if isinstance(target, ast.Name) and target.id == "__all__":
@@ -1031,7 +1348,6 @@ class CodeIntelligence:
                 except Exception:
                     pass
 
-        # Also inspect nested imports inside functions/methods so lazy imports are captured
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
                 names = [alias.name for alias in node.names]
@@ -1060,8 +1376,8 @@ class CodeIntelligence:
             info["summary"] = doc
         elif rel_path == "test.py":
             info["summary"] = (
-                "Top-level verification/demo script that invokes `query_directory('.', ...)` "
-                "from `ntg.agent` to explain the codebase and output a file reading order."
+                "Top-level verification/demo script that invokes `query_directory(...)` "
+                "from `ntg` to explain the codebase and output a dependency-aware file reading order."
             )
         elif classes or functions:
             sym_list = [c["name"] for c in classes] + [f["name"] for f in functions]
@@ -1140,6 +1456,7 @@ class CodeIntelligence:
             "external_dependencies": [],
             "depended_on_by": [],
             "is_entry_point": False,
+            "parse_error": None,
         }
 
     def _classify_layer(self, file_info: dict[str, Any]) -> tuple[int, str, int]:
@@ -1169,7 +1486,6 @@ class CodeIntelligence:
         if len(parts) >= 2 and parts[0] == "ntg":
             subpkg = parts[1]
             if subpkg == "core":
-                # Leaf utilities & config/models/exceptions before __init__.py
                 prio_map = {
                     "ntg/core/utils.py": 0,
                     "ntg/core/config.py": 1,
@@ -1261,7 +1577,6 @@ class CodeIntelligence:
             layer_name, layer_files = layers[layer_num]
             layer_paths = {f["path"] for f in layer_files}
 
-            # Topological sort within the layer so intra-layer dependencies come first
             in_degree: dict[str, int] = {p: 0 for p in layer_paths}
             adj: dict[str, list[str]] = {p: [] for p in layer_paths}
 
@@ -1297,7 +1612,6 @@ class CodeIntelligence:
                             )
                         )
 
-            # In case of intra-layer cycles (e.g. __init__.py <-> submodule), append remaining in priority order
             if len(sorted_layer_paths) < len(layer_paths):
                 remaining = [p for p in layer_paths if p not in sorted_layer_paths]
                 remaining.sort(
@@ -1359,8 +1673,12 @@ class CodeIntelligence:
         return ordered_items
 
     def build_repository_inventory(self) -> dict[str, Any]:
-        """Build a complete, deterministic AST and filesystem inventory of the repository."""
-        py_files, other_files = self._discover_repo_files()
+        """Build a complete, deterministic AST and filesystem inventory of the repository,
+        including symbol map, dependency map, reading order, excluded files/dirs, and limitations.
+        """
+        py_files, other_files, excluded_dirs, excluded_files = (
+            self._discover_repo_files_with_exclusions()
+        )
         mod_to_rel = self._module_map_for_repo(py_files)
 
         files_by_path: dict[str, dict[str, Any]] = {}
@@ -1368,23 +1686,72 @@ class CodeIntelligence:
             info = self._analyze_config_or_doc_file(fpath)
             files_by_path[info["path"]] = info
 
+        parse_errors: list[str] = []
         for py_path in py_files:
             info = self._analyze_python_file(py_path, mod_to_rel)
             files_by_path[info["path"]] = info
+            if info.get("parse_error"):
+                parse_errors.append(f"{info['path']}: {info['parse_error']}")
 
-        # Populate reverse dependencies (`depended_on_by`)
         for src_path, info in files_by_path.items():
             for target_dep in info["internal_dependencies"]:
-                if target_dep in files_by_path and src_path not in files_by_path[target_dep]["depended_on_by"]:
+                if (
+                    target_dep in files_by_path
+                    and src_path not in files_by_path[target_dep]["depended_on_by"]
+                ):
                     files_by_path[target_dep]["depended_on_by"].append(src_path)
 
-        for info in files_by_path.values():
+        symbol_map: dict[str, dict[str, Any]] = {}
+        dependency_map: dict[str, dict[str, list[str]]] = {}
+
+        for rel_path, info in sorted(files_by_path.items()):
             info["depended_on_by"].sort()
+            dependency_map[rel_path] = {
+                "depends_on": info["internal_dependencies"],
+                "depended_on_by": info["depended_on_by"],
+                "external_dependencies": info["external_dependencies"],
+            }
+            for cls in info.get("classes", []):
+                symbol_map[f"{rel_path}:{cls['name']}"] = {
+                    "name": cls["name"],
+                    "kind": "class",
+                    "file": rel_path,
+                    "line": cls.get("line", 1),
+                    "methods": cls.get("methods", []),
+                    "docstring": cls.get("docstring", ""),
+                }
+            for fn in info.get("functions", []):
+                symbol_map[f"{rel_path}:{fn['name']}"] = {
+                    "name": fn["name"],
+                    "kind": "function",
+                    "file": rel_path,
+                    "line": fn.get("line", 1),
+                    "docstring": fn.get("docstring", ""),
+                }
 
         reading_order = self._compute_reading_order(files_by_path)
         entry_points = [
             p for p, info in sorted(files_by_path.items()) if info.get("is_entry_point")
         ]
+
+        coverage_limitations: list[str] = []
+        if excluded_files:
+            excl_f_summary = ", ".join(
+                f"{item['path']} ({item['reason']})" for item in excluded_files[:10]
+            )
+            coverage_limitations.append(f"Excluded files: {excl_f_summary}")
+        if excluded_dirs:
+            excl_d_summary = ", ".join(
+                f"{item['path']} ({item['reason']})" for item in excluded_dirs[:10]
+            )
+            coverage_limitations.append(f"Excluded directories: {excl_d_summary}")
+        if parse_errors:
+            coverage_limitations.append(
+                f"Files with syntax/parse errors ({len(parse_errors)}): {'; '.join(parse_errors)}"
+            )
+        coverage_limitations.append(
+            "Static AST dependency analysis captures all module-level and function-level `import`/`from ... import` edges; dynamic runtime dispatch (e.g., LiteLLM provider callback hooks) is supplemented via Graphify and Codebase Memory MCP."
+        )
 
         return {
             "repo_root": str(self.repo_root),
@@ -1394,19 +1761,30 @@ class CodeIntelligence:
             "config_doc_file_count": len(other_files),
             "entry_points": entry_points,
             "files": [files_by_path[k] for k in sorted(files_by_path.keys())],
+            "symbol_map": symbol_map,
+            "dependency_map": dependency_map,
             "reading_order": reading_order,
+            "excluded_dirs": excluded_dirs,
+            "excluded_files": excluded_files,
+            "parse_errors": parse_errors,
+            "coverage_limitations": coverage_limitations,
         }
 
     def format_inventory_for_prompt(
         self,
         inventory: dict[str, Any] | None = None,
     ) -> str:
-        """Render the complete file inventory and dependency-aware reading order as concise Markdown."""
+        """Render the complete file inventory, dependency-aware reading order, and exclusions as Markdown."""
         inv = inventory or self.build_repository_inventory()
+        excl_dirs = [d["path"] for d in inv.get("excluded_dirs", [])]
+        excl_files = [f"{f['path']} ({f['reason']})" for f in inv.get("excluded_files", [])]
+
         lines: list[str] = [
             f"- **Repository Root**: `{inv['repo_root']}`",
-            f"- **Total Relevant Files**: {inv['total_files']} ({inv['python_file_count']} Python modules, {inv['config_doc_file_count']} config/documentation files)",
+            f"- **Total Analyzed Project Files**: {inv['total_files']} ({inv['python_file_count']} Python modules, {inv['config_doc_file_count']} config/documentation files)",
             f"- **Execution Entry Points**: {', '.join(f'`{ep}`' for ep in inv['entry_points']) or 'None'}",
+            f"- **Excluded Directories**: {', '.join(f'`{d}`' for d in excl_dirs) or 'None'}",
+            f"- **Excluded Files**: {', '.join(f'`{f}`' for f in excl_files) or 'None'}",
             "",
             "### Dependency-Aware Reading Order & Complete File Inventory",
         ]
@@ -1437,15 +1815,21 @@ class CodeIntelligence:
             rev_deps = item.get("depended_on_by", [])
             ext_deps = f_info.get("external_dependencies", [])
 
-            details: list[str] = [f"**`{path}`** ({f_info.get('lines', 0)} lines): {item['summary']}"]
+            details: list[str] = [
+                f"**`{path}`** ({f_info.get('lines', 0)} lines): {item['summary']}"
+            ]
             if classes:
                 details.append(f"  - Classes: `{', '.join(classes)}`")
             if funcs:
                 details.append(f"  - Functions: `{', '.join(funcs[:10])}`")
             if deps:
-                details.append(f"  - Internal Imports (`depends_on`): {', '.join(f'`{d}`' for d in deps)}")
+                details.append(
+                    f"  - Internal Imports (`depends_on`): {', '.join(f'`{d}`' for d in deps)}"
+                )
             else:
-                details.append("  - Internal Imports (`depends_on`): None (leaf / standalone file)")
+                details.append(
+                    "  - Internal Imports (`depends_on`): None (leaf / standalone file)"
+                )
             if rev_deps:
                 details.append(
                     f"  - Imported By (`depended_on_by`): {', '.join(f'`{r}`' for r in rev_deps[:8])}"
@@ -1456,6 +1840,12 @@ class CodeIntelligence:
 
             lines.append(f"{item['step']}. " + "\n".join(details))
 
+        limitations = inv.get("coverage_limitations", [])
+        if limitations:
+            lines.append("\n### Explicit Coverage & Static Analysis Notes")
+            for lim in limitations:
+                lines.append(f"- {lim}")
+
         return "\n".join(lines)
 
     # ------------------------------------------------------------------
@@ -1463,31 +1853,38 @@ class CodeIntelligence:
     # ------------------------------------------------------------------
 
     def refresh_knowledge(self, project: str | None = None) -> dict[str, Any]:
-        """Rebuild/update both Graphify and Codebase Memory MCP indices after code changes."""
+        """Rebuild/update both Graphify and Codebase Memory MCP indices and verify both after refresh."""
         errors: list[str] = []
         graphify_ok = False
         memory_ok = False
         graphify_out = ""
         memory_out = ""
+        post_graph: dict[str, Any] = {}
+        post_memory: dict[str, Any] = {}
 
         try:
             graphify_out = self.graphify_update(".", force=True, clean_if_contaminated=True)
             post_graph = self.inspect_graphify_status()
-            graphify_ok = bool(post_graph["valid"] and not post_graph["deleted_files"])
+            graphify_ok = bool(post_graph["fresh"] and not post_graph["deleted_files"])
             if not graphify_ok:
                 errors.append(
-                    f"graphify_update validation failed: {'; '.join(post_graph['reasons'])}"
+                    f"graphify_update post-refresh verification failed: {'; '.join(post_graph['reasons'])}"
                 )
         except Exception as err:
             errors.append(f"graphify_update: {err}")
 
         try:
             memory_out = self.memory_index(project=project)
-            memory_ok = True
+            post_memory = self.inspect_memory_status(project=project)
+            memory_ok = bool(post_memory["fresh"] and not post_memory["deleted_files"])
+            if not memory_ok:
+                errors.append(
+                    f"memory_index post-refresh verification failed: {'; '.join(post_memory['reasons'])}"
+                )
         except Exception as err:
             errors.append(f"memory_index: {err}")
 
-        effective_proj = self.resolve_memory_project(project)
+        effective_proj = post_memory.get("project") or self.resolve_memory_project(project)
         return {
             "synced": graphify_ok and memory_ok,
             "graphify_updated": graphify_ok,
@@ -1495,11 +1892,15 @@ class CodeIntelligence:
             "project": effective_proj,
             "graphify": {
                 "updated": graphify_ok,
+                "verified": post_graph.get("fresh", False),
+                "status": post_graph,
                 "output": graphify_out.strip(),
             },
             "memory": {
                 "indexed": memory_ok,
+                "verified": post_memory.get("fresh", False),
                 "project": effective_proj,
+                "status": post_memory,
                 "output": memory_out.strip(),
             },
             "graphify_output": graphify_out,
@@ -1554,9 +1955,11 @@ class CodeIntelligence:
         project: str | None = None,
         symbol_pattern: str | None = None,
         auto_build: bool = False,
+        strict: bool = False,
     ) -> dict[str, Any]:
         """Gather combined deterministic AST inventory, Graphify context, and Codebase Memory MCP
-        architecture & symbol intelligence.
+        architecture & symbol intelligence. Validates both indexes before and after refresh and
+        never silently uses stale or contaminated index data.
         """
         if not question or not question.strip():
             raise ValueError("Question cannot be empty.")
@@ -1570,79 +1973,112 @@ class CodeIntelligence:
         # 1. Build deterministic repository inventory and dependency-aware reading order
         inventory = self.build_repository_inventory()
         formatted_inventory = self.format_inventory_for_prompt(inventory)
+        if inventory.get("parse_errors"):
+            errors.append(
+                f"inventory_parse_errors: {'; '.join(inventory['parse_errors'])}"
+            )
 
-        # 2. Validate Graphify freshness & contamination, refreshing if auto_build=True
+        # 2. Validate Graphify freshness & contamination; refresh only when needed and verify after refresh
         graph_status = self.inspect_graphify_status()
         try:
             if graph_status["needs_refresh"]:
                 if auto_build:
                     self.ensure_graphify_graph(force_refresh=True)
                     graph_status = self.inspect_graphify_status()
-                elif not graph_status["exists"]:
-                    errors.append("graphify_status: graphify-out/graph.json is missing (auto_build=False)")
                 else:
+                    reasons_str = "; ".join(graph_status["reasons"]) or "stale or missing graph"
                     errors.append(
-                        f"graphify_status: graph is stale/contaminated ({'; '.join(graph_status['reasons'])})"
+                        f"graphify_status: Graphify index is not fresh ({reasons_str}) and auto_build=False"
                     )
-            if graph_status["valid"]:
+
+            # Never silently use contaminated or invalid Graphify data
+            if graph_status["valid"] and not graph_status["contaminated"] and graph_status["fresh"]:
                 graph_ctx = self.graphify_query(question, budget=2500)
                 graph_report = self.read_graphify_report_summary(max_chars=3000)
+            elif graph_status["contaminated"]:
+                errors.append(
+                    f"graphify_contaminated: Refusing to use contaminated Graphify index ({'; '.join(graph_status['reasons'])})"
+                )
         except Exception as err:
             errors.append(f"graphify_query: {err}")
 
-        # 3. Resolve & validate Codebase Memory MCP project and retrieve full architecture
-        is_indexed, matched_proj = self.is_memory_project_indexed(project)
-        resolved_proj = matched_proj or self.resolve_memory_project(project)
+        # 3. Validate Codebase Memory MCP index against repo_root and current files; refresh only when needed
+        memory_status = self.inspect_memory_status(project)
+        resolved_proj = memory_status["project"]
 
         try:
-            if not is_indexed and auto_build:
-                self.memory_index(project=project)
-                is_indexed, matched_proj = self.is_memory_project_indexed(project)
-                resolved_proj = matched_proj or self.resolve_memory_project(project)
+            if memory_status["needs_refresh"]:
+                if auto_build:
+                    memory_status = self.ensure_memory_index(project=project, force_refresh=True)
+                    resolved_proj = memory_status["project"]
+                else:
+                    reasons_str = "; ".join(memory_status["reasons"]) or "stale or missing index"
+                    errors.append(
+                        f"memory_status: Codebase Memory index is not fresh ({reasons_str}) and auto_build=False"
+                    )
 
-            raw_arch = self.memory_architecture(resolved_proj, aspects="all")
-            arch_ctx = self._summarize_memory_architecture(raw_arch)
+            # Never silently use contaminated or invalid Codebase Memory MCP data
+            if memory_status["valid"] and not memory_status["contaminated"] and memory_status["fresh"]:
+                raw_arch = self.memory_architecture(resolved_proj, aspects="all")
+                arch_ctx = self._summarize_memory_architecture(raw_arch)
+
+                effective_pattern = (
+                    symbol_pattern.strip()
+                    if isinstance(symbol_pattern, str) and symbol_pattern.strip()
+                    else ".*"
+                )
+                raw_symbols = self.memory_query(
+                    resolved_proj,
+                    effective_pattern,
+                    limit=80,
+                )
+                memory_ctx = self._summarize_memory_symbols(raw_symbols)
+            elif memory_status["contaminated"]:
+                errors.append(
+                    f"memory_contaminated: Refusing to use contaminated Codebase Memory index ({'; '.join(memory_status['reasons'])})"
+                )
         except Exception as err:
-            if auto_build:
-                try:
-                    self.memory_index(project=project)
-                    is_indexed, matched_proj = self.is_memory_project_indexed(project)
-                    resolved_proj = matched_proj or self.resolve_memory_project(project)
-                    raw_arch = self.memory_architecture(resolved_proj, aspects="all")
-                    arch_ctx = self._summarize_memory_architecture(raw_arch)
-                except Exception as retry_err:
-                    errors.append(f"memory_architecture: {retry_err}")
-            else:
-                errors.append(f"memory_architecture: {err}")
+            errors.append(f"memory_retrieval: {err}")
 
-        # 4. Retrieve symbol context (even when symbol_pattern is not explicitly supplied)
-        effective_pattern = (
-            symbol_pattern.strip()
-            if isinstance(symbol_pattern, str) and symbol_pattern.strip()
-            else ".*"
+        all_sources_verified = bool(
+            graph_status.get("verified")
+            and graph_status.get("fresh")
+            and memory_status.get("verified")
+            and memory_status.get("fresh")
+            and not errors
         )
-        try:
-            raw_symbols = self.memory_query(
-                resolved_proj,
-                effective_pattern,
-                limit=80,
-            )
-            memory_ctx = self._summarize_memory_symbols(raw_symbols)
-        except Exception as err:
-            errors.append(f"memory_query: {err}")
 
         coverage = {
             "total_repo_files": inventory["total_files"],
             "python_files": inventory["python_file_count"],
             "config_doc_files": inventory["config_doc_file_count"],
-            "graphify_fresh": graph_status["fresh"],
-            "graphify_indexed_files": len(graph_status["indexed_files"]),
-            "graphify_deleted_files": graph_status["deleted_files"],
-            "graphify_missing_files": graph_status["missing_files"],
+            "excluded_dirs_count": len(inventory.get("excluded_dirs", [])),
+            "excluded_files_count": len(inventory.get("excluded_files", [])),
+            "excluded_dirs": inventory.get("excluded_dirs", []),
+            "excluded_files": inventory.get("excluded_files", []),
+            "coverage_limitations": inventory.get("coverage_limitations", []),
+            "graphify_verified": bool(graph_status.get("verified")),
+            "graphify_fresh": bool(graph_status.get("fresh")),
+            "graphify_indexed_files": len(graph_status.get("indexed_files", [])),
+            "graphify_deleted_files": graph_status.get("deleted_files", []),
+            "graphify_missing_files": graph_status.get("missing_files", []),
             "memory_project": resolved_proj,
-            "memory_indexed": is_indexed,
+            "memory_verified": bool(memory_status.get("verified")),
+            "memory_indexed": bool(memory_status.get("indexed")),
+            "memory_fresh": bool(memory_status.get("fresh")),
+            "memory_indexed_files": len(memory_status.get("indexed_files", [])),
+            "memory_deleted_files": memory_status.get("deleted_files", []),
+            "memory_missing_files": memory_status.get("missing_files", []),
+            "memory_stale_files": memory_status.get("stale_files", []),
             "complete_inventory_available": True,
+            "all_sources_verified": all_sources_verified,
         }
+
+        if strict and not all_sources_verified:
+            raise RuntimeError(
+                "Strict mode: critical indexing or retrieval verification failed: "
+                + ("; ".join(errors) if errors else "unverified knowledge sources")
+            )
 
         return {
             "repo_root": str(self.repo_root),
@@ -1650,8 +2086,11 @@ class CodeIntelligence:
             "project": resolved_proj,
             "index_status": {
                 "graphify": graph_status,
+                "memory": memory_status,
                 "memory_project": resolved_proj,
-                "memory_indexed": is_indexed,
+                "memory_indexed": bool(memory_status.get("indexed")),
+                "memory_fresh": bool(memory_status.get("fresh")),
+                "all_verified": all_sources_verified,
             },
             "coverage": coverage,
             "repository_inventory": inventory,

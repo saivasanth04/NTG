@@ -14,9 +14,11 @@ from ntg.agent.planner import (
     build_planning_prompt,
     build_query_prompt,
     extract_response_content,
+    finalize_grounded_answer,
     record_files_changed,
     reject_plan,
     require_approved_plan,
+    validate_query_answer,
 )
 from ntg.agent.verifier import CodeVerifier
 from ntg.router.engine import UnifiedNTGRouter
@@ -84,6 +86,7 @@ class ArchitectureAwareAgent:
         symbol_pattern: str | None = None,
         project: str | None = None,
         auto_build: bool = False,
+        strict: bool = False,
     ) -> dict[str, Any]:
         """Collect structural context from Graphify and Codebase Memory MCP."""
         effective_project = project or self.project
@@ -92,6 +95,7 @@ class ArchitectureAwareAgent:
             project=effective_project,
             symbol_pattern=symbol_pattern,
             auto_build=auto_build,
+            strict=strict,
         )
 
     def _invoke_router(
@@ -141,6 +145,7 @@ class ArchitectureAwareAgent:
         model: str | None = None,
         capabilities: list[str] | None = None,
         auto_build_graph: bool = False,
+        strict: bool = False,
     ) -> dict[str, Any]:
         """Gather codebase intelligence from Graphify and Codebase Memory MCP,
         route an architecture-aware planning prompt through UnifiedNTGRouter,
@@ -154,6 +159,7 @@ class ArchitectureAwareAgent:
             symbol_pattern=symbol_pattern,
             project=project,
             auto_build=auto_build_graph,
+            strict=strict,
         )
         prompt = build_planning_prompt(request=request, context=context)
         response = self._invoke_router(
@@ -308,9 +314,11 @@ class ArchitectureAwareAgent:
         model: str | None = None,
         capabilities: list[str] | None = None,
         auto_build_graph: bool = True,
+        strict: bool = False,
+        include_diagnostics: bool = False,
     ) -> dict[str, Any]:
         """Answer a natural-language query about `self.repo_root` using Graphify,
-        Codebase Memory MCP, and UnifiedNTGRouter.
+        Codebase Memory MCP, deterministic AST inventory, and UnifiedNTGRouter.
         """
         if not isinstance(query, str) or not query.strip():
             raise ValueError("query must be a non-empty string.")
@@ -320,6 +328,7 @@ class ArchitectureAwareAgent:
             symbol_pattern=symbol_pattern,
             project=project,
             auto_build=auto_build_graph,
+            strict=strict,
         )
         prompt = build_query_prompt(query=query, context=context)
         response = self._invoke_router(
@@ -327,12 +336,35 @@ class ArchitectureAwareAgent:
             model=model,
             capabilities=capabilities,
         )
-        answer = extract_response_content(response)
+        raw_answer = extract_response_content(response)
+        initial_validation = validate_query_answer(
+            answer=raw_answer,
+            query=query,
+            context=context,
+        )
+        answer = finalize_grounded_answer(
+            answer=raw_answer,
+            query=query,
+            context=context,
+            validation=initial_validation,
+            strict=strict,
+            include_diagnostics=include_diagnostics,
+        )
+        final_validation = validate_query_answer(
+            answer=answer,
+            query=query,
+            context=context,
+        )
         return {
             "repo_root": str(self.repo_root),
             "project": context.get("project"),
             "query": query,
             "answer": answer,
+            "raw_answer": raw_answer,
+            "complete": final_validation["complete"],
+            "status": "complete" if final_validation["complete"] else "incomplete",
+            "validation": final_validation,
+            "initial_validation": initial_validation,
             "index_status": context.get("index_status"),
             "coverage": context.get("coverage"),
             "errors": context.get("errors", []),
@@ -348,9 +380,11 @@ def query_directory(
     model: str | None = None,
     capabilities: list[str] | None = None,
     auto_build_graph: bool = True,
+    strict: bool = False,
+    include_diagnostics: bool = False,
 ) -> str:
     """Query any target directory using NTG's CodeIntelligence and UnifiedNTGRouter
-    and return the answer text.
+    and return the verified answer text.
     """
     agent = ArchitectureAwareAgent(repo_root=directory)
     result = agent.ask(
@@ -359,6 +393,8 @@ def query_directory(
         model=model,
         capabilities=capabilities,
         auto_build_graph=auto_build_graph,
+        strict=strict,
+        include_diagnostics=include_diagnostics,
     )
     return result["answer"]
 

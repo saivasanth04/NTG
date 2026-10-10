@@ -79,6 +79,7 @@ from ntg.agent import (
     build_change_plan,
     build_planning_prompt,
     build_query_prompt,
+    finalize_grounded_answer,
     inspect_git_diff,
     query_directory,
     record_files_changed,
@@ -86,6 +87,7 @@ from ntg.agent import (
     reject_plan,
     require_approved_plan,
     run_verification_command,
+    validate_query_answer,
     verify_python_syntax,
 )
 from ntg.cli import (
@@ -119,6 +121,8 @@ __all__ = [
     "CodeIntelligence",
     "build_planning_prompt",
     "build_query_prompt",
+    "validate_query_answer",
+    "finalize_grounded_answer",
     "build_change_plan",
     "approve_plan",
     "reject_plan",
