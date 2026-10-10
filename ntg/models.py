@@ -780,7 +780,7 @@ class Deployment:
     def release_half_open_probe(self) -> None:
         """Release a claimed probe slot if the probe request was not dispatched."""
         with self._state_lock:
-            if self.circuit_state == CircuitState.HALF_OPEN and self.half_open_probes > 0:
+            if self.half_open_probes > 0:
                 self.half_open_probes -= 1
 
     def admit_to_request_pool(self, now: Optional[float] = None) -> bool:
@@ -831,6 +831,7 @@ class Deployment:
             elif self.consecutive_failures >= threshold:
                 # Reached consecutive failure threshold: trip circuit to OPEN (Rule 2)
                 self.circuit_state = CircuitState.OPEN
+                self.half_open_probes = 0
                 self.circuit_open_until = now + cooldown
                 self.state_reason = f"Consecutive failure threshold reached ({self.consecutive_failures}); circuit OPEN until {utc_string(self.circuit_open_until)}"
 

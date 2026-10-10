@@ -77,7 +77,7 @@ class NTGTelemetryLogger(CustomLogger):
                     break
 
         if deployment:
-            self.router._record_request_attempt(deployment)
+            self.router._record_request_attempt(deployment, call_id=kw.get("litellm_call_id"))
 
     def log_success_event(self, kwargs: dict, response_obj: Any, start_time: Any, end_time: Any) -> None:
         """Handle upstream success callback."""
@@ -111,8 +111,7 @@ class NTGTelemetryLogger(CustomLogger):
                             break
 
         if deployment:
-            self.router._record_request_attempt(deployment)
-            deployment.metrics.record_attempt()
+            self.router._record_request_attempt(deployment, call_id=kwargs.get("litellm_call_id"))
             deployment.metrics.record_success()
             deployment.record_success()
 
@@ -178,8 +177,7 @@ class NTGTelemetryLogger(CustomLogger):
                             break
 
         if deployment:
-            self.router._record_request_attempt(deployment)
-            deployment.metrics.record_attempt()
+            self.router._record_request_attempt(deployment, call_id=kwargs.get("litellm_call_id"))
 
             if exc:
                 info = parse_provider_error(exc, provider=deployment.provider)
@@ -209,6 +207,7 @@ class NTGTelemetryLogger(CustomLogger):
 
                 # NTG Confirmed Authentication Failure Quarantine (Rule 1, 2, 8)
                 if info.category == CATEGORY_AUTH_ERROR:
+                    deployment.half_open_probes = 0
                     safe_reason = sanitize_secret(f"Authentication failure: {info.message}", deployment.api_key)
                     self.router._propagate_account_auth_quarantine(
                         provider=deployment.provider,
@@ -220,6 +219,7 @@ class NTGTelemetryLogger(CustomLogger):
                 # NTG General Quarantine (e.g. 404 Model Not Found)
                 elif info.should_quarantine:
                     deployment.circuit_state = CircuitState.QUARANTINED
+                    deployment.half_open_probes = 0
                     deployment.state_reason = sanitize_secret(f"Model unavailable: {info.message}", deployment.api_key)
                     self.router.state_manager.record_quarantine(
                         deployment.id, deployment.state_reason, state=CircuitState.QUARANTINED
@@ -232,6 +232,7 @@ class NTGTelemetryLogger(CustomLogger):
                     CATEGORY_UNKNOWN_LIMIT,
                 ):
                     deployment.circuit_state = CircuitState.OPEN
+                    deployment.half_open_probes = 0
                     deployment.quota.reset_at = info.reset_timestamp
                     deployment.quota.retry_after = info.cooldown_seconds
                     deployment.state_reason = (
@@ -592,7 +593,8 @@ class UnifiedNTGRouter:
         )
 
         # 6. Synchronization and request context
-        self._router_lock = threading.RLock()
+        self._model_pool_lock = threading.Lock()
+        self._current_pool_key: Optional[tuple] = None
         self._request_context = threading.local()
 
         # 7. Register telemetry and circuit breaker callback via public litellm.callbacks contract
@@ -600,12 +602,77 @@ class UnifiedNTGRouter:
         litellm.callbacks = [cb for cb in litellm.callbacks if not isinstance(cb, NTGTelemetryLogger)]
         litellm.callbacks.append(self.telemetry_logger)
 
-    def _record_request_attempt(self, deployment: Deployment) -> None:
-        """Track deployment attempted in thread-local request context (Issue 3)."""
+    def _sync_router_model_pool(
+        self,
+        request_models: List[Dict[str, Any]],
+        target_model: str,
+    ) -> None:
+        """Fast, thread-safe synchronization of the shared LiteLLM model pool.
+
+        Ensures target_model and fallbacks map to verified eligible deployments,
+        while preserving all other active provider and capability groups so
+        concurrent requests for other models are never disrupted.
+        """
+        now = time.time()
+        base_models: List[Dict[str, Any]] = []
+        registered_pairs: Set[tuple[str, str]] = set()
+
+        for dep in self.deployments:
+            if not dep.api_key or not dep.api_key.strip():
+                continue
+            if not dep.is_available(now):
+                continue
+
+            litellm_dict = dep.to_litellm_dict()
+            groups = [dep.logical_model, MODEL_GROUP_AUTO, dep.id]
+            if dep.capabilities.coding:
+                groups.append("coding")
+            if dep.capabilities.reasoning:
+                groups.append("reasoning")
+            if dep.capabilities.vision:
+                groups.append("vision")
+            if dep.capabilities.tool_calling:
+                groups.append("tool_calling")
+            if dep.capabilities.structured_output:
+                groups.append("structured_output")
+            if dep.capabilities.streaming:
+                groups.append("streaming")
+
+            for g in groups:
+                pair = (g, dep.id)
+                if pair not in registered_pairs:
+                    registered_pairs.add(pair)
+                    entry = dict(litellm_dict)
+                    entry["model_name"] = g
+                    base_models.append(entry)
+
+        req_groups = {m["model_name"] for m in request_models}
+        combined = [m for m in base_models if m["model_name"] not in req_groups] + list(request_models)
+
+        pool_key = tuple(sorted((m["model_name"], m.get("model_info", {}).get("id", "")) for m in combined))
+        with self._model_pool_lock:
+            if self._current_pool_key != pool_key:
+                self.router.set_model_list(combined)
+                self._current_pool_key = pool_key
+
+    def _record_request_attempt(self, deployment: Deployment, call_id: Optional[str] = None) -> bool:
+        """Track deployment attempted in thread-local request context with attempt deduplication.
+
+        Returns True if this is a newly counted upstream attempt, False if already counted via call_id.
+        """
+        recorded = getattr(self._request_context, "recorded_call_ids", None)
         attempts = getattr(self._request_context, "attempted_deployments", None)
+
+        if call_id and recorded is not None:
+            if call_id in recorded:
+                return False
+            recorded.add(call_id)
+
         if attempts is not None and isinstance(attempts, list):
-            if not attempts or attempts[-1].id != deployment.id:
-                attempts.append(deployment)
+            attempts.append(deployment)
+
+        deployment.metrics.record_attempt()
+        return True
 
     def _propagate_account_auth_quarantine(
         self,
@@ -625,6 +692,7 @@ class UnifiedNTGRouter:
         for dep in self.deployments:
             if dep.provider == provider and dep.account == account:
                 dep.circuit_state = CircuitState.AUTH_FAILED
+                dep.half_open_probes = 0
                 key_to_hash = failed_key or dep.api_key or ""
                 if key_to_hash:
                     dep.auth_failed_key_hash = hashlib.sha256(key_to_hash.encode("utf-8")).hexdigest()
@@ -880,6 +948,7 @@ class UnifiedNTGRouter:
         for dep in self.deployments:
             if dep.provider == provider and dep.account == account:
                 dep.circuit_state = CircuitState.OPEN
+                dep.half_open_probes = 0
                 dep.quota.reset_at = reset_at
                 dep.state_reason = reason
                 self.state_manager.record_cooldown(dep.id, reset_at, "account_quota")
@@ -1320,6 +1389,7 @@ class UnifiedNTGRouter:
         now = time.time()
         claimed_probes: List[Deployment] = []
         self._request_context.attempted_deployments = []
+        self._request_context.recorded_call_ids = set()
 
         # Build eligible LiteLLM pool and capability-safe provider group fallbacks
         model_list, fallbacks, eligible = self._build_request_pool_and_fallbacks(
@@ -1349,21 +1419,20 @@ class UnifiedNTGRouter:
             return None
 
         call_kwargs = dict(kwargs)
+        call_kwargs["num_retries"] = effective_retries
         if fallbacks:
             call_kwargs["fallbacks"] = fallbacks
 
-        try:
-            # Persistent LiteLLM Router instance: retains failover/cooldown memory across requests (Issue 1)
-            with self._router_lock:
-                self.router.set_model_list(model_list)
-                self.router.fallbacks = fallbacks or []
-                self.router.num_retries = effective_retries
+        # Thread-safe synchronization of shared model pool without serializing network calls
+        self._sync_router_model_pool(model_list, target_model)
 
-                response = self.router.completion(
-                    model=target_model,
-                    messages=[{"role": "user", "content": prompt}],
-                    **call_kwargs,
-                )
+        try:
+            # Persistent LiteLLM Router instance executed UNLOCKED for true concurrency
+            response = self.router.completion(
+                model=target_model,
+                messages=[{"role": "user", "content": prompt}],
+                **call_kwargs,
+            )
 
             # Retrieve fulfilling deployment directly from response instance (100% concurrency-safe)
             deployment = self._get_response_deployment(response, eligible)
@@ -1399,6 +1468,7 @@ class UnifiedNTGRouter:
                 if dep.id not in attempted_ids:
                     dep.release_half_open_probe()
             self._request_context.attempted_deployments = []
+            self._request_context.recorded_call_ids = set()
 
     def completion(
         self,
@@ -1435,6 +1505,7 @@ class UnifiedNTGRouter:
         now = time.time()
         claimed_probes: List[Deployment] = []
         self._request_context.attempted_deployments = []
+        self._request_context.recorded_call_ids = set()
 
         # Build eligible LiteLLM pool and capability-safe provider group fallbacks
         model_list, fallbacks, eligible = self._build_request_pool_and_fallbacks(
@@ -1456,21 +1527,20 @@ class UnifiedNTGRouter:
             )
 
         call_kwargs = dict(kwargs)
+        call_kwargs["num_retries"] = effective_retries
         if fallbacks:
             call_kwargs["fallbacks"] = fallbacks
 
-        try:
-            # Persistent LiteLLM Router instance: retains failover/cooldown memory across requests (Issue 1)
-            with self._router_lock:
-                self.router.set_model_list(model_list)
-                self.router.fallbacks = fallbacks or []
-                self.router.num_retries = effective_retries
+        # Thread-safe synchronization of shared model pool without serializing network calls
+        self._sync_router_model_pool(model_list, target_model)
 
-                response = self.router.completion(
-                    model=target_model,
-                    messages=messages,
-                    **call_kwargs,
-                )
+        try:
+            # Persistent LiteLLM Router instance executed UNLOCKED for true concurrency
+            response = self.router.completion(
+                model=target_model,
+                messages=messages,
+                **call_kwargs,
+            )
 
             deployment = self._get_response_deployment(response, eligible)
             if deployment:
@@ -1491,6 +1561,7 @@ class UnifiedNTGRouter:
                 if dep.id not in attempted_ids:
                     dep.release_half_open_probe()
             self._request_context.attempted_deployments = []
+            self._request_context.recorded_call_ids = set()
 
 
 # Maintain backwards compatibility
