@@ -446,25 +446,31 @@ class ArchitectureAwareAgent:
                 "context is incomplete: " + "; ".join(details)
             )
 
-        prompt = build_query_prompt(query=query, context=context)
-
         model_invoked = False
-        try:
-            model_invoked = True
+        response: Any = None
+        raw_answer = ""
+
+        if prerequisites_ok and not context_errors:
+            prompt = build_query_prompt(
+                query=query,
+                context=context,
+                strict=strict,
+            )
             response = self._invoke_router(
                 prompt=prompt,
                 model=model,
                 capabilities=capabilities,
             )
-        except Exception:
-            raise
+            model_invoked = True
+            raw_answer = extract_response_content(response)
 
-        raw_answer = extract_response_content(response)
         initial_validation = validate_query_answer(
             answer=raw_answer,
             query=query,
             context=context,
         )
+        initial_validation["model_invoked"] = model_invoked
+
         answer = finalize_grounded_answer(
             answer=raw_answer,
             query=query,
@@ -478,6 +484,17 @@ class ArchitectureAwareAgent:
             query=query,
             context=context,
         )
+        final_validation["model_invoked"] = model_invoked
+
+        if strict and not final_validation["complete"]:
+            err_msg = (
+                "; ".join(final_validation.get("warnings") or [])
+                or "Finalized answer failed strict completeness verification"
+            )
+            raise RuntimeError(
+                f"Strict mode: refusing to present incomplete or unverified answer: {err_msg}"
+            )
+
         answer_complete = bool(final_validation.get("complete", False))
         retrieval_failed = bool(
             final_validation.get("critical_retrieval_failed", True)
@@ -487,13 +504,6 @@ class ArchitectureAwareAgent:
             overall_status = "degraded"
         elif answer_complete:
             overall_status = "complete"
-        else:
-            overall_status = "incomplete"
-
-        if final_validation["complete"]:
-            overall_status = "complete"
-        elif final_validation["critical_retrieval_failed"]:
-            overall_status = "degraded"
         else:
             overall_status = "incomplete"
 
@@ -507,6 +517,9 @@ class ArchitectureAwareAgent:
             "is_repo_wide_query": final_validation.get("is_repo_wide_query", False),
             "answer_complete": answer_complete,
             "retrieval_failed": retrieval_failed,
+            "retrieval_blocked": bool(
+                final_validation.get("retrieval_blocked", retrieval_failed)
+            ),
             "complete": final_validation["complete"],
             "status": overall_status,
             "validation": final_validation,
