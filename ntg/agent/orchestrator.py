@@ -447,13 +447,19 @@ class ArchitectureAwareAgent:
             )
 
         prompt = build_query_prompt(query=query, context=context)
-        response = self._invoke_router(
-            prompt=prompt,
-            model=model,
-            capabilities=capabilities,
-        )
-        raw_answer = extract_response_content(response)
 
+        model_invoked = False
+        try:
+            model_invoked = True
+            response = self._invoke_router(
+                prompt=prompt,
+                model=model,
+                capabilities=capabilities,
+            )
+        except Exception:
+            raise
+
+        raw_answer = extract_response_content(response)
         initial_validation = validate_query_answer(
             answer=raw_answer,
             query=query,
@@ -472,6 +478,17 @@ class ArchitectureAwareAgent:
             query=query,
             context=context,
         )
+        answer_complete = bool(final_validation.get("complete", False))
+        retrieval_failed = bool(
+            final_validation.get("critical_retrieval_failed", True)
+        )
+
+        if retrieval_failed:
+            overall_status = "degraded"
+        elif answer_complete:
+            overall_status = "complete"
+        else:
+            overall_status = "incomplete"
 
         if final_validation["complete"]:
             overall_status = "complete"
@@ -486,6 +503,10 @@ class ArchitectureAwareAgent:
             "query": query,
             "answer": answer,
             "raw_answer": raw_answer,
+            "query_scope": final_validation.get("query_scope"),
+            "is_repo_wide_query": final_validation.get("is_repo_wide_query", False),
+            "answer_complete": answer_complete,
+            "retrieval_failed": retrieval_failed,
             "complete": final_validation["complete"],
             "status": overall_status,
             "validation": final_validation,
@@ -502,7 +523,7 @@ class ArchitectureAwareAgent:
                 "memory_ok": memory_ok,
             },
             "retrieval_operations": retrieval_operations,
-            "model_invoked": True,
+            "model_invoked": model_invoked,
             "context": context,
             "response": response,
         }

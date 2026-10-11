@@ -180,10 +180,31 @@ def _evaluate_source_verification(
         memory_verified and mem_st.get("fresh")
     )
 
+    graphify_data_present = bool(
+        isinstance(context.get("graphify_context"), str)
+        and context["graphify_context"].strip()
+    )
+
+    memory_architecture_present = bool(
+        context.get("memory_architecture")
+        or context.get("architecture_overview")
+    )
+
+    memory_symbols_present = bool(
+        context.get("memory_symbols")
+        or context.get("memory_context")
+    )
+
+    memory_data_present = bool(
+        memory_architecture_present and memory_symbols_present
+    )
+
     all_verified = bool(
         inventory_verified
         and graphify_fresh
         and memory_fresh
+        and graphify_data_present
+        and memory_data_present
         and not errors
     )
 

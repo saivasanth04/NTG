@@ -428,19 +428,37 @@ class CodeIntelligence:
             return status
 
         root_marker = self.repo_root / "graphify-out" / ".graphify_root"
-        if root_marker.is_file():
+
+        if not root_marker.is_file():
+            status["mismatched_root"] = True
+            status["contaminated"] = True
+            status["reasons"].append(
+                "Graphify repository-root marker is missing."
+            )
+        else:
             try:
-                recorded_root = Path(
-                    root_marker.read_text(encoding="utf-8").strip()
-                ).resolve()
+                recorded_text = root_marker.read_text(
+                    encoding="utf-8"
+                ).strip()
+
+                if not recorded_text:
+                    raise ValueError("Root marker is empty.")
+
+                recorded_root = Path(recorded_text).expanduser().resolve()
+
                 if recorded_root != self.repo_root:
                     status["mismatched_root"] = True
                     status["contaminated"] = True
                     status["reasons"].append(
-                        f"Graphify root marker '{recorded_root}' does not match '{self.repo_root}'"
+                        f"Graphify root marker '{recorded_root}' "
+                        f"does not match '{self.repo_root}'"
                     )
-            except OSError:
-                pass
+            except (OSError, ValueError, RuntimeError) as exc:
+                status["mismatched_root"] = True
+                status["contaminated"] = True
+                status["reasons"].append(
+                    f"Graphify repository-root marker is invalid: {exc}"
+                )
 
         try:
             raw = self.graph_path.read_text(encoding="utf-8")
@@ -960,16 +978,29 @@ class CodeIntelligence:
                     pass
 
         cli_output = ""
+        cli_succeeded = False
+
         try:
             cli_output = self._run(
                 ["graphify", "update", str(target_path)],
                 timeout=120,
-                check=False,
+                check=True,
             )
+            cli_succeeded = True
         except Exception as exc:
-            cli_output = f"graphify CLI notice: {exc}"
+            cli_output = f"Graphify CLI update failed: {exc}"
 
+        # The local AST synchronization is a fallback, not proof that
+        # the external Graphify operation itself succeeded.
         sync_stats = self._sync_graphify_python_ast()
+
+        if not cli_succeeded:
+            raise RuntimeError(
+                "Graphify CLI update failed. AST synchronization ran as a "
+                "fallback, but the Graphify index cannot be certified as "
+                "successfully refreshed by the external tool. "
+                f"Details: {cli_output}"
+            )
         return (
             f"{cli_output}\nAST sync: {sync_stats['node_count']} nodes, "
             f"{sync_stats['edge_count']} edges, rebuilt={len(sync_stats['rebuilt_files'])}".strip()
