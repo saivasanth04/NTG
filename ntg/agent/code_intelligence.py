@@ -2822,55 +2822,185 @@ class CodeIntelligence:
             return ["|".join(representative[:8])]
         return [".*"]
 
-    def _extract_scoped_source_excerpts(
+    def _read_targeted_file_excerpt(
+        self,
+        rel_path: str,
+        target_symbols: list[str] | set[str] | None = None,
+        max_lines: int = 110,
+    ) -> tuple[str, list[str]]:
+        """Read a bounded source excerpt from `rel_path`, focusing on AST line ranges
+        for `target_symbols` (plus module header/imports) when the file exceeds `max_lines`.
+        """
+        disk_p = (self.repo_root / rel_path).resolve()
+        try:
+            disk_p.relative_to(self.repo_root)
+            if not disk_p.is_file():
+                return "", []
+            raw_text = disk_p.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return "", []
+
+        src_lines = raw_text.splitlines()
+        if not src_lines:
+            return "", []
+
+        wanted_syms = {
+            s.strip().lower()
+            for s in (target_symbols or [])
+            if isinstance(s, str) and s.strip()
+        }
+        excerpted_syms: list[str] = []
+
+        if len(src_lines) <= max_lines:
+            if rel_path.endswith(".py") and wanted_syms:
+                try:
+                    tree = ast.parse(raw_text, filename=rel_path)
+                    for node in ast.walk(tree):
+                        if isinstance(
+                            node,
+                            (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef),
+                        ):
+                            if node.name.lower() in wanted_syms and node.name not in excerpted_syms:
+                                excerpted_syms.append(node.name)
+                except SyntaxError:
+                    pass
+            return "\n".join(src_lines), excerpted_syms
+
+        if rel_path.endswith(".py") and wanted_syms:
+            try:
+                tree = ast.parse(raw_text, filename=rel_path)
+            except SyntaxError:
+                tree = None
+
+            if tree is not None:
+                matched_ranges: list[tuple[int, int, str]] = []
+                for node in tree.body:
+                    if isinstance(node, ast.ClassDef):
+                        cls_low = node.name.lower()
+                        cls_start = max(1, int(getattr(node, "lineno", 1)))
+                        cls_end = int(getattr(node, "end_lineno", cls_start + 35))
+                        method_matched = False
+                        for sub in node.body:
+                            if isinstance(
+                                sub, (ast.FunctionDef, ast.AsyncFunctionDef)
+                            ):
+                                m_low = sub.name.lower()
+                                qual_low = f"{cls_low}.{m_low}"
+                                if m_low in wanted_syms or qual_low in wanted_syms:
+                                    method_matched = True
+                                    m_start = max(1, int(getattr(sub, "lineno", cls_start)) - 1)
+                                    m_end = min(
+                                        len(src_lines),
+                                        int(getattr(sub, "end_lineno", m_start + 30)),
+                                    )
+                                    # Include class header line if not already added
+                                    matched_ranges.append(
+                                        (cls_start, min(cls_start + 4, cls_end), node.name)
+                                    )
+                                    matched_ranges.append(
+                                        (
+                                            m_start,
+                                            min(m_start + 45, m_end),
+                                            f"{node.name}.{sub.name}",
+                                        )
+                                    )
+                        if cls_low in wanted_syms and not method_matched:
+                            matched_ranges.append(
+                                (
+                                    cls_start,
+                                    min(cls_start + 55, cls_end, len(src_lines)),
+                                    node.name,
+                                )
+                            )
+                    elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        fn_low = node.name.lower()
+                        if fn_low in wanted_syms:
+                            f_start = max(1, int(getattr(node, "lineno", 1)) - 1)
+                            f_end = min(
+                                len(src_lines),
+                                int(getattr(node, "end_lineno", f_start + 40)),
+                            )
+                            matched_ranges.append(
+                                (f_start, min(f_start + 55, f_end), node.name)
+                            )
+
+                if matched_ranges:
+                    header_end = min(28, len(src_lines))
+                    windows: list[tuple[int, int]] = [(1, header_end)]
+                    for r_start, r_end, sym_label in sorted(
+                        matched_ranges, key=lambda x: (x[0], x[1])
+                    ):
+                        if sym_label not in excerpted_syms:
+                            excerpted_syms.append(sym_label)
+                        prev_s, prev_e = windows[-1]
+                        if r_start <= prev_e + 2:
+                            windows[-1] = (prev_s, max(prev_e, r_end))
+                        else:
+                            windows.append((r_start, r_end))
+
+                    out_lines: list[str] = []
+                    last_end = 0
+                    budget_remaining = max_lines
+                    for w_start, w_end in windows:
+                        if budget_remaining <= 0:
+                            break
+                        if last_end > 0 and w_start > last_end + 1:
+                            out_lines.append(
+                                f"# ... (lines {last_end + 1}-{w_start - 1} omitted) ..."
+                            )
+                        chunk = src_lines[w_start - 1 : w_end]
+                        if len(chunk) > budget_remaining:
+                            chunk = chunk[:budget_remaining]
+                            w_end = w_start - 1 + len(chunk)
+                        out_lines.extend(chunk)
+                        budget_remaining -= len(chunk)
+                        last_end = w_end
+                    if last_end < len(src_lines):
+                        out_lines.append(
+                            f"# ... ({len(src_lines) - last_end} additional lines)"
+                        )
+                    return "\n".join(out_lines), excerpted_syms
+
+        snippet = "\n".join(src_lines[:max_lines])
+        if len(src_lines) > max_lines:
+            snippet += f"\n# ... ({len(src_lines) - max_lines} additional lines)"
+        return snippet, excerpted_syms
+
+    def _identify_relevant_targets(
         self,
         question: str,
         inventory: dict[str, Any],
-        max_files: int = 5,
-        max_lines_per_file: int = 110,
-    ) -> dict[str, str]:
-        """Inspect actual source files on disk when the question targets specific files,
-        packages, or symbols (or for small repositories), ensuring deep behavioral context.
+        extra_files: list[str] | None = None,
+        extra_symbols: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Identify relevant target modules, symbols, callers/callees, internal dependencies,
+        interfaces, configuration files, and any unmatched or excluded references.
         """
-        q_lower = (question or "").lower()
+        q_text = (question or "").strip()
+        q_lower = q_text.lower()
         files = inventory.get("files") or []
-        by_path = {
+        by_path: dict[str, dict[str, Any]] = {
             str(f["path"]): f
             for f in files
             if isinstance(f, dict) and f.get("path")
         }
+        basename_to_paths: dict[str, list[str]] = {}
+        for p in by_path:
+            basename_to_paths.setdefault(Path(p).name.lower(), []).append(p)
 
-        matched_paths: list[str] = []
-        # Pass 1: Explicit file path mentions in the question (highest priority)
-        for path in by_path:
-            if path.lower() in q_lower or path.replace("/", "\\").lower() in q_lower:
-                if path not in matched_paths:
-                    matched_paths.append(path)
+        excluded_dirs = inventory.get("excluded_dirs") or []
+        excluded_files = inventory.get("excluded_files") or []
+        excluded_file_paths = {
+            str(f.get("path") or "").lower()
+            for f in excluded_files
+            if isinstance(f, dict) and f.get("path")
+        }
+        excluded_dir_paths = {
+            str(d.get("path") or "").lower()
+            for d in excluded_dirs
+            if isinstance(d, dict) and d.get("path")
+        }
 
-        # Pass 2: Word-boundary class/function symbol matches (prioritize concrete modules over __init__.py)
-        q_words = set(re.findall(r"[a-z_][a-z0-9_]{3,}", q_lower))
-        ordered_candidates = sorted(
-            by_path.keys(),
-            key=lambda p: (1 if p.endswith("__init__.py") else 0, p),
-        )
-        for path in ordered_candidates:
-            if path in matched_paths:
-                continue
-            rec = by_path[path]
-            for c in rec.get("classes", []):
-                cname = str(c.get("name") or "")
-                if cname and cname.lower() in q_words:
-                    matched_paths.append(path)
-                    break
-            if path in matched_paths:
-                continue
-            for fn in rec.get("functions", []):
-                fname = str(fn.get("name") or "")
-                if fname and len(fname) >= 5 and fname.lower() in q_words:
-                    matched_paths.append(path)
-                    break
-
-        # Pass 3: Package prefix or domain-token relevance for targeted natural-language questions
         is_broad = any(
             kw in q_lower
             for kw in (
@@ -2884,7 +3014,90 @@ class CodeIntelligence:
                 "explain this project",
             )
         )
-        if not matched_paths and not is_broad and q_words:
+
+        primary_files: list[str] = []
+        matched_symbols_by_file: dict[str, list[str]] = {}
+        unmatched_references: list[str] = []
+        excluded_matches: list[str] = []
+
+        def _add_primary(path: str, sym: str | None = None) -> None:
+            if path in by_path and path not in primary_files:
+                primary_files.append(path)
+            if sym and path in by_path:
+                syms = matched_symbols_by_file.setdefault(path, [])
+                if sym not in syms:
+                    syms.append(sym)
+
+        for ef in extra_files or []:
+            norm_ef = str(ef).replace("\\", "/").lstrip("./")
+            if norm_ef in by_path:
+                _add_primary(norm_ef)
+            elif "/" not in norm_ef and norm_ef.lower() in basename_to_paths:
+                for mp in basename_to_paths[norm_ef.lower()]:
+                    _add_primary(mp)
+
+        # Check excluded file/directory mentions
+        for ex_f in sorted(excluded_file_paths):
+            if ex_f and re.search(rf"(?<![A-Za-z0-9_./\\-]){re.escape(ex_f)}(?![A-Za-z0-9_.-])", q_lower):
+                excluded_matches.append(ex_f)
+        for ex_d in sorted(excluded_dir_paths):
+            clean_d = ex_d.replace("**/", "")
+            if clean_d and re.search(rf"(?<![A-Za-z0-9_./\\-]){re.escape(clean_d)}(?![A-Za-z0-9_.-])", q_lower):
+                excluded_matches.append(ex_d)
+
+        # Pass 1: Explicit file path mentions in the question
+        for path in by_path:
+            if path.lower() in q_lower or path.replace("/", "\\").lower() in q_lower:
+                _add_primary(path)
+
+        for py_match in re.findall(
+            r"(?<![A-Za-z0-9_./\\-])((?:[A-Za-z0-9_.-]+/)*[A-Za-z0-9_.-]+\.py)\b",
+            q_text,
+        ):
+            norm_py = py_match.replace("\\", "/").lstrip("./")
+            if norm_py in by_path:
+                _add_primary(norm_py)
+            elif "/" not in norm_py and norm_py.lower() in basename_to_paths:
+                for mp in basename_to_paths[norm_py.lower()]:
+                    _add_primary(mp)
+            elif norm_py.lower() not in excluded_file_paths:
+                if norm_py not in unmatched_references:
+                    unmatched_references.append(norm_py)
+
+        # Pass 2: Class, method, function, constant, and export symbol matches
+        q_words = set(re.findall(r"[a-z_][a-z0-9_]{2,}", q_lower))
+        for es in extra_symbols or []:
+            if isinstance(es, str) and es.strip():
+                q_words.add(es.strip().lower())
+
+        ordered_candidates = sorted(
+            by_path.keys(),
+            key=lambda p: (1 if p.endswith("__init__.py") else 0, p),
+        )
+        for path in ordered_candidates:
+            rec = by_path[path]
+            for c in rec.get("classes", []):
+                cname = str(c.get("name") or "")
+                if cname and cname.lower() in q_words:
+                    _add_primary(path, cname)
+                for m in c.get("methods", []) or []:
+                    if (
+                        isinstance(m, str)
+                        and len(m) >= 4
+                        and not m.startswith("__")
+                        and m.lower() in q_words
+                    ):
+                        _add_primary(path, f"{cname}.{m}" if cname else m)
+            for fn in rec.get("functions", []):
+                fname = str(fn.get("name") or "")
+                if fname and len(fname) >= 4 and fname.lower() in q_words:
+                    _add_primary(path, fname)
+            for const in rec.get("constants", []) or []:
+                if isinstance(const, str) and len(const) >= 4 and const.lower() in q_words:
+                    _add_primary(path, const)
+
+        # Pass 3: Package prefix or domain-token relevance for targeted questions
+        if not primary_files and not is_broad and q_words:
             scored: list[tuple[int, str]] = []
             for path in ordered_candidates:
                 rec = by_path[path]
@@ -2898,6 +3111,11 @@ class CodeIntelligence:
                                 path.lower(),
                                 str(rec.get("summary") or "").lower(),
                                 *[str(c.get("name") or "").lower() for c in rec.get("classes", [])],
+                                *[
+                                    str(m).lower()
+                                    for c in rec.get("classes", [])
+                                    for m in (c.get("methods") or [])
+                                ],
                                 *[str(f.get("name") or "").lower() for f in rec.get("functions", [])],
                             ]
                         ),
@@ -2907,29 +3125,392 @@ class CodeIntelligence:
                 if overlap >= 2:
                     scored.append((overlap, path))
             scored.sort(key=lambda item: (-item[0], item[1]))
-            matched_paths.extend(p for _, p in scored[:max_files])
+            for _, p in scored[:5]:
+                _add_primary(p)
 
-        if not matched_paths and len(by_path) <= max_files:
-            matched_paths = [
-                p for p, r in by_path.items() if r.get("type") == "python"
-            ]
+        if not primary_files and not is_broad and len(by_path) <= 5:
+            for p, r in by_path.items():
+                if r.get("type") == "python":
+                    _add_primary(p)
 
-        excerpts: dict[str, str] = {}
-        for rel_p in matched_paths[:max_files]:
-            disk_p = (self.repo_root / rel_p).resolve()
-            try:
-                disk_p.relative_to(self.repo_root)
-                if disk_p.is_file():
-                    src_lines = disk_p.read_text(
-                        encoding="utf-8", errors="replace"
-                    ).splitlines()
-                    snippet = "\n".join(src_lines[:max_lines_per_file])
-                    if len(src_lines) > max_lines_per_file:
-                        snippet += f"\n# ... ({len(src_lines) - max_lines_per_file} additional lines)"
-                    excerpts[rel_p] = snippet
-            except OSError:
+        # Identify callers/callees and internal dependencies for primary targets
+        call_edges = inventory.get("call_graph_edges") or []
+        primary_set = set(primary_files)
+        caller_callee_files: list[str] = []
+        dependency_files: list[str] = []
+        relevant_call_edges: list[dict[str, Any]] = []
+
+        for edge in call_edges:
+            if not isinstance(edge, dict):
                 continue
+            caller = str(edge.get("caller_file") or "")
+            callee = str(edge.get("callee_file") or "")
+            inv_syms = [
+                str(s) for s in (edge.get("invoked_symbols") or []) if s
+            ]
+            if caller in primary_set or callee in primary_set:
+                relevant_call_edges.append(
+                    {
+                        "caller_file": caller,
+                        "callee_file": callee,
+                        "invoked_symbols": inv_syms,
+                    }
+                )
+                if callee in by_path:
+                    for sym in inv_syms:
+                        syms = matched_symbols_by_file.setdefault(callee, [])
+                        if sym not in syms:
+                            syms.append(sym)
+                if caller in primary_set and callee in by_path and callee not in primary_set:
+                    if not callee.endswith("__init__.py") and callee not in caller_callee_files:
+                        caller_callee_files.append(callee)
+                elif callee in primary_set and caller in by_path and caller not in primary_set:
+                    if not caller.endswith("__init__.py") and caller not in caller_callee_files:
+                        caller_callee_files.append(caller)
+
+        for p in primary_files:
+            rec = by_path.get(p) or {}
+            for dep in rec.get("internal_dependencies") or []:
+                if dep in by_path and dep not in primary_set and dep not in dependency_files:
+                    dependency_files.append(dep)
+            for imp in rec.get("imported_by") or []:
+                if (
+                    imp in by_path
+                    and imp not in primary_set
+                    and not imp.endswith("__init__.py")
+                    and imp not in caller_callee_files
+                ):
+                    caller_callee_files.append(imp)
+
+        # Identify relevant configuration files when config/dependencies/CLI/env are referenced
+        config_files: list[str] = []
+        wants_config = any(
+            kw in q_lower
+            for kw in (
+                "config",
+                "configuration",
+                "pyproject",
+                "requirements",
+                "dependency",
+                "dependencies",
+                "package",
+                "entry point",
+                "entrypoint",
+                "cli",
+                ".env",
+                "environment",
+                "setting",
+                "install",
+            )
+        )
+        for p, rec in by_path.items():
+            if rec.get("type") == "config_or_doc":
+                if p in primary_set or (
+                    wants_config
+                    and Path(p).name.lower()
+                    in ("pyproject.toml", "requirements.txt", ".env.example", "setup.py", "setup.cfg")
+                ):
+                    if p not in config_files:
+                        config_files.append(p)
+
+        # Collect concise interface signatures for primary, dependency, and caller/callee files
+        interface_signatures: dict[str, list[str]] = {}
+        for p in [*primary_files, *caller_callee_files[:4], *dependency_files[:4]]:
+            rec = by_path.get(p) or {}
+            if rec.get("type") != "python":
+                continue
+            sigs: list[str] = []
+            for cls in rec.get("classes", [])[:5]:
+                cname = str(cls.get("name") or "")
+                if not cname:
+                    continue
+                m_sigs = [
+                    f"{md.get('name')}{md.get('signature', '()')}"
+                    for md in (cls.get("method_details") or [])[:6]
+                    if isinstance(md, dict) and md.get("name") and not str(md.get("name")).startswith("__")
+                ]
+                if m_sigs:
+                    sigs.append(f"class {cname}: " + "; ".join(m_sigs))
+                else:
+                    sigs.append(f"class {cname}")
+            for fn in rec.get("functions", [])[:8]:
+                fname = str(fn.get("name") or "")
+                if fname:
+                    sigs.append(f"def {fname}{fn.get('signature', '()')}")
+            if sigs:
+                interface_signatures[p] = sigs
+
+        return {
+            "is_broad": is_broad,
+            "primary_files": primary_files,
+            "matched_symbols_by_file": matched_symbols_by_file,
+            "caller_callee_files": caller_callee_files,
+            "dependency_files": dependency_files,
+            "config_files": config_files,
+            "interface_signatures": interface_signatures,
+            "call_relationships": relevant_call_edges[:15],
+            "unmatched_references": unmatched_references,
+            "excluded_matches": excluded_matches,
+        }
+
+    def _extract_scoped_source_excerpts(
+        self,
+        question: str,
+        inventory: dict[str, Any],
+        max_files: int = 5,
+        max_lines_per_file: int = 110,
+    ) -> dict[str, str]:
+        """Inspect actual source files on disk when the question targets specific files,
+        packages, or symbols (or for small repositories), ensuring deep behavioral context
+        across target modules, callers/callees, dependencies, interfaces, and configuration.
+        """
+        targets = self._identify_relevant_targets(question, inventory)
+        candidate_paths: list[str] = []
+        for group in (
+            targets["primary_files"],
+            targets["caller_callee_files"],
+            targets["dependency_files"],
+            targets["config_files"],
+        ):
+            for p in group:
+                if p not in candidate_paths:
+                    candidate_paths.append(p)
+            if len(candidate_paths) >= max_files:
+                break
+
+        matched_symbols_by_file = targets["matched_symbols_by_file"]
+        excerpts: dict[str, str] = {}
+        for rel_p in candidate_paths[:max_files]:
+            snippet, _ = self._read_targeted_file_excerpt(
+                rel_p,
+                target_symbols=matched_symbols_by_file.get(rel_p),
+                max_lines=max_lines_per_file,
+            )
+            if snippet:
+                excerpts[rel_p] = snippet
         return excerpts
+
+    def _build_retrieval_evidence(
+        self,
+        question: str,
+        inventory: dict[str, Any],
+        scoped_source_excerpts: dict[str, str],
+        errors: list[str],
+        targets: dict[str, Any] | None = None,
+        excerpted_symbols: dict[str, list[str]] | None = None,
+        expansion_rounds: int = 0,
+    ) -> dict[str, Any]:
+        """Evaluate request-specific retrieval evidence and epistemic limitations.
+        Index health alone never implies sufficient evidence for a request.
+        """
+        resolved_targets = targets or self._identify_relevant_targets(
+            question, inventory
+        )
+        inventory_status = str(inventory.get("inventory_status") or "unavailable")
+        unreadable_files = list(inventory.get("unreadable_files") or [])
+        missing_files = list(inventory.get("missing_files") or [])
+        excluded_dirs = list(inventory.get("excluded_dirs") or [])
+        excluded_files = list(inventory.get("excluded_files") or [])
+
+        primary_files = list(resolved_targets.get("primary_files") or [])
+        unmatched_refs = list(resolved_targets.get("unmatched_references") or [])
+        excluded_matches = list(resolved_targets.get("excluded_matches") or [])
+        is_broad = bool(resolved_targets.get("is_broad"))
+        excerpted_files = list(scoped_source_excerpts.keys())
+
+        insufficiency_reasons: list[str] = []
+        if inventory_status != "verified":
+            insufficiency_reasons.append(
+                f"Repository AST inventory status is '{inventory_status}'."
+            )
+        if unreadable_files:
+            insufficiency_reasons.append(
+                f"{len(unreadable_files)} repository file(s) could not be read or parsed."
+            )
+        if missing_files:
+            insufficiency_reasons.append(
+                f"{len(missing_files)} discovered file(s) are missing from AST analysis."
+            )
+        if errors:
+            insufficiency_reasons.append(
+                f"Retrieval reported {len(errors)} error(s)."
+            )
+        if unmatched_refs:
+            insufficiency_reasons.append(
+                "Request references non-existent repository path(s): "
+                + ", ".join(unmatched_refs)
+            )
+        if excluded_matches and not primary_files and not is_broad:
+            insufficiency_reasons.append(
+                "Request targets excluded/unindexed path(s): "
+                + ", ".join(excluded_matches)
+            )
+        if primary_files and not is_broad:
+            missing_excerpts = [
+                p for p in primary_files[:5] if p not in scoped_source_excerpts
+            ]
+            if missing_excerpts:
+                insufficiency_reasons.append(
+                    "Direct source excerpts were not yet retrieved for targeted module(s): "
+                    + ", ".join(missing_excerpts)
+                )
+
+        evidence_sufficient = len(insufficiency_reasons) == 0
+        limitations: list[str] = [
+            "Index freshness and AST inventory verify structural coverage and file fingerprints, not full semantic or runtime understanding of the repository.",
+            "Direct source code inspection is bounded to relevant module and symbol excerpts rather than reading or sending the entire repository.",
+        ]
+        if excluded_dirs or excluded_files:
+            limitations.append(
+                f"{len(excluded_dirs)} directory(ies) and {len(excluded_files)} file(s) are excluded from repository indexing."
+            )
+        if unreadable_files:
+            limitations.append(
+                f"{len(unreadable_files)} file(s) were unreadable during inventory construction."
+            )
+
+        return {
+            "targeted_modules": primary_files,
+            "caller_callee_files": list(
+                resolved_targets.get("caller_callee_files") or []
+            ),
+            "dependency_files": list(
+                resolved_targets.get("dependency_files") or []
+            ),
+            "config_files": list(resolved_targets.get("config_files") or []),
+            "excerpted_files": excerpted_files,
+            "excerpted_symbols": excerpted_symbols or {},
+            "interface_signatures": dict(
+                resolved_targets.get("interface_signatures") or {}
+            ),
+            "call_relationships": list(
+                resolved_targets.get("call_relationships") or []
+            ),
+            "unmatched_references": unmatched_refs,
+            "excluded_matches": excluded_matches,
+            "unreadable_files": unreadable_files,
+            "targeted_retrieval_performed": bool(excerpted_files),
+            "targeted_expansion_rounds": expansion_rounds,
+            "index_health_only": not bool(excerpted_files) and bool(primary_files),
+            "evidence_sufficient": evidence_sufficient,
+            "insufficiency_reasons": insufficiency_reasons,
+            "limitations": limitations,
+        }
+
+    def retrieve_targeted_evidence(
+        self,
+        context: dict[str, Any],
+        question: str | None = None,
+        target_files: list[str] | None = None,
+        target_symbols: list[str] | None = None,
+        include_dependencies: bool = True,
+        include_callers: bool = True,
+        include_config: bool = True,
+        max_files: int = 8,
+        max_lines_per_file: int = 140,
+    ) -> dict[str, Any]:
+        """Perform bounded targeted source retrieval on an already-gathered `context`
+        package to obtain actual source excerpts for relevant modules, callers/callees,
+        dependencies, interfaces, and configuration without re-running full indexing.
+        """
+        if not isinstance(context, dict):
+            return {}
+
+        effective_question = (
+            question
+            if isinstance(question, str) and question.strip()
+            else str(context.get("question") or "")
+        )
+        inventory = (
+            context.get("repository_inventory")
+            if isinstance(context.get("repository_inventory"), dict)
+            else self.build_repository_inventory()
+        )
+        targets = self._identify_relevant_targets(
+            effective_question,
+            inventory,
+            extra_files=target_files,
+            extra_symbols=target_symbols,
+        )
+
+        ordered_paths: list[str] = []
+        for p in targets["primary_files"]:
+            if p not in ordered_paths:
+                ordered_paths.append(p)
+        if include_callers:
+            for p in targets["caller_callee_files"]:
+                if p not in ordered_paths:
+                    ordered_paths.append(p)
+        if include_dependencies:
+            for p in targets["dependency_files"]:
+                if p not in ordered_paths:
+                    ordered_paths.append(p)
+        if include_config:
+            for p in targets["config_files"]:
+                if p not in ordered_paths:
+                    ordered_paths.append(p)
+
+        existing_excerpts = (
+            dict(context["scoped_source_excerpts"])
+            if isinstance(context.get("scoped_source_excerpts"), dict)
+            else {}
+        )
+        matched_symbols_by_file = dict(targets["matched_symbols_by_file"])
+        if target_symbols:
+            for p in ordered_paths:
+                syms = matched_symbols_by_file.setdefault(p, [])
+                for s in target_symbols:
+                    if isinstance(s, str) and s.strip() and s not in syms:
+                        syms.append(s.strip())
+
+        prev_ev = (
+            context.get("retrieval_evidence")
+            if isinstance(context.get("retrieval_evidence"), dict)
+            else {}
+        )
+        excerpted_symbols: dict[str, list[str]] = dict(
+            prev_ev.get("excerpted_symbols") or {}
+        )
+
+        for rel_p in ordered_paths[:max_files]:
+            wanted_for_file = matched_symbols_by_file.get(rel_p)
+            # Re-read if not yet excerpted or if specific target symbols are now requested
+            if rel_p not in existing_excerpts or wanted_for_file:
+                snippet, found_syms = self._read_targeted_file_excerpt(
+                    rel_p,
+                    target_symbols=wanted_for_file,
+                    max_lines=max_lines_per_file,
+                )
+                if snippet:
+                    existing_excerpts[rel_p] = snippet
+                if found_syms:
+                    excerpted_symbols[rel_p] = found_syms
+
+        rounds = int(prev_ev.get("targeted_expansion_rounds", 0) or 0) + 1
+        errors = [str(e) for e in (context.get("errors") or [])]
+        evidence = self._build_retrieval_evidence(
+            question=effective_question,
+            inventory=inventory,
+            scoped_source_excerpts=existing_excerpts,
+            errors=errors,
+            targets=targets,
+            excerpted_symbols=excerpted_symbols,
+            expansion_rounds=rounds,
+        )
+
+        context["scoped_source_excerpts"] = existing_excerpts
+        context["retrieval_evidence"] = evidence
+        if isinstance(context.get("coverage"), dict):
+            context["coverage"]["scoped_source_excerpts_count"] = len(
+                existing_excerpts
+            )
+            context["coverage"]["targeted_retrieval_performed"] = bool(
+                existing_excerpts
+            )
+            context["coverage"]["evidence_sufficient"] = bool(
+                evidence.get("evidence_sufficient", False)
+            )
+        return context
 
     def gather_context(
         self,
@@ -2944,9 +3525,31 @@ class CodeIntelligence:
         errors: list[str] = []
         inventory = self.build_repository_inventory()
         formatted_inventory = self.format_inventory_for_prompt(inventory)
-        scoped_source_excerpts = self._extract_scoped_source_excerpts(
-            question, inventory
-        )
+        targets = self._identify_relevant_targets(question, inventory)
+        scoped_source_excerpts: dict[str, str] = {}
+        excerpted_symbols: dict[str, list[str]] = {}
+        candidate_paths: list[str] = []
+        for grp in (
+            targets["primary_files"],
+            targets["caller_callee_files"],
+            targets["dependency_files"],
+            targets["config_files"],
+        ):
+            for p in grp:
+                if p not in candidate_paths:
+                    candidate_paths.append(p)
+            if len(candidate_paths) >= 5:
+                break
+        for rel_p in candidate_paths[:5]:
+            snippet, found_syms = self._read_targeted_file_excerpt(
+                rel_p,
+                target_symbols=targets["matched_symbols_by_file"].get(rel_p),
+                max_lines=110,
+            )
+            if snippet:
+                scoped_source_excerpts[rel_p] = snippet
+            if found_syms:
+                excerpted_symbols[rel_p] = found_syms
 
         graphify_status: dict[str, Any] = {}
         graphify_ctx: str | None = None
@@ -3119,6 +3722,15 @@ class CodeIntelligence:
         inventory_status = str(
             inventory.get("inventory_status") or "unavailable"
         )
+        retrieval_evidence = self._build_retrieval_evidence(
+            question=question,
+            inventory=inventory,
+            scoped_source_excerpts=scoped_source_excerpts,
+            errors=errors,
+            targets=targets,
+            excerpted_symbols=excerpted_symbols,
+            expansion_rounds=0,
+        )
 
         coverage = {
             "total_repo_files": inventory.get("total_files", 0),
@@ -3137,6 +3749,10 @@ class CodeIntelligence:
                 inventory.get("execution_flows", [])
             ),
             "scoped_source_excerpts_count": len(scoped_source_excerpts),
+            "targeted_retrieval_performed": bool(scoped_source_excerpts),
+            "evidence_sufficient": bool(
+                retrieval_evidence.get("evidence_sufficient", False)
+            ),
             "excluded_dirs_count": len(inventory.get("excluded_dirs", [])),
             "excluded_files_count": len(inventory.get("excluded_files", [])),
             "excluded_dirs": inventory.get("excluded_dirs", []),
@@ -3206,6 +3822,7 @@ class CodeIntelligence:
             "execution_flows": inventory.get("execution_flows", []),
             "call_graph_edges": inventory.get("call_graph_edges", []),
             "scoped_source_excerpts": scoped_source_excerpts,
+            "retrieval_evidence": retrieval_evidence,
             "graphify_context": graphify_ctx,
             "graphify_report": graphify_report_summary,
             "memory_architecture": memory_arch,

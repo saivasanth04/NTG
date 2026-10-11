@@ -71,10 +71,11 @@ def run_cli(argv: Optional[List[str]] = None) -> None:
         print_banner(deployments=router.deployments, default_model=router.default_model)
         print("Usage: python main.py [OPTIONS] [PROMPT]\n")
         print("Options:")
-        print("  -d, --dir <path>        Target repository/directory location to analyze and query")
+        print("  -d, --dir <path>        Target repository/directory location to analyze and query (defaults to '.')")
         print("  --model <name>          Route to specific model group (auto, groq, openrouter, gemini, etc.)")
         print("  --capability <caps>     Filter by comma-separated capabilities (coding, vision, reasoning, etc.)")
         print("  --plan                  Generate an architecture-aware change plan using Graphify + Codebase Memory")
+        print("  --router-only           Bypass repository analysis and send prompt directly to the smart router")
         print("  --verify                Verify Python syntax across the repository")
         print("  --refresh-knowledge     Update Graphify knowledge graph and Codebase Memory MCP index")
         print("  --status                Display detailed status table of all deployments and quotas")
@@ -104,6 +105,11 @@ def run_cli(argv: Optional[List[str]] = None) -> None:
     if "--plan" in args:
         plan_mode = True
         args = [a for a in args if a != "--plan"]
+
+    router_only = False
+    if "--router-only" in args or "--direct" in args:
+        router_only = True
+        args = [a for a in args if a not in ("--router-only", "--direct")]
 
     strict_mode = True
     if "--non-strict" in args:
@@ -144,44 +150,39 @@ def run_cli(argv: Optional[List[str]] = None) -> None:
         print("No prompt supplied.")
         return
 
-    if plan_mode:
-        agent = ArchitectureAwareAgent(repo_root=target_dir or ".", router=router)
-        plan = agent.create_plan(
-            request=prompt,
-            model=selected_model,
-            capabilities=selected_capability,
-            auto_build_graph=True,
-            strict=strict_mode,
-        )
+    if router_only and not plan_mode:
+        router.ask(prompt, model=selected_model, capabilities=selected_capability)
+        return
+
+    effective_repo_root = target_dir or "."
+    agent = ArchitectureAwareAgent(repo_root=effective_repo_root, router=router)
+    result = agent.handle_request(
+        request=prompt,
+        mode="coding" if plan_mode else None,
+        model=selected_model,
+        capabilities=selected_capability,
+        auto_build_graph=True,
+        strict=strict_mode,
+        include_diagnostics=True,
+    )
+
+    if result.get("request_type") == "coding":
         print("\n=== Architecture-Aware Change Plan ===")
         print(
-            f"Status: {plan['status']} (complete={plan.get('complete')}, "
-            f"approved={plan['approved']}, model_invoked={plan.get('model_invoked')})\n"
+            f"Status: {result['status']} (complete={result.get('complete')}, "
+            f"approved={result['approved']}, model_invoked={result.get('model_invoked')})\n"
         )
-        print(plan["plan"])
+        print(result["plan"])
         return
 
-    if target_dir:
-        agent = ArchitectureAwareAgent(repo_root=target_dir, router=router)
-        result = agent.ask(
-            query=prompt,
-            model=selected_model,
-            capabilities=selected_capability,
-            auto_build_graph=True,
-            strict=strict_mode,
-            include_diagnostics=True,
-        )
-        print(f"\n=== Directory Query Answer ({result['repo_root']}) ===")
-        print(
-            f"Verification: status={result['status']}, complete={result['complete']}, "
-            f"model_invoked={result.get('model_invoked')}, "
-            f"retrieval_blocked={result.get('retrieval_blocked')}, "
-            f"errors={len(result.get('errors', []))}\n"
-        )
-        print(result["answer"])
-        return
-
-    router.ask(prompt, model=selected_model, capabilities=selected_capability)
+    print(f"\n=== Directory Query Answer ({result['repo_root']}) ===")
+    print(
+        f"Verification: status={result['status']}, complete={result['complete']}, "
+        f"model_invoked={result.get('model_invoked')}, "
+        f"retrieval_blocked={result.get('retrieval_blocked')}, "
+        f"errors={len(result.get('errors', []))}\n"
+    )
+    print(result["answer"])
 
 
 main = run_cli

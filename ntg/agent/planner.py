@@ -1,13 +1,13 @@
 """Architecture-aware change planner, deterministic evidence validator, and human-in-the-loop approval lifecycle."""
 
 from __future__ import annotations
-import re
+
+import builtins
 import json
+import keyword
 from pathlib import Path
 import re
 from typing import Any
-import builtins
-import keyword
 
 from spacy.lang.en.stop_words import STOP_WORDS
 
@@ -94,9 +94,11 @@ def _evaluate_source_verification(
             "graphify_fresh": False,
             "graphify_fingerprint_verified": False,
             "graphify_ast_symbols_verified": False,
+            "graphify_data_present": False,
             "memory_verified": False,
             "memory_fresh": False,
             "memory_fingerprint_verified": False,
+            "memory_data_present": False,
             "errors": ["Context dictionary is missing"],
             "all_verified": False,
         }
@@ -184,9 +186,11 @@ def _evaluate_source_verification(
         "graphify_fresh": graphify_fresh,
         "graphify_fingerprint_verified": graphify_fp,
         "graphify_ast_symbols_verified": graphify_ast,
+        "graphify_data_present": graphify_data_present,
         "memory_verified": memory_verified,
         "memory_fresh": memory_fresh,
         "memory_fingerprint_verified": memory_fp,
+        "memory_data_present": memory_data_present,
         "errors": errors,
         "all_verified": all_verified,
     }
@@ -291,6 +295,18 @@ def _append_context_sections(
             "- **Retrieval Diagnostics / Errors**: " + "; ".join(ver["errors"])
         )
 
+    retrieval_ev = (
+        context.get("retrieval_evidence")
+        if isinstance(context.get("retrieval_evidence"), dict)
+        else {}
+    )
+    if retrieval_ev:
+        lim_list = retrieval_ev.get("limitations") or []
+        if lim_list:
+            meta_lines.append(
+                "- **Retrieval Scope & Limitations**: " + " ".join(str(x) for x in lim_list[:2])
+            )
+
     if meta_lines:
         sections.append(
             "## Repository Identity & Index Diagnostics\n" + "\n".join(meta_lines)
@@ -346,6 +362,38 @@ def _append_context_sections(
                     "### Verified Runtime Execution Flows (AST Call-Graph Traces)\n"
                     + "\n".join(flow_lines)
                 )
+
+    if retrieval_ev:
+        ev_lines: list[str] = []
+        iface_sigs = retrieval_ev.get("interface_signatures")
+        if isinstance(iface_sigs, dict) and iface_sigs:
+            for mod_p, sigs in list(iface_sigs.items())[:8]:
+                if isinstance(sigs, list) and sigs:
+                    ev_lines.append(
+                        f"- **Interfaces in `{mod_p}`**: "
+                        + " | ".join(f"`{s}`" for s in sigs[:6])
+                    )
+        call_rels = retrieval_ev.get("call_relationships")
+        if isinstance(call_rels, list) and call_rels:
+            rel_strs = [
+                f"`{r.get('caller_file')}` -> `{r.get('callee_file')}`"
+                + (
+                    f" ({', '.join(f'`{s}`' for s in (r.get('invoked_symbols') or [])[:4])})"
+                    if r.get("invoked_symbols")
+                    else ""
+                )
+                for r in call_rels[:8]
+                if isinstance(r, dict) and r.get("caller_file") and r.get("callee_file")
+            ]
+            if rel_strs:
+                ev_lines.append(
+                    "- **Caller/Callee Relationships**: " + " ; ".join(rel_strs)
+                )
+        if ev_lines:
+            sections.append(
+                "## Targeted Module Interfaces & Caller/Callee Evidence\n"
+                + "\n".join(ev_lines)
+            )
 
     graph_report = context.get("graphify_report")
     if isinstance(graph_report, str) and graph_report.strip():
@@ -412,6 +460,29 @@ def build_planning_prompt(
     if _is_full_retrieval_context(context):
         verify_retrieval_context(context, strict=strict)
 
+    req_info = (
+        analyze_query_requirements(query=request, context=context)
+        if isinstance(context, dict) and isinstance(context.get("repository_inventory"), dict)
+        else None
+    )
+
+    grounding_notes: list[str] = [
+        "Ground your plan strictly in the actual files, classes, functions, and dependencies listed below. Never invent non-existent files or symbols.",
+        "Include all four required sections with explicit headings, reference backticked relative file paths and AST symbols, explain relevant internal dependencies and caller/callee impacts, provide at least two concrete numbered implementation steps, and specify syntax verification (`CodeVerifier` / `verify_python_syntax`) plus post-verification index refresh (`sync_knowledge` / `refresh_knowledge`).",
+    ]
+    if req_info:
+        if req_info.get("target_files") and not req_info.get("is_repo_wide"):
+            t_str = ", ".join(f"`{p}`" for p in req_info["target_files"][:10])
+            grounding_notes.append(f"Primary Target File(s): {t_str}")
+        if req_info.get("queried_symbols"):
+            s_str = ", ".join(f"`{s}`" for s in req_info["queried_symbols"][:10])
+            grounding_notes.append(f"Primary Referenced Symbol(s): {s_str}")
+        if req_info.get("unmatched_targets"):
+            u_str = ", ".join(f"`{u}`" for u in req_info["unmatched_targets"][:8])
+            grounding_notes.append(
+                f"Note: The following token(s) in the request do not match existing repository symbols/files ({u_str}); treat them as new additions only if requested, or explicitly state that they do not exist in the current repository."
+            )
+
     sections: list[str] = [
         "You are an architecture-aware AI coding agent for this repository.",
         "Analyze the user request and the verified repository inventory, dependency graph, Graphify context, and Codebase Memory MCP context below,",
@@ -421,12 +492,12 @@ def build_planning_prompt(
         "3. Step-by-Step Implementation Plan",
         "4. Verification & Post-Change Knowledge Sync Strategy",
         "",
-        "Ground your plan strictly in the actual files, classes, functions, and dependencies listed below. Never invent non-existent files or symbols.",
+        "\n".join(grounding_notes),
         "",
         f"## User Request\n{request.strip()}",
     ]
 
-    _append_context_sections(sections, context)
+    _append_context_sections(sections, context, include_execution_flows=True)
     return "\n\n".join(sections)
 
 
@@ -3242,16 +3313,748 @@ def finalize_grounded_answer(
     return "\n\n".join(b for b in output_blocks if b)
 
 
+_ALLOWED_PLAN_META_TOKENS: frozenset[str] = frozenset(
+    {
+        "awaiting_review",
+        "verification_failed",
+        "verified_complete",
+        "repo_wide",
+        "config_or_doc",
+        "python_syntax",
+        "git_status",
+        "index_manifest",
+        "graphify_root",
+        "codebase_memory",
+        "search_graph",
+        "get_architecture",
+        "trace_path",
+        "detect_changes",
+        "get_code_snippet",
+        "index_repository",
+        "list_projects",
+        "save_result",
+        "py_compile",
+        "pytest",
+        "ruff",
+        "mypy",
+        "flake8",
+        "black",
+        "git",
+        "python",
+        "python3",
+        "pip",
+        "utf_8",
+        "sha256",
+        "litellm",
+    }
+)
+
+
+def validate_change_plan(
+    plan: str,
+    request: str,
+    context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Validate an implementation plan against retrieval prerequisites, required plan
+    sections, referenced repository paths and symbols, relevant dependencies,
+    implementation steps, architectural impact, and verification strategy.
+    """
+    req_text = (request or "").strip()
+    req_lower = req_text.lower()
+    plan_body = _strip_diagnostic_footers(plan or "").strip()
+    plan_lower = plan_body.lower()
+
+    full_ctx = _is_full_retrieval_context(context)
+    if full_ctx:
+        ver = _evaluate_source_verification(context)
+        retrieval_healthy = bool(ver["all_verified"])
+        critical_retrieval_failed = not retrieval_healthy
+    elif isinstance(context, dict) and bool(context):
+        ver = _evaluate_source_verification(context)
+        has_synth_evidence = any(
+            bool(context.get(k))
+            for k in (
+                "graphify_context",
+                "memory_architecture",
+                "architecture_overview",
+                "memory_symbols",
+                "memory_context",
+                "scoped_source_excerpts",
+                "formatted_inventory",
+                "reading_order",
+            )
+        )
+        retrieval_healthy = bool(has_synth_evidence and not ver["errors"])
+        critical_retrieval_failed = not retrieval_healthy
+    else:
+        ver = _evaluate_source_verification(None)
+        retrieval_healthy = False
+        critical_retrieval_failed = True
+
+    inv = (
+        context.get("repository_inventory")
+        if isinstance(context, dict)
+        and isinstance(context.get("repository_inventory"), dict)
+        else {}
+    )
+    files_list = inv.get("files") if isinstance(inv.get("files"), list) else []
+    reading_order = (
+        inv.get("reading_order") if isinstance(inv.get("reading_order"), list) else []
+    )
+    files_by_path: dict[str, dict[str, Any]] = {
+        str(f["path"]): f
+        for f in files_list
+        if isinstance(f, dict) and f.get("path")
+    }
+    ro_by_path: dict[str, dict[str, Any]] = {
+        str(item["path"]): dict(item)
+        for item in reading_order
+        if isinstance(item, dict) and item.get("path")
+    }
+    all_repo_paths: list[str] = list(ro_by_path.keys()) or list(files_by_path.keys())
+    for p in files_by_path:
+        if p not in all_repo_paths:
+            all_repo_paths.append(p)
+
+    # Support synthetic context dicts by extracting paths/symbols when inventory is absent
+    synthetic_symbols: set[str] = set()
+    if not all_repo_paths and isinstance(context, dict):
+        excerpts_dict = (
+            context.get("scoped_source_excerpts")
+            if isinstance(context.get("scoped_source_excerpts"), dict)
+            else {}
+        )
+        for k_path in excerpts_dict:
+            norm_k = str(k_path).replace("\\", "/").lstrip("./")
+            if norm_k and norm_k not in all_repo_paths:
+                all_repo_paths.append(norm_k)
+        blob_parts = [
+            json.dumps(context.get(k), default=str)
+            if isinstance(context.get(k), (dict, list))
+            else str(context.get(k) or "")
+            for k in (
+                "graphify_context",
+                "graphify_report",
+                "memory_architecture",
+                "architecture_overview",
+                "memory_symbols",
+                "memory_context",
+                "formatted_inventory",
+                "scoped_source_excerpts",
+            )
+        ]
+        blob_text = "\n".join(blob_parts)
+        for found_p in re.findall(
+            r"(?<![A-Za-z0-9_./\\-])((?:[A-Za-z0-9_.-]+/)+[A-Za-z0-9_.-]+\.(?:py|md|toml|txt|json|yaml|yml)|[A-Za-z0-9_-]+\.(?:py|md|toml|txt))\b",
+            blob_text,
+        ):
+            norm_fp = found_p.replace("\\", "/").lstrip("./")
+            if norm_fp not in all_repo_paths:
+                all_repo_paths.append(norm_fp)
+        for sym_tok in re.findall(r"\b([A-Za-z_][A-Za-z0-9_]{3,})\b", blob_text):
+            if sym_tok not in _STOP_WORDS and sym_tok not in _PYTHON_BUILTIN_IDENTIFIERS:
+                synthetic_symbols.add(sym_tok)
+
+    valid_path_set = set(all_repo_paths)
+    basename_to_paths: dict[str, list[str]] = {}
+    for p in all_repo_paths:
+        basename_to_paths.setdefault(Path(p).name.lower(), []).append(p)
+    valid_basenames = {Path(p).name for p in all_repo_paths}
+    top_pkg_prefixes = {p.split("/")[0] for p in all_repo_paths if "/" in p}
+
+    req_info = (
+        analyze_query_requirements(query=req_text, context=context)
+        if files_by_path
+        else {
+            "scope": "targeted",
+            "is_repo_wide": False,
+            "target_files": list(all_repo_paths),
+            "queried_symbols": [],
+            "unmatched_targets": [],
+            "excluded_dirs": [],
+            "excluded_files": [],
+        }
+    )
+
+    # 1. Check required plan sections
+    required_sections = [
+        "architectural_impact",
+        "files_and_symbols",
+        "implementation_steps",
+        "verification_strategy",
+    ]
+    section_patterns: dict[str, re.Pattern[str]] = {
+        "architectural_impact": re.compile(
+            r"(?:^|\n)\s*(?:#{1,6}\s*|\d+[.)]\s*|[-*+•]\s*|\*\*)?(?:\d+[.)]\s*)?(?:architectur(?:al|e)\s+impact|affected\s+(?:components|modules|layers)|impact\s*(?:&|and)\s*affected|component\s+impact|architectur(?:al|e)\s+overview)",
+            re.IGNORECASE,
+        ),
+        "files_and_symbols": re.compile(
+            r"(?:^|\n)\s*(?:#{1,6}\s*|\d+[.)]\s*|[-*+•]\s*|\*\*)?(?:\d+[.)]\s*)?(?:files?\s*(?:&|and|,|/)\s*symbols?|symbols?\s+to\s+(?:modify|change|update)|files?\s+to\s+(?:modify|change|update)|target\s+files?|affected\s+files?|modified\s+files?|modules?\s*(?:&|and)?\s*symbols?)",
+            re.IGNORECASE,
+        ),
+        "implementation_steps": re.compile(
+            r"(?:^|\n)\s*(?:#{1,6}\s*|\d+[.)]\s*|[-*+•]\s*|\*\*)?(?:\d+[.)]\s*)?(?:step-by-step|implementation\s+(?:plan|steps)|execution\s+steps|planned\s+changes|change\s+steps|implementation\s+details)",
+            re.IGNORECASE,
+        ),
+        "verification_strategy": re.compile(
+            r"(?:^|\n)\s*(?:#{1,6}\s*|\d+[.)]\s*|[-*+•]\s*|\*\*)?(?:\d+[.)]\s*)?(?:verification|post-change|knowledge\s+sync|testing\s*(?:&|and)\s*verification|validation\s+strategy)",
+            re.IGNORECASE,
+        ),
+    }
+    present_sections: list[str] = []
+    missing_sections: list[str] = []
+    for sec_key in required_sections:
+        if section_patterns[sec_key].search(plan_body):
+            present_sections.append(sec_key)
+        else:
+            missing_sections.append(sec_key)
+    sections_valid = len(missing_sections) == 0
+
+    # 2. Check referenced paths, target file coverage, and unsupported/hallucinated paths
+    referenced_paths: list[str] = []
+    for p in all_repo_paths:
+        if p in plan_body or p.replace("/", "\\") in plan_body:
+            if p not in referenced_paths:
+                referenced_paths.append(p)
+        else:
+            bname = Path(p).name
+            if (
+                len(basename_to_paths.get(bname.lower(), [])) == 1
+                and re.search(
+                    rf"(?<![A-Za-z0-9_./\\-]){re.escape(bname)}(?![A-Za-z0-9_.-])",
+                    plan_body,
+                )
+            ):
+                if p not in referenced_paths:
+                    referenced_paths.append(p)
+
+    # Identify explicitly named existing files in the user request
+    explicit_request_files: list[str] = []
+    unmatched_request_files: list[str] = []
+    excluded_file_names = {
+        str(f).lower() for f in (req_info.get("excluded_files") or [])
+    }
+    for p in all_repo_paths:
+        if p.lower() in req_lower or p.replace("/", "\\").lower() in req_lower:
+            if p not in explicit_request_files:
+                explicit_request_files.append(p)
+    for py_match in re.findall(
+        r"(?<![A-Za-z0-9_./\\-])((?:[A-Za-z0-9_.-]+/)*[A-Za-z0-9_.-]+\.py)\b",
+        req_text,
+    ):
+        norm_py = py_match.replace("\\", "/").lstrip("./")
+        if norm_py in valid_path_set:
+            if norm_py not in explicit_request_files:
+                explicit_request_files.append(norm_py)
+        elif "/" not in norm_py and norm_py.lower() in basename_to_paths:
+            for mp in basename_to_paths[norm_py.lower()]:
+                if mp not in explicit_request_files:
+                    explicit_request_files.append(mp)
+        elif norm_py.lower() not in excluded_file_names:
+            # Check if request explicitly asks to create a brand-new file
+            is_new_file_req = bool(
+                re.search(
+                    rf"\b(?:create|add|new\s+file|introduce)\b[^.\n]{{0,50}}{re.escape(py_match)}",
+                    req_text,
+                    re.IGNORECASE,
+                )
+            )
+            if not is_new_file_req and norm_py not in unmatched_request_files:
+                unmatched_request_files.append(norm_py)
+
+    missing_target_files = [
+        p for p in explicit_request_files if p not in referenced_paths
+    ]
+
+    unsupported_paths: list[str] = list(unmatched_request_files)
+    candidate_py_refs = re.findall(
+        r"(?<![A-Za-z0-9_./\\-])((?:[A-Za-z0-9_.-]+/)+[A-Za-z0-9_.-]+\.py|[A-Za-z0-9_-]+\.py)\b",
+        plan_body,
+    )
+    for ref in candidate_py_refs:
+        norm_ref = ref.replace("\\", "/").lstrip("./")
+        if "/" in norm_ref:
+            ref_top = norm_ref.split("/")[0]
+            if (
+                (
+                    not top_pkg_prefixes
+                    or ref_top in top_pkg_prefixes
+                    or ref_top in ("src", "app", "lib", "tests", "ntg")
+                )
+                and norm_ref not in valid_path_set
+                and norm_ref not in unsupported_paths
+            ):
+                unsupported_paths.append(norm_ref)
+        else:
+            if (
+                norm_ref not in valid_basenames
+                and norm_ref not in unsupported_paths
+            ):
+                unsupported_paths.append(norm_ref)
+
+    # 3. Build repository symbol tables & check referenced vs unsupported symbols/claims
+    all_repo_symbols: set[str] = set(synthetic_symbols)
+    all_repo_valid_identifiers: set[str] = (
+        set(_PYTHON_BUILTIN_IDENTIFIERS)
+        | set(_ALLOWED_PLAN_META_TOKENS)
+        | set(synthetic_symbols)
+    )
+    for path, rec in files_by_path.items():
+        stem = Path(path).stem
+        if stem:
+            all_repo_valid_identifiers.add(stem)
+        for part in Path(path).parts[:-1]:
+            all_repo_valid_identifiers.add(part)
+        for ext in rec.get("external_dependencies") or []:
+            if isinstance(ext, str):
+                all_repo_valid_identifiers.add(ext)
+        for cls in rec.get("classes", []):
+            cname = str(cls.get("name") or "")
+            if cname:
+                all_repo_symbols.add(cname)
+                all_repo_valid_identifiers.add(cname)
+                for m in cls.get("methods", []):
+                    if isinstance(m, str) and m:
+                        all_repo_valid_identifiers.add(m)
+                        if not m.startswith("__"):
+                            all_repo_symbols.add(m)
+        for fn in rec.get("functions", []):
+            fname = str(fn.get("name") or "")
+            if fname:
+                all_repo_symbols.add(fname)
+                all_repo_valid_identifiers.add(fname)
+        for const in rec.get("constants", []):
+            if isinstance(const, str) and const:
+                all_repo_symbols.add(const)
+                all_repo_valid_identifiers.add(const)
+        for exp in rec.get("exports", []):
+            if isinstance(exp, str) and exp:
+                all_repo_symbols.add(exp)
+                all_repo_valid_identifiers.add(exp)
+        for call_s in rec.get("all_calls", []) or []:
+            if isinstance(call_s, str) and call_s:
+                all_repo_valid_identifiers.add(call_s)
+
+    referenced_symbols: list[str] = []
+    for sym in sorted(all_repo_symbols):
+        if len(sym) >= 3 and re.search(
+            rf"(?<![A-Za-z0-9_]){re.escape(sym)}(?![A-Za-z0-9_])",
+            plan_body,
+        ):
+            referenced_symbols.append(sym)
+
+    queried_symbols = list(req_info.get("queried_symbols") or [])
+    missing_target_symbols = [
+        sym
+        for sym in queried_symbols
+        if not re.search(
+            rf"(?<![A-Za-z0-9_]){re.escape(sym)}(?![A-Za-z0-9_])",
+            plan_body,
+        )
+    ]
+
+    # Run per-file description/ownership/dependency validation on structured file entries in the plan
+    primary_lines, desc_windows, _ = _extract_file_entry_lines(
+        answer_body=plan_body,
+        all_repo_paths=all_repo_paths,
+    )
+    subject_covered_files: list[str] = []
+    for p in referenced_paths:
+        if p not in desc_windows:
+            continue
+        pline = primary_lines.get(p, "")
+        other_paths_on_line = [
+            op for op in referenced_paths if op != p and op in pline
+        ]
+        is_leading_subject = bool(
+            re.match(
+                rf"^\s*(?:[-*+•]|\d+[.)]|#{1,6})\s*(?:\*\*|`|\*|_|\s)*{re.escape(p)}\b",
+                pline,
+            )
+        )
+        if is_leading_subject or not other_paths_on_line:
+            subject_covered_files.append(p)
+            if other_paths_on_line:
+                desc_windows[p] = [pline]
+
+    desc_val = (
+        _validate_file_descriptions(
+            covered_files=subject_covered_files,
+            primary_lines=primary_lines,
+            desc_windows=desc_windows,
+            files_by_path=files_by_path,
+            ro_by_path=ro_by_path,
+        )
+        if files_by_path and subject_covered_files
+        else {
+            "checked_files_count": 0,
+            "grounded_files_count": 0,
+            "files_with_ast_symbol_mentions_count": 0,
+            "files_with_ast_symbol_mentions": [],
+            "ungrounded_descriptions": [],
+            "unsupported_claims": [],
+        }
+    )
+    unsupported_claims: list[dict[str, Any]] = list(
+        desc_val.get("unsupported_claims") or []
+    )
+    unsupported_symbols: list[str] = []
+    for claim in unsupported_claims:
+        c_sym = str(claim.get("symbol") or "")
+        if c_sym and not c_sym.endswith(".py") and c_sym not in all_repo_valid_identifiers:
+            if c_sym not in unsupported_symbols:
+                unsupported_symbols.append(c_sym)
+
+    # Identify tokens in request that may represent newly proposed symbols when valid target files exist
+    request_code_tokens = set(
+        re.findall(r"\b([A-Za-z_][A-Za-z0-9_]{2,})\b", req_text)
+    )
+    has_valid_target_files = bool(
+        explicit_request_files or req_info.get("target_files")
+    )
+
+    # If the request has unmatched targets and zero matched files/symbols in the repo, flag them
+    if req_info.get("unmatched_targets") and not has_valid_target_files:
+        for ut in req_info["unmatched_targets"]:
+            if str(ut).endswith(".py"):
+                if ut not in unsupported_paths:
+                    unsupported_paths.append(str(ut))
+            else:
+                if ut not in unsupported_symbols:
+                    unsupported_symbols.append(str(ut))
+
+    # Scan plan_body for backticked or explicitly claimed existing symbols not in the repository
+    if all_repo_valid_identifiers:
+        valid_lower_map = {s.lower() for s in all_repo_valid_identifiers}
+        for match in re.finditer(r"`([A-Za-z_][A-Za-z0-9_]{3,})(?:\(\))?`", plan_body):
+            cand = match.group(1)
+            cand_low = cand.lower()
+            if (
+                cand in all_repo_valid_identifiers
+                or cand_low in valid_lower_map
+                or cand_low in _STOP_WORDS
+                or cand_low in _GENERIC_SNAKE_TERMS
+                or cand_low in _ALLOWED_PLAN_META_TOKENS
+            ):
+                continue
+            # Check if preceded by creation/addition phrasing or part of user request's proposed additions
+            start_pos = max(0, match.start() - 65)
+            prefix_ctx = plan_body[start_pos : match.start()].lower()
+            is_proposed_new = bool(
+                (cand in request_code_tokens and has_valid_target_files)
+                or re.search(
+                    r"\b(?:add|create|introduce|new|define|helper|method|function|flag|option|parameter|field|key)\b",
+                    prefix_ctx,
+                )
+            )
+            looks_like_code_id = "_" in cand or bool(
+                re.match(r"^[A-Z][a-z0-9]+[A-Z]", cand)
+            )
+            if looks_like_code_id and not is_proposed_new:
+                if cand not in unsupported_symbols:
+                    unsupported_symbols.append(cand)
+                unsupported_claims.append(
+                    {
+                        "file": "",
+                        "symbol": cand,
+                        "actual_defined_in": [],
+                        "reason": (
+                            f"Plan references symbol `{cand}` which does not exist in the verified repository inventory"
+                        ),
+                    }
+                )
+
+    for u_path in unsupported_paths:
+        unsupported_claims.append(
+            {
+                "file": u_path,
+                "symbol": u_path,
+                "actual_defined_in": [],
+                "reason": (
+                    f"Plan references non-existent repository file path `{u_path}`"
+                ),
+            }
+        )
+
+    # 4. Check relevant dependencies and callers/callees
+    relevant_dep_files: set[str] = set()
+    relevant_caller_files: set[str] = set()
+    inspect_files = referenced_paths or list(req_info.get("target_files") or [])
+    for p in inspect_files:
+        rec = files_by_path.get(p) or {}
+        relevant_dep_files.update(rec.get("internal_dependencies") or [])
+        relevant_caller_files.update(rec.get("imported_by") or [])
+
+    has_dep_keywords = any(
+        kw in plan_lower
+        for kw in (
+            "depend",
+            "import",
+            "caller",
+            "callee",
+            "call",
+            "layer",
+            "downstream",
+            "upstream",
+            "invoke",
+            "route",
+            "orchestrat",
+        )
+    )
+    mentions_related_dep_or_caller = any(
+        d in referenced_paths or Path(d).stem.lower() in plan_lower
+        for d in (relevant_dep_files | relevant_caller_files)
+    )
+    has_contradicted_deps = any(
+        "dependency" in str(c.get("reason") or "").lower()
+        for c in unsupported_claims
+    )
+    dependencies_addressed = bool(
+        not has_contradicted_deps
+        and (
+            not (relevant_dep_files or relevant_caller_files)
+            or has_dep_keywords
+            or mentions_related_dep_or_caller
+        )
+    )
+
+    # 5. Check implementation steps (excluding the 4 top-level section headers)
+    step_lines: list[str] = []
+    for raw_ln in plan_body.splitlines():
+        ln = raw_ln.strip()
+        if not ln:
+            continue
+        if any(pat.search(ln) for pat in section_patterns.values()):
+            continue
+        if re.match(
+            r"^(?:[-*+•]\s+|\d+[.)]\s+|\*\*Step\s+\d+|\#{3,6}\s+Step\s+\d+)",
+            ln,
+            re.IGNORECASE,
+        ) and len(ln) >= 18:
+            step_lines.append(ln)
+    implementation_steps_count = len(step_lines)
+    has_implementation_steps = (
+        "implementation_steps" in present_sections
+        and implementation_steps_count >= 2
+    )
+
+    # 6. Check architecture impact and verification strategy
+    has_architecture_impact = bool(
+        "architectural_impact" in present_sections
+        and len(referenced_paths) > 0
+        and any(
+            kw in plan_lower
+            for kw in (
+                "architectur",
+                "component",
+                "layer",
+                "module",
+                "depend",
+                "import",
+                "call",
+                "boundary",
+                "flow",
+                "interface",
+                "route",
+                "agent",
+                "impact",
+                "affect",
+            )
+        )
+    )
+    has_verification_strategy = bool(
+        "verification_strategy" in present_sections
+        and any(
+            kw in plan_lower
+            for kw in (
+                "verify",
+                "syntax",
+                "py_compile",
+                "ast",
+                "test",
+                "command",
+                "codeverifier",
+                "verify_python_syntax",
+                "refresh_knowledge",
+                "sync_knowledge",
+                "graphify",
+                "codebase-memory",
+                "knowledge",
+            )
+        )
+    )
+
+    # 7. Evaluate overall evidence sufficiency
+    missing_evidence: list[str] = []
+    if not retrieval_healthy:
+        missing_evidence.append(
+            "Retrieval context is unverified, stale, or missing required codebase intelligence sources."
+        )
+    if ver.get("errors"):
+        missing_evidence.extend(str(e) for e in ver["errors"])
+    if full_ctx and not req_info.get("target_files"):
+        missing_evidence.append(
+            "No matching target files were resolved in the verified repository inventory."
+        )
+    if unmatched_request_files:
+        missing_evidence.append(
+            "Request references non-existent repository file(s): "
+            + ", ".join(unmatched_request_files)
+        )
+    if req_info.get("unmatched_targets") and not has_valid_target_files:
+        missing_evidence.append(
+            "Request targets non-existent repository symbol(s)/file(s): "
+            + ", ".join(str(u) for u in req_info["unmatched_targets"])
+        )
+
+    retrieval_ev = (
+        context.get("retrieval_evidence")
+        if isinstance(context, dict)
+        and isinstance(context.get("retrieval_evidence"), dict)
+        else {}
+    )
+    if retrieval_ev.get("unreadable_files"):
+        missing_evidence.append(
+            f"{len(retrieval_ev['unreadable_files'])} repository file(s) were unreadable."
+        )
+    for reason in retrieval_ev.get("insufficiency_reasons") or []:
+        if isinstance(reason, str) and reason and reason not in missing_evidence:
+            missing_evidence.append(reason)
+
+    target_py_has_symbols = any(
+        bool(
+            (files_by_path.get(p) or {}).get("classes")
+            or (files_by_path.get(p) or {}).get("functions")
+        )
+        for p in (referenced_paths or req_info.get("target_files") or [])
+    ) or bool(synthetic_symbols)
+
+    evidence_sufficient = bool(
+        retrieval_healthy
+        and not missing_evidence
+        and len(all_repo_paths) > 0
+    )
+
+    warnings: list[str] = []
+    if missing_evidence:
+        warnings.extend(missing_evidence)
+    if missing_sections:
+        warnings.append(
+            "Plan is missing required section(s): " + ", ".join(missing_sections)
+        )
+    if not referenced_paths:
+        warnings.append(
+            "Plan does not reference any valid repository file paths."
+        )
+    if target_py_has_symbols and not referenced_symbols:
+        warnings.append(
+            "Plan does not reference any verified repository symbols (classes, functions, methods, or constants)."
+        )
+    if missing_target_files:
+        warnings.append(
+            "Plan omitted explicitly targeted repository file(s): "
+            + ", ".join(missing_target_files)
+        )
+    if missing_target_symbols:
+        warnings.append(
+            "Plan omitted explicitly queried repository symbol(s): "
+            + ", ".join(missing_target_symbols)
+        )
+    if unsupported_paths:
+        warnings.append(
+            "Plan referenced non-existent/unsupported file path(s): "
+            + ", ".join(unsupported_paths)
+        )
+    if unsupported_symbols:
+        warnings.append(
+            "Plan referenced unsupported/non-existent symbol(s): "
+            + ", ".join(unsupported_symbols)
+        )
+    if unsupported_claims:
+        warnings.append(
+            f"Plan contained {len(unsupported_claims)} unsupported claim(s): "
+            + "; ".join(str(c.get("reason")) for c in unsupported_claims[:5])
+        )
+    if not dependencies_addressed:
+        warnings.append(
+            "Plan does not address relevant internal dependencies or caller/callee impacts."
+        )
+    if not has_implementation_steps:
+        warnings.append(
+            f"Plan requires at least 2 concrete implementation steps (found {implementation_steps_count})."
+        )
+    if not has_architecture_impact:
+        warnings.append(
+            "Plan does not sufficiently ground architectural impact and affected components."
+        )
+    if not has_verification_strategy:
+        warnings.append(
+            "Plan does not specify a concrete verification and post-change knowledge sync strategy."
+        )
+
+    is_complete = bool(
+        plan_body
+        and retrieval_healthy
+        and evidence_sufficient
+        and sections_valid
+        and len(referenced_paths) > 0
+        and (len(referenced_symbols) > 0 or not target_py_has_symbols)
+        and not missing_target_files
+        and not missing_target_symbols
+        and not unsupported_paths
+        and not unsupported_symbols
+        and not unsupported_claims
+        and not missing_evidence
+        and dependencies_addressed
+        and has_implementation_steps
+        and has_architecture_impact
+        and has_verification_strategy
+    )
+
+    if is_complete:
+        status_label = "verified_complete"
+    elif critical_retrieval_failed and full_ctx:
+        status_label = "degraded"
+    else:
+        status_label = "incomplete"
+
+    return {
+        "complete": is_complete,
+        "valid": is_complete,
+        "status": status_label,
+        "retrieval_healthy": retrieval_healthy,
+        "critical_retrieval_failed": critical_retrieval_failed,
+        "evidence_sufficient": evidence_sufficient,
+        "required_sections": required_sections,
+        "present_sections": present_sections,
+        "missing_sections": missing_sections,
+        "sections_valid": sections_valid,
+        "referenced_paths": referenced_paths,
+        "referenced_symbols": referenced_symbols,
+        "missing_target_files": missing_target_files,
+        "missing_target_symbols": missing_target_symbols,
+        "unsupported_paths": unsupported_paths,
+        "unsupported_symbols": unsupported_symbols,
+        "unsupported_claims": unsupported_claims,
+        "missing_evidence": missing_evidence,
+        "dependencies_addressed": dependencies_addressed,
+        "implementation_steps_count": implementation_steps_count,
+        "has_implementation_steps": has_implementation_steps,
+        "has_architecture_impact": has_architecture_impact,
+        "has_verification_strategy": has_verification_strategy,
+        "warnings": list(dict.fromkeys(warnings)),
+    }
+
+
 def build_change_plan(
     request: str,
     planning_response: Any,
     context: dict[str, Any] | None = None,
     strict: bool = True,
 ) -> dict[str, Any]:
-    """Create a reviewable plan from the model's planning response.
-    When `context` is a retrieval context dictionary, verifies that all knowledge sources
-    succeeded (`strict=True` raises `RuntimeError` on degraded retrieval; `strict=False`
-    marks the plan `status='degraded'` so it cannot be approved).
+    """Create a reviewable plan from the model's planning response, validating
+    both retrieval prerequisites and plan-specific completeness/evidence grounding.
+    Keeps `approved=False` until explicit human approval via `approve_plan()`.
     """
     if not isinstance(request, str) or not request.strip():
         raise ValueError("request must be a non-empty string.")
@@ -3261,15 +4064,24 @@ def build_change_plan(
         ver = verify_retrieval_context(context, strict=strict)
 
     if ver is not None and not ver["all_verified"]:
+        degraded_val = validate_change_plan(
+            plan="",
+            request=request,
+            context=context,
+        )
         plan_dict: dict[str, Any] = {
             "request": request,
             "plan": "",
+            "raw_plan": "",
             "status": "degraded",
+            "validation_status": "degraded",
             "complete": False,
             "approved": False,
             "model_invoked": False,
             "retrieval_blocked": True,
             "retrieval_verified": False,
+            "validation": degraded_val,
+            "warnings": list(degraded_val.get("warnings", [])),
             "errors": list(ver["errors"]),
             "files_changed": [],
             "validation_results": [],
@@ -3279,16 +4091,36 @@ def build_change_plan(
         return plan_dict
 
     content = extract_response_content(planning_response)
+    plan_validation = validate_change_plan(
+        plan=content or "",
+        request=request,
+        context=context,
+    )
+    is_complete = bool(plan_validation["complete"])
+    retrieval_verified = (
+        True
+        if (ver is not None and ver["all_verified"])
+        else (bool(plan_validation["retrieval_healthy"]) if context is not None else False)
+    )
+
+    if is_complete:
+        plan_status = "awaiting_review"
+    else:
+        plan_status = "incomplete"
 
     plan_dict = {
         "request": request,
         "plan": content or "",
-        "status": "awaiting_review",
-        "complete": bool(content and content.strip()),
+        "raw_plan": content or "",
+        "status": plan_status,
+        "validation_status": plan_validation["status"],
+        "complete": is_complete,
         "approved": False,
         "model_invoked": True,
         "retrieval_blocked": False,
-        "retrieval_verified": True if ver is not None else None,
+        "retrieval_verified": retrieval_verified,
+        "validation": plan_validation,
+        "warnings": list(plan_validation.get("warnings", [])),
         "errors": [],
         "files_changed": [],
         "validation_results": [],
@@ -3304,7 +4136,11 @@ def approve_plan(plan: dict[str, Any]) -> dict[str, Any]:
     """
     if not isinstance(plan, dict):
         raise ValueError("plan must be a dictionary.")
-    if plan.get("status") != "awaiting_review":
+    if (
+        plan.get("status") not in ("awaiting_review", "incomplete")
+        or plan.get("retrieval_blocked")
+        or not str(plan.get("plan") or "").strip()
+    ):
         raise ValueError("Only a pending plan can be approved.")
 
     plan["approved"] = True
@@ -3316,7 +4152,7 @@ def reject_plan(plan: dict[str, Any], reason: str = "") -> dict[str, Any]:
     """Explicitly reject a pending plan so it cannot be executed."""
     if not isinstance(plan, dict):
         raise ValueError("plan must be a dictionary.")
-    if plan.get("status") != "awaiting_review":
+    if plan.get("status") not in ("awaiting_review", "incomplete"):
         raise ValueError("Only a pending plan can be rejected.")
 
     plan["approved"] = False
