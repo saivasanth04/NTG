@@ -362,6 +362,24 @@ class ArchitectureAwareAgent:
         )
 
         context_errors = [str(e) for e in context.get("errors", [])]
+        retrieval_operations = {
+            "graphify_query_succeeded": bool(
+                context.get("graphify_context")
+            ),
+            "memory_architecture_succeeded": bool(
+                context.get("memory_architecture")
+                or context.get("architecture_overview")
+            ),
+            "memory_symbol_query_succeeded": bool(
+                context.get("memory_symbols")
+                or context.get("memory_context")
+            ),
+            "inventory_verified": (
+                context.get("coverage", {}).get("inventory_status")
+                == "verified"
+            ),
+            "retrieval_errors": context_errors,
+        }        
         index_status = context.get("index_status") or {}
         graph_st = (
             index_status.get("graphify")
@@ -392,12 +410,17 @@ class ArchitectureAwareAgent:
             if isinstance(context.get("coverage"), dict)
             else {}
         )
+        discovered_count = coverage.get("discovered_files_count", -1)
+        analyzed_count = coverage.get("analyzed_files_count", -2)
+
         inventory_ok = bool(
             isinstance(inventory, dict)
             and inventory.get("total_files", 0) > 0
             and coverage.get("inventory_status") == "verified"
             and coverage.get("inventory_missing_files_count", 1) == 0
             and coverage.get("inventory_unreadable_files_count", 1) == 0
+            and discovered_count >= 0
+            and analyzed_count == discovered_count
         )
 
         indexes_ok = (graph_ok and memory_ok) if require_indexes else True
@@ -478,6 +501,8 @@ class ArchitectureAwareAgent:
                 "graphify_ok": graph_ok,
                 "memory_ok": memory_ok,
             },
+            "retrieval_operations": retrieval_operations,
+            "model_invoked": True,
             "context": context,
             "response": response,
         }
