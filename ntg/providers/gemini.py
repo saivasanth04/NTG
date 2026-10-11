@@ -23,7 +23,7 @@ from ntg.core.models import (
     QuotaScope,
 )
 from ntg.core.utils import sanitize_secret
-from ntg.providers.base import DiscoveryErrorCategory, apply_stored_state, classify_discovery_error
+from ntg.providers.base import enrich_capabilities, DiscoveryErrorCategory, apply_stored_state, classify_discovery_error
 
 load_env_file()
 
@@ -109,7 +109,7 @@ def infer_gemini_capabilities(model_dict: Dict[str, Any]) -> ModelCapabilities:
     sdk_thinking = model_dict.get("thinking")
     reasoning: Optional[bool] = bool(sdk_thinking) if sdk_thinking is not None else None
 
-    return ModelCapabilities(
+    return enrich_capabilities("gemini/" + str(model_dict.get("name", "")).removeprefix("models/"), ModelCapabilities(
         coding=None,
         reasoning=reasoning,
         vision=None,
@@ -117,7 +117,7 @@ def infer_gemini_capabilities(model_dict: Dict[str, Any]) -> ModelCapabilities:
         structured_output=None,
         streaming=True,
         context_window=context_window,
-    )
+    ))
 
 
 def supports_generate_content(model: Dict[str, Any]) -> bool:

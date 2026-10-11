@@ -11,12 +11,12 @@ from ntg.core.config import (
     NVIDIA_LITELLM_MODEL,
 )
 from ntg.core.models import Deployment, ModelCapabilities, QuotaInfo, QuotaScope
-from ntg.providers.base import apply_stored_state
+from ntg.providers.base import enrich_capabilities, apply_stored_state
 
 
 def infer_nvidia_capabilities(model_id: str = NVIDIA_ACTUAL_MODEL) -> ModelCapabilities:
     """Infer normalized ModelCapabilities for an NVIDIA NIM model."""
-    return ModelCapabilities(
+    return enrich_capabilities("nvidia_nim/" + model_id, ModelCapabilities(
         coding=None,
         reasoning=None,
         vision=None,
@@ -24,7 +24,7 @@ def infer_nvidia_capabilities(model_id: str = NVIDIA_ACTUAL_MODEL) -> ModelCapab
         structured_output=None,
         streaming=True,
         context_window=131072,
-    )
+    ))
 
 
 def build_nvidia_deployments(

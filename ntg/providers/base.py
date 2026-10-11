@@ -7,7 +7,27 @@ import json
 from typing import Any, Optional
 import requests
 
-from ntg.core.models import Deployment
+from ntg.core.models import Deployment, ModelCapabilities
+
+
+def enrich_capabilities(model: str, capabilities: ModelCapabilities) -> ModelCapabilities:
+    """Fill unknown protocol support from LiteLLM's bundled model metadata.
+
+    Provider discovery remains authoritative. Unknown models stay unknown;
+    name substrings never imply vision, tool, or schema support.
+    """
+    from litellm import model_cost
+    metadata = model_cost.get(model, {})
+    for capability, field in (("tool_calling", "supports_function_calling"),
+                              ("structured_output", "supports_response_schema"),
+                              ("vision", "supports_vision"),
+                              ("audio_input", "supports_audio_input"),
+                              ("audio_output", "supports_audio_output"),
+                              ("reasoning", "supports_reasoning")):
+        value = metadata.get(field)
+        if getattr(capabilities, capability) is None and isinstance(value, bool):
+            setattr(capabilities, capability, value)
+    return capabilities
 
 
 class DiscoveryErrorCategory(str, Enum):

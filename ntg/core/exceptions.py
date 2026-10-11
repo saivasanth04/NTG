@@ -20,6 +20,7 @@ CATEGORY_SERVER_ERROR = "UPSTREAM_SERVER_ERROR"
 CATEGORY_REQUEST_ERROR = "REQUEST_ERROR"
 CATEGORY_NOT_FOUND = "MODEL_NOT_FOUND"
 CATEGORY_UNKNOWN_ERROR = "UNKNOWN_ERROR"
+CATEGORY_CAPABILITY_ERROR = "CAPABILITY_MISMATCH"
 
 
 @dataclass
@@ -231,7 +232,34 @@ def parse_provider_error(error: Exception, provider: str = "") -> ParsedErrorInf
 
     err_str = str(error)
     err_lower = err_str.lower()
-    msg = err_data.get("message") or err_str
+    msg = sanitize_secret(err_data.get("message") or err_str)
+
+    # HTTP status is authoritative. Diagnostic text may mention models, quotas,
+    # or authentication without making those the cause of a server failure.
+    if (isinstance(status_code, int) and (status_code >= 500 or status_code == 408)
+        or isinstance(error, (TimeoutError, ConnectionError))
+        or type(error).__name__ in ("APIConnectionError", "APITimeoutError")):
+        _, retry_delay = parse_reset_header(_header(headers, "retry-after"))
+        return ParsedErrorInfo(category=CATEGORY_SERVER_ERROR, status_code=status_code or 503,
+            is_retryable=True, should_quarantine=False, cooldown_seconds=retry_delay or 0.0,
+            reset_timestamp=None, limit_type="server", quota_scope=QuotaScope.UNKNOWN,
+            provider_name=provider or None, message=msg)
+    if status_code == 403 and "model" in err_lower and any(
+        word in err_lower for word in ("access", "permission", "not allowed", "not authorized")
+    ):
+        return ParsedErrorInfo(category=CATEGORY_NOT_FOUND, status_code=403,
+            is_retryable=False, should_quarantine=True, cooldown_seconds=0.0,
+            reset_timestamp=None, limit_type="model_access", quota_scope=QuotaScope.MODEL,
+            provider_name=provider or None, message=msg)
+    if (type(error).__name__ == "ContextWindowExceededError"
+        or status_code == 400 and any(phrase in err_lower for phrase in (
+            "context length", "context window", "maximum context",
+            "does not support tools", "does not support function", "does not support json",
+            "does not support streaming", "unsupported response_format"))):
+        return ParsedErrorInfo(category=CATEGORY_CAPABILITY_ERROR, status_code=status_code or 400,
+            is_retryable=True, should_quarantine=False, cooldown_seconds=0.0,
+            reset_timestamp=None, limit_type="capability", quota_scope=QuotaScope.UNKNOWN,
+            provider_name=provider or None, message=msg)
 
     limit_source = metadata.get("limit_source")
     provider_name = metadata.get("provider_name") or provider or None
@@ -307,8 +335,8 @@ def parse_provider_error(error: Exception, provider: str = "") -> ParsedErrorInf
                 "api key not valid",
                 "api key expired",
                 "permission_denied",
-                "authentication",
-                "invalid token",
+                "invalid bearer token",
+                "invalid access token",
                 "incorrect api key",
             )
         )
@@ -336,8 +364,8 @@ def parse_provider_error(error: Exception, provider: str = "") -> ParsedErrorInf
     # 2. Status 429 / 402 Rate Limit / Quota Exhaustion
     is_429 = (
         status_code in (429, 402)
-        or "429" in err_lower
-        or has_quota_or_rate_kw
+        or (status_code is None and re.search(r"\b429\b", err_lower) is not None)
+        or (has_quota_or_rate_kw and status_code in (None, 403, 429, 402))
         or (status_code == 403 and "credits" in err_lower)
     )
 
@@ -438,23 +466,20 @@ def parse_provider_error(error: Exception, provider: str = "") -> ParsedErrorInf
     err_code = str(err_data.get("code") or "").lower() if isinstance(err_data, dict) else ""
     is_model_specific = (
         (
-            "model" in err_lower
+            status_code in (None, 400, 404)
+            and "model" in err_lower
             and any(
                 kw in err_lower
                 for kw in (
                     "not found",
                     "does not exist",
                     "not exist",
-                    "access",
                     "unknown",
-                    "unavailable",
                     "recognized",
                     "could not find",
                     "no such",
                     "decommissioned",
                     "deprecated",
-                    "not supported",
-                    "unsupported",
                     "no endpoints",
                 )
             )
@@ -468,7 +493,6 @@ def parse_provider_error(error: Exception, provider: str = "") -> ParsedErrorInf
                 "model_decommissioned",
                 "no endpoints found",
                 "unsupported model",
-                "models/",
             )
         )
         or err_code in ("model_not_found", "model_decommissioned", "model_not_supported")
@@ -546,8 +570,8 @@ def parse_provider_error(error: Exception, provider: str = "") -> ParsedErrorInf
             status_code=status_code or 503,
             is_retryable=True,
             should_quarantine=False,
-            cooldown_seconds=15.0,
-            reset_timestamp=time.time() + 15.0,
+            cooldown_seconds=0.0,
+            reset_timestamp=None,
             limit_type="server",
             quota_scope=QuotaScope.UNKNOWN,
             provider_name=provider_name,

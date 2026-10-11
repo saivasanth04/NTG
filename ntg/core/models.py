@@ -63,6 +63,17 @@ class ModelCapabilities:
     structured_output: Optional[bool] = None
     streaming: Optional[bool] = None
     context_window: int = 4096
+    audio_input: Optional[bool] = None
+    audio_output: Optional[bool] = None
+
+    def __post_init__(self) -> None:
+        for name in ("coding", "reasoning", "vision", "tool_calling", "structured_output",
+                     "streaming", "audio_input", "audio_output"):
+            value = getattr(self, name)
+            if value is not None and not isinstance(value, bool):
+                raise ValueError(f"{name} must be True, False or None")
+        if isinstance(self.context_window, bool) or not isinstance(self.context_window, int) or self.context_window < 0:
+            raise ValueError("context_window must be a nonnegative integer")
 
     def satisfies(self, required: Optional["ModelCapabilities"]) -> bool:
         """Check if deployment meets all required capabilities and minimum context window."""
@@ -79,6 +90,10 @@ class ModelCapabilities:
         if required.structured_output is True and self.structured_output is not True:
             return False
         if required.streaming is True and self.streaming is not True:
+            return False
+        if required.audio_input is True and self.audio_input is not True:
+            return False
+        if required.audio_output is True and self.audio_output is not True:
             return False
         if required.context_window and self.context_window < required.context_window:
             return False
@@ -99,6 +114,10 @@ class ModelCapabilities:
             tags.append("structured_output")
         if self.streaming is True:
             tags.append("streaming")
+        if self.audio_input is True:
+            tags.append("audio_input")
+        if self.audio_output is True:
+            tags.append("audio_output")
         return tags
 
     def to_dict(self) -> Dict[str, Any]:
@@ -111,6 +130,8 @@ class ModelCapabilities:
             "structured_output": self.structured_output,
             "streaming": self.streaming,
             "context_window": self.context_window,
+            "audio_input": self.audio_input,
+            "audio_output": self.audio_output,
         }
 
 
@@ -137,6 +158,31 @@ class QuotaInfo:
     quota_scope: str = QuotaScope.UNKNOWN
     limit_type: Optional[str] = None  # "rpm", "rpd", "tpm", "quota", "temporary"
     last_updated: float = 0.0
+    rpm_reset_at: Optional[float] = None
+    rpd_reset_at: Optional[float] = None
+
+    def refresh(self, now: float) -> None:
+        for prefix, fallback in (("rpm", 60.0), ("rpd", 86400.0)):
+            reset = getattr(self, f"{prefix}_reset_at")
+            if reset is None and getattr(self, f"{prefix}_remaining") is not None:
+                reset = (self.last_updated or now) + fallback
+                setattr(self, f"{prefix}_reset_at", reset)
+            if reset is not None and now >= reset:
+                setattr(self, f"{prefix}_remaining", None)
+                setattr(self, f"{prefix}_reset_at", None)
+        if self.reset_at is not None and now >= self.reset_at:
+            self.reset_at = None
+            self.retry_after = None
+            # A 429 cooldown is authoritative even without per-window headers.
+            if self.rpm_remaining == 0:
+                self.rpm_remaining = None
+            if self.rpd_remaining == 0:
+                self.rpd_remaining = None
+
+    def exhausted(self, now: float) -> bool:
+        self.refresh(now)
+        return bool((self.reset_at and now < self.reset_at)
+                    or self.rpm_remaining == 0 or self.rpd_remaining == 0)
 
     def update(
         self,
@@ -228,8 +274,14 @@ class QuotaInfo:
         if target:
             ts, cd = parse_reset_header(target)
             if cd is not None and ts is not None:
-                self.retry_after = cd
-                self.reset_at = ts
+                self.rpm_reset_at = ts
+                # Reset headers describe a window, not an unconditional embargo.
+                if raw_retry or self.rpm_remaining == 0:
+                    self.retry_after = cd
+                    self.reset_at = ts
+        raw_day_reset = _get_h(["x-ratelimit-reset-requests-day", "x-ratelimit-reset-day"])
+        if raw_day_reset:
+            self.rpd_reset_at, _ = parse_reset_header(raw_day_reset)
 
         # Quota Scope determination
         p_low = (provider or "").lower()
@@ -257,6 +309,8 @@ class QuotaInfo:
             "quota_scope": self.quota_scope,
             "limit_type": self.limit_type,
             "last_updated": self.last_updated,
+            "rpm_reset_at": self.rpm_reset_at,
+            "rpd_reset_at": self.rpd_reset_at,
         }
 
 
@@ -416,7 +470,7 @@ class Deployment:
     model: str
     logical_model: str
     litellm_model: str
-    api_key: str
+    api_key: str = field(repr=False)
     api_base: Optional[str] = None
     capabilities: ModelCapabilities = field(default_factory=ModelCapabilities)
     quota: QuotaInfo = field(default_factory=QuotaInfo)
@@ -435,6 +489,7 @@ class Deployment:
     last_auth_probe_at: float = 0.0
     auth_probe_backoff: float = 300.0
     is_stale: bool = False
+    latency_ewma: Optional[float] = None
     stale_reason: Optional[str] = None
     last_discovered_at: float = 0.0
     _active_probe_request_ids: Set[str] = field(default_factory=set, repr=False, compare=False)
@@ -653,7 +708,7 @@ class Deployment:
         if self.circuit_state in (CircuitState.QUARANTINED, CircuitState.AUTH_FAILED):
             return False
         current_time = now if now is not None else time.time()
-        if self.quota.reset_at and current_time < self.quota.reset_at:
+        if self.quota.exhausted(current_time):
             return False
         if self.circuit_state == CircuitState.OPEN:
             return False
@@ -687,7 +742,7 @@ class Deployment:
         ):
             return False
         current_time = now if now is not None else time.time()
-        if self.quota.reset_at and current_time < self.quota.reset_at:
+        if self.quota.exhausted(current_time):
             return False
         return True
 
@@ -730,7 +785,7 @@ class Deployment:
                 return False
             if self.circuit_state in (CircuitState.QUARANTINED, CircuitState.AUTH_FAILED):
                 return False
-            if self.quota.reset_at and current_time < self.quota.reset_at:
+            if self.quota.exhausted(current_time):
                 return False
             if self.circuit_state == CircuitState.OPEN:
                 return False
@@ -755,7 +810,7 @@ class Deployment:
                 self._active_probe_request_ids.clear()
             self.half_open_probes = len(self._active_probe_request_ids)
             self.circuit_state = CircuitState.HEALTHY
-            self.state_reason = reason
+            self.state_reason = sanitize_secret(reason, self.api_key)
             self.state_updated_at = time.time()
             self.auth_failed_key_hash = None
             self.auth_probe_backoff = 300.0
@@ -779,7 +834,7 @@ class Deployment:
                 self.circuit_open_until = max(now + cooldown_seconds, reset_at)
             else:
                 self.circuit_open_until = now + cooldown_seconds
-            self.state_reason = reason
+            self.state_reason = sanitize_secret(reason, self.api_key)
             self.state_updated_at = now
 
     def transition_to_half_open(
@@ -791,7 +846,7 @@ class Deployment:
             self.circuit_state = CircuitState.HALF_OPEN
             self._active_probe_request_ids.clear()
             self.half_open_probes = 0
-            self.state_reason = reason
+            self.state_reason = sanitize_secret(reason, self.api_key)
             self.state_updated_at = time.time()
 
     def transition_to_quarantine(
@@ -863,8 +918,7 @@ class Deployment:
                 if curr_hash != self.auth_failed_key_hash:
                     self.transition_to_healthy(reason="API key updated; authentication quarantine lifted")
 
-            if self.quota.reset_at and current_time >= self.quota.reset_at:
-                self.quota.reset_at = None
+            self.quota.refresh(current_time)
 
             if self.circuit_state == CircuitState.OPEN:
                 is_circuit_cooled = bool(not self.circuit_open_until or current_time >= self.circuit_open_until)

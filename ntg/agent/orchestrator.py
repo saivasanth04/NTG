@@ -500,22 +500,23 @@ class ArchitectureAwareAgent:
             completion_fn = router_obj.completion
             try:
                 sig = inspect.signature(completion_fn)
-                kwargs: dict[str, Any] = {}
-                params = sig.parameters
-                accepts_var_kw = any(
-                    p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
-                )
-                if "messages" in params or accepts_var_kw:
-                    kwargs["messages"] = messages
-                if model is not None and ("model" in params or accepts_var_kw):
-                    kwargs["model"] = model
-                if effective_caps and ("capabilities" in params or accepts_var_kw):
-                    kwargs["capabilities"] = effective_caps
-                if kwargs:
-                    return completion_fn(**kwargs)
             except (ValueError, TypeError):
-                pass
-            return completion_fn(messages=messages)
+                return completion_fn(messages=messages)
+            params = sig.parameters
+            accepts_var_kw = any(
+                parameter.kind == inspect.Parameter.VAR_KEYWORD
+                for parameter in params.values()
+            )
+            kwargs: dict[str, Any] = {}
+            if "messages" in params or accepts_var_kw:
+                kwargs["messages"] = messages
+            if model is not None and ("model" in params or accepts_var_kw):
+                kwargs["model"] = model
+            if effective_caps and ("capabilities" in params or accepts_var_kw):
+                kwargs["capabilities"] = effective_caps
+            # Provider/validation errors must propagate. Retrying the call inside a
+            # signature-inspection handler could silently discard requirements.
+            return completion_fn(**kwargs) if kwargs else completion_fn(messages=messages)
 
         if hasattr(router_obj, "ask"):
             return router_obj.ask(prompt, model=model, capabilities=effective_caps)

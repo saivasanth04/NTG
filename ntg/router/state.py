@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
+import math
 import os
 import threading
 import time
@@ -53,23 +55,26 @@ SAFE_EXACT_KEYS = {
 }
 
 
-def clean_for_persistence(obj: Any) -> Any:
+def clean_for_persistence(obj: Any, secrets: Any = ()) -> Any:
     """Recursively scrub secrets, credentials, and request bodies before saving."""
     if isinstance(obj, dict):
         cleaned: Dict[str, Any] = {}
         for k, v in obj.items():
             k_str = str(k).lower()
             if k_str in SAFE_EXACT_KEYS:
-                cleaned[k] = clean_for_persistence(v)
+                cleaned[k] = clean_for_persistence(v, secrets)
             elif any(pat in k_str for pat in FORBIDDEN_KEY_PATTERNS):
                 continue
             else:
-                cleaned[k] = clean_for_persistence(v)
+                cleaned[k] = clean_for_persistence(v, secrets)
         return cleaned
     elif isinstance(obj, list):
-        return [clean_for_persistence(item) for item in obj]
+        return [clean_for_persistence(item, secrets) for item in obj]
     elif isinstance(obj, str):
-        return sanitize_secret(obj)
+        result = sanitize_secret(obj)
+        for secret in secrets:
+            result = sanitize_secret(result, secret)
+        return result
     return obj
 
 
@@ -88,6 +93,7 @@ class StateManager:
 
     def __init__(self, state_file: Optional[str] = None):
         self._lock = threading.RLock()
+        self._known_secrets: set[str] = set()
         if state_file:
             self.state_file = state_file
         else:
@@ -96,6 +102,11 @@ class StateManager:
             self.state_file = str(ntg_dir / "state.json")
 
         self.state_data: Dict[str, Any] = self._load()
+
+    def register_secrets(self, secrets: Any) -> None:
+        """Keep credentials only in memory for exact redaction of persisted strings."""
+        with self._lock:
+            self._known_secrets.update(secret for secret in secrets if isinstance(secret, str) and secret)
 
     def _load(self) -> Dict[str, Any]:
         """Load state data safely from file, discarding expired information."""
@@ -124,12 +135,28 @@ class StateManager:
 
         now = time.time()
 
+        for section in ("deployments", "quota", "metrics"):
+            for identity, entry in list(data[section].items()):
+                if not isinstance(entry, dict):
+                    del data[section][identity]
+                    continue
+                for key in ("reset_at", "rpm_reset_at", "rpd_reset_at", "retry_after", "last_updated",
+                            "circuit_open_until", "state_updated_at", "consecutive_failures", "latency_ewma",
+                            "last_auth_probe_at", "auth_probe_backoff",
+                            "rpm_limit", "rpm_remaining", "rpd_limit", "rpd_remaining",
+                            "user_requests", "upstream_attempts", "successes", "failures", "rate_limits", "auth_failures"):
+                    value = entry.get(key)
+                    if value is not None and (isinstance(value, bool) or not isinstance(value, (int, float))
+                                              or not math.isfinite(value) or value < 0):
+                        entry.pop(key, None)
+
         deployments = data.get("deployments", {})
         for dep_id, entry in list(deployments.items()):
             if not isinstance(entry, dict):
                 continue
             if entry.get("circuit_state") == CircuitState.OPEN.value:
-                open_until = entry.get("circuit_open_until", 0.0) or entry.get("reset_at", 0.0)
+                open_until = max(entry.get("circuit_open_until", 0.0) or 0.0, entry.get("reset_at", 0.0) or 0.0,
+                                 data["quota"].get(dep_id, {}).get("reset_at", 0.0) or 0.0)
                 if open_until > 0 and now >= open_until:
                     entry.pop("reset_at", None)
                     entry.pop("circuit_open_until", None)
@@ -142,6 +169,9 @@ class StateManager:
                 continue
             q_reset = q_entry.get("reset_at")
             if q_reset and isinstance(q_reset, (int, float)) and now >= q_reset:
+                for prefix in ("rpm", "rpd"):
+                    if q_entry.get(f"{prefix}_remaining") == 0:
+                        q_entry[f"{prefix}_remaining"] = None
                 q_entry["reset_at"] = None
                 q_entry["retry_after"] = 0.0
 
@@ -152,19 +182,18 @@ class StateManager:
         with self._lock:
             temp_file = None
             try:
-                os.makedirs(os.path.dirname(self.state_file), exist_ok=True)
-                clean_data = clean_for_persistence(self.state_data)
-                clean_data["version"] = 1
+                os.makedirs(os.path.dirname(os.path.abspath(self.state_file)), exist_ok=True)
+                clean_data = clean_for_persistence(self.state_data, self._known_secrets)
+                clean_data["version"] = 2
                 clean_data["updated_at"] = time.time()
 
                 temp_file = f"{self.state_file}.tmp.{os.getpid()}.{threading.get_ident()}"
                 with open(temp_file, "w", encoding="utf-8") as f:
-                    json.dump(clean_data, f, indent=2)
+                    json.dump(clean_data, f, indent=2, allow_nan=False)
+                    f.flush()
+                    os.fsync(f.fileno())
 
-                if os.path.exists(self.state_file):
-                    os.replace(temp_file, self.state_file)
-                else:
-                    os.rename(temp_file, self.state_file)
+                os.replace(temp_file, self.state_file)
             except Exception as err:
                 logger.warning("Could not save state file: %s", err)
                 if temp_file and os.path.exists(temp_file):
@@ -174,37 +203,37 @@ class StateManager:
                         pass
 
     def snapshot_deployment(self, deployment: Any) -> None:
-        """Persist runtime state directly from a Deployment instance."""
+        """Persist a coherent runtime snapshot in one atomic replacement."""
+        self.snapshot_deployments([deployment])
+
+    def snapshot_deployments(self, deployments: Any, account_auth: Any = None) -> None:
+        """Commit all deployments affected by one scoped outcome together."""
         with self._lock:
-            dep_id = getattr(deployment, "id", str(deployment))
-            now = time.time()
-            if "deployments" not in self.state_data:
-                self.state_data["deployments"] = {}
-            if dep_id not in self.state_data["deployments"]:
-                self.state_data["deployments"][dep_id] = {}
-
-            c_state = getattr(deployment, "circuit_state", CircuitState.HEALTHY)
-            c_val = c_state.value if hasattr(c_state, "value") else str(c_state)
-
-            quota_obj = getattr(deployment, "quota", None)
-            reset_at = getattr(quota_obj, "reset_at", 0.0) if quota_obj else 0.0
-            quota_scope = getattr(quota_obj, "quota_scope", "deployment") if quota_obj else "deployment"
-
-            self.state_data["deployments"][dep_id].update({
-                "circuit_state": c_val,
-                "state_reason": getattr(deployment, "state_reason", None),
-                "circuit_open_until": getattr(deployment, "circuit_open_until", 0.0),
-                "reset_at": reset_at or 0.0,
-                "quota_scope": quota_scope,
-                "state_updated_at": getattr(deployment, "state_updated_at", now) or now,
-                "last_available": deployment.is_available(now) if hasattr(deployment, "is_available") else True,
-            })
-
-            if hasattr(deployment, "metrics"):
-                self.record_metrics(dep_id, deployment.metrics)
-            if hasattr(deployment, "quota"):
-                self.record_quota(dep_id, deployment.quota)
+            if account_auth:
+                self.state_data["accounts"].update(account_auth)
+            for deployment in deployments:
+                self._known_secrets.add(deployment.api_key)
+                with deployment._state_lock:
+                    self.state_data["deployments"][deployment.id] = {
+                        "circuit_state": deployment.circuit_state.value,
+                        "state_reason": sanitize_secret(deployment.state_reason, deployment.api_key),
+                        "circuit_open_until": deployment.circuit_open_until,
+                        "reset_at": deployment.quota.reset_at or 0.0,
+                        "state_updated_at": deployment.state_updated_at,
+                        "consecutive_failures": deployment.consecutive_failures,
+                        "latency_ewma": deployment.latency_ewma,
+                        "auth_fingerprint": deployment.auth_failed_key_hash,
+                        "last_auth_probe_at": deployment.last_auth_probe_at,
+                        "auth_probe_backoff": deployment.auth_probe_backoff,
+                    }
+                    self.state_data["metrics"][deployment.id] = deployment.metrics.to_dict()
+                    self.state_data["quota"][deployment.id] = deployment.quota.to_dict()
             self.save()
+
+    def get_account_auth(self, provider: str, account: str) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            record = self.state_data["accounts"].get(f"{provider}:{account}")
+            return dict(record) if isinstance(record, dict) else None
 
     def get_cached_discovery(self, key: str) -> List[Any]:
         """Retrieve last-known-good models for a provider account."""
@@ -525,6 +554,8 @@ class StateManager:
                     quota_scope=raw.get("quota_scope", "unknown"),
                     limit_type=raw.get("limit_type"),
                     last_updated=raw.get("last_updated", 0.0),
+                    rpm_reset_at=raw.get("rpm_reset_at"),
+                    rpd_reset_at=raw.get("rpd_reset_at"),
                 )
             saved = self.state_data.get("deployments", {}).get(dep_id, {})
             if saved and isinstance(saved, dict):
@@ -550,6 +581,8 @@ class StateManager:
     def apply_to_deployment(self, deployment: Any) -> None:
         """Apply persisted state (quarantine, cooldown, circuit breaker, quota) to a deployment."""
         with self._lock:
+            account_auth = self.get_account_auth(deployment.provider, deployment.account)
+            current_hash = hashlib.sha256(deployment.api_key.encode()).hexdigest()
             if deployment.id in self.state_data.get("quota", {}):
                 deployment.quota = self.get_quota(deployment.id)
 
@@ -561,7 +594,18 @@ class StateManager:
                     deployment.metrics = self.get_metrics(deployment.id)
 
             deps = self.state_data.get("deployments", {})
-            saved = deps.get(deployment.id)
+            saved = deps.get(deployment.id, {})
+            if not isinstance(saved, dict):
+                saved = {}
+            deployment.consecutive_failures = saved.get("consecutive_failures", 0)
+            deployment.latency_ewma = saved.get("latency_ewma")
+            deployment.auth_failed_key_hash = saved.get("auth_fingerprint")
+            deployment.last_auth_probe_at = saved.get("last_auth_probe_at", 0.0)
+            deployment.auth_probe_backoff = saved.get("auth_probe_backoff", 300.0)
+            if account_auth and account_auth.get("auth_fingerprint") == current_hash:
+                deployment.transition_to_quarantine(account_auth.get("state_reason", "Account authentication failed"),
+                    CircuitState.AUTH_FAILED)
+                return
             if not saved:
                 return
 
@@ -575,7 +619,8 @@ class StateManager:
 
             circuit_str = saved.get("circuit_state", CircuitState.HEALTHY.value)
             reset_at = saved.get("reset_at", 0.0)
-            open_until = saved.get("circuit_open_until", 0.0) or reset_at
+            open_until = max(saved.get("circuit_open_until", 0.0) or 0.0, reset_at or 0.0,
+                             deployment.quota.reset_at or 0.0)
 
             if circuit_str in (
                 CircuitState.QUARANTINED.value,

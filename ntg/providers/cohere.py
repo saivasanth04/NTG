@@ -11,12 +11,12 @@ from ntg.core.config import (
     MODEL_GROUP_COHERE,
 )
 from ntg.core.models import Deployment, ModelCapabilities, QuotaInfo, QuotaScope
-from ntg.providers.base import apply_stored_state
+from ntg.providers.base import enrich_capabilities, apply_stored_state
 
 
 def infer_cohere_capabilities(model_id: str = COHERE_ACTUAL_MODEL) -> ModelCapabilities:
     """Infer normalized ModelCapabilities for a Cohere model."""
-    return ModelCapabilities(
+    return enrich_capabilities("cohere_chat/" + model_id, ModelCapabilities(
         coding=None,
         reasoning=None,
         vision=None,
@@ -24,7 +24,7 @@ def infer_cohere_capabilities(model_id: str = COHERE_ACTUAL_MODEL) -> ModelCapab
         structured_output=None,
         streaming=True,
         context_window=128000,
-    )
+    ))
 
 
 def build_cohere_deployments(

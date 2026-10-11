@@ -61,8 +61,8 @@ def print_banner(
     print_divider("NTG — MULTI-PROVIDER LITELLM SMART ROUTER")
     print(f"Deployments   : {total} total ({breakdown})")
     print(f"Default Model : {default_model}")
-    print("Architecture  : NTG (capabilities, quotas, state) + LiteLLM (routing & failover)")
-    print("Routing Engine: LiteLLM Router (simple-shuffle & bounded failover)")
+    print("Architecture  : NTG (ranking, failover, quotas, state) + LiteLLM (provider transport)")
+    print("Routing Engine: Deterministic scoring & bounded account/provider failover")
     print("Reliability   : Circuit Breaker (HEALTHY -> OPEN -> HALF_OPEN -> HEALTHY)")
     print("Security      : Zero secrets in console diagnostics\n")
 

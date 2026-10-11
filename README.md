@@ -115,18 +115,18 @@ AGENT / USER PROMPT
     ↓
 REQUEST REQUIREMENTS (`extract_request_requirements`: tools, structured_output, vision, streaming, coding, reasoning, min_context)
     ↓
-NTG ELIGIBILITY FILTER (`_filter_eligible_deployments`: capabilities + quota + auth quarantine + circuit state + HALF_OPEN probe claim)
+NTG ELIGIBILITY FILTER (verified protocol capabilities + quota + auth quarantine + circuit state)
     ↓
-ELIGIBLE DEPLOYMENT POOL & FALLBACKS (`simple_shuffle` initial selection + account-first & cross-provider fallback chain)
+DETERMINISTIC POLICY (capability fit + quota headroom + health + latency + account distribution)
     ↓
-LITELLM ROUTER (persistent Router instance, bounded retry budget [default=1, max=2], automatic failover)
+NTG ATTEMPT LOOP (dispatch-time probe/quota reservation, account/provider failover, bounded extra retries [default=1, max=2])
     ↓
 UPSTREAM PROVIDER / ACCOUNT / MODEL (OpenRouter, Groq, NVIDIA NIM, Cohere, Gemini)
     ↓
-NTG TELEMETRY CALLBACKS (`NTGTelemetryLogger`) & ATOMIC PERSISTENCE (`.ntg/state.json`)
+SYNCHRONOUS ATTEMPT OUTCOMES & COHERENT ATOMIC PERSISTENCE (`.ntg/state.json`)
 ```
 
-LiteLLM acts as the **execution and failover engine**, while NTG provides **deterministic capability filtering, quota scope intelligence, circuit breaker state transitions, HALF_OPEN single-probe reservation, and zero-secret persistence**.
+NTG owns **deterministic ranking, bounded retry/failover, scoped quota reservations, circuit recovery, and secret-scrubbed persistence**. LiteLLM provides the public provider transport. See [the routing audit and design](docs/smart-routing.md) for the scoring formula, state ownership, compatibility details, and operational limits.
 
 ---
 
@@ -168,7 +168,7 @@ LiteLLM acts as the **execution and failover engine**, while NTG provides **dete
   - **Cohere**: Up to 5 accounts (`COHERE_API_KEY_1..5`), model `north-mini-code-1-0` (`128,000` token context window).
   - **Google Gemini**: Up to 4 accounts (`GEMINI_API_KEY_1..4`), dynamic discovery via `google-genai` SDK (`client.models.list()`), filtering for `generateContent` text models (`supports_generate_content`).
 - **Capability-Aware Request Extraction (`ntg/router/requirements.py`)**:
-  - Automatically extracts requirements for `tool_calling` (`tools`/`functions`), `structured_output` (`response_format`/`schema`/`json_schema`), `vision` (image URLs / base64 payloads), `streaming`, `reasoning`, `coding`, and `context_window`.
+  - Automatically extracts requirements for `tool_calling` (`tools`/`functions`), `structured_output` (`response_format`/`schema`/`json_schema`), `vision` (typed image content), audio input/output, `streaming`, `reasoning`, `coding`, and `context_window`.
 - **Circuit Breaker & Atomic `HALF_OPEN` Probing (`ntg/core/models.py`)**:
   - States: `HEALTHY` → `OPEN` → `HALF_OPEN` → `HEALTHY`, plus `QUARANTINED` (model 404) and `AUTH_FAILED` (account 401/403).
   - `HALF_OPEN` state enforces atomic single-request probe reservation (`claim_half_open_probe` / `release_half_open_probe`); probe failure doubles the cooldown backoff, while probe success restores `HEALTHY`.
@@ -177,7 +177,7 @@ LiteLLM acts as the **execution and failover engine**, while NTG provides **dete
   - Resolves cooldowns using strict priority: (1) `Retry-After` header, (2) `X-RateLimit-Reset` / `RateLimit-Reset`, (3) provider-specific reset headers, (4) structured metadata / error duration strings (`6m0s`, `250ms`, ISO-8601, RFC 2822), and (5) conservative fallback (UTC midnight for daily quotas, `60s` for short-term limits).
   - Propagates `QuotaScope.ACCOUNT` (OpenRouter, Cohere, NVIDIA) and `QuotaScope.PROVIDER` cooldowns or `AUTH_FAILED` quarantines across all sibling deployments sharing the affected account.
 - **Zero-Secret Atomic State Persistence (`ntg/router/state.py`)**:
-  - Atomically writes `.ntg/state.json` via PID/thread-scoped temporary file replacement while recursively scrubbing keys matching `api_key`, `token`, `secret`, `authorization`, `headers`, `messages`, or `prompt`, and redacting `Bearer` / `sk-` tokens via `sanitize_secret`.
+  - Atomically writes coherent `.ntg/state.json` snapshots via flushed PID/thread-scoped temporary file replacement while recursively scrubbing keys matching `api_key`, `token`, `secret`, `authorization`, `headers`, `messages`, or `prompt`, and redacting `Bearer` / `sk-` tokens via `sanitize_secret`.
 
 ---
 

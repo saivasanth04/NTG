@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Set
+import json
 
 from ntg.core.models import ModelCapabilities
 
@@ -20,7 +21,7 @@ def parse_capabilities(
     if caps is None:
         return None
     if isinstance(caps, ModelCapabilities):
-        return caps
+        return ModelCapabilities(**caps.to_dict())
     if isinstance(caps, dict):
         return ModelCapabilities(**caps)
     if isinstance(caps, list):
@@ -31,8 +32,13 @@ def parse_capabilities(
             "tool_calling",
             "structured_output",
             "streaming",
+            "audio_input",
+            "audio_output",
         }
-        return ModelCapabilities(**{c: True for c in caps if c in valid_fields})
+        unknown = set(caps) - valid_fields
+        if unknown:
+            raise ValueError(f"Unknown capabilities: {sorted(unknown)}")
+        return ModelCapabilities(**{c: True for c in caps})
     if isinstance(caps, str):
         c_clean = caps.strip().lower()
         if c_clean in ("coding", "code"):
@@ -47,7 +53,9 @@ def parse_capabilities(
             return ModelCapabilities(structured_output=True)
         if c_clean in ("streaming", "stream"):
             return ModelCapabilities(streaming=True)
-    return None
+        if c_clean in ("audio_input", "audio_output"):
+            return ModelCapabilities(**{c_clean: True})
+    raise ValueError("Invalid capabilities parameter")
 
 
 class RequestRequirements:
@@ -74,6 +82,10 @@ class RequestRequirements:
             reqs.append("vision")
         if self.capabilities.streaming is True:
             reqs.append("streaming")
+        if self.capabilities.audio_input is True:
+            reqs.append("audio_input")
+        if self.capabilities.audio_output is True:
+            reqs.append("audio_output")
         if self.capabilities.reasoning is True:
             reqs.append("reasoning")
         if self.capabilities.coding is True:
@@ -97,18 +109,21 @@ def extract_request_requirements(
     req_caps = ModelCapabilities()
     strict_reqs: Set[str] = set()
     coding_preferred = False
+    if model in ("vision", "tool_calling", "structured_output", "streaming", "audio_input", "audio_output"):
+        setattr(req_caps, model, True)
+        strict_reqs.add(model)
 
     # 1. Tools / functions requested -> require tool_calling
     tools = kwargs.get("tools")
     functions = kwargs.get("functions")
     tool_choice = kwargs.get("tool_choice")
     has_tools = bool(
-        (tools and len(tools) > 0) or (functions and len(functions) > 0) or tool_choice
+        tools or functions or (tool_choice is not None and tool_choice != "none")
     )
     if not has_tools and messages and isinstance(messages, list):
         for msg in messages:
             if isinstance(msg, dict):
-                if msg.get("role") in ("tool", "function") or msg.get("tool_calls"):
+                if msg.get("role") in ("tool", "function") or msg.get("tool_calls") or msg.get("function_call"):
                     has_tools = True
                     break
     if has_tools:
@@ -149,19 +164,20 @@ def extract_request_requirements(
                 for part in content:
                     if isinstance(part, dict):
                         part_type = str(part.get("type", "")).lower()
-                        if part_type in ("image_url", "image") or "image_url" in part:
+                        if part_type in ("image_url", "image", "input_image") or "image_url" in part:
                             has_image = True
-                            break
-            elif isinstance(content, str) and ("data:image/" in content or "base64," in content):
-                has_image = True
-            if has_image:
-                break
-    if prompt and ("data:image/" in prompt or "base64," in prompt):
-        has_image = True
+                        if part_type in ("input_audio", "audio_url"):
+                            req_caps.audio_input = True
+                            strict_reqs.add("audio_input")
+                        if part_type in ("file", "input_file", "video", "video_url"):
+                            raise ValueError(f"Unsupported input modality: {part_type}")
 
     if has_image:
         req_caps.vision = True
         strict_reqs.add("vision")
+    if "audio" in (kwargs.get("modalities") or []) or kwargs.get("audio") is not None:
+        req_caps.audio_output = True
+        strict_reqs.add("audio_output")
 
     # 4. Streaming requested -> require streaming
     if kwargs.get("stream") is True or kwargs.get("streaming") is True:
@@ -172,7 +188,8 @@ def extract_request_requirements(
     if (
         model == "reasoning"
         or kwargs.get("reasoning") is True
-        or kwargs.get("reasoning_effort") is not None
+        or isinstance(kwargs.get("reasoning"), dict) and bool(kwargs["reasoning"]) and kwargs["reasoning"].get("enabled") is not False
+        or kwargs.get("reasoning_effort") not in (None, "none", False)
     ):
         req_caps.reasoning = True
         strict_reqs.add("reasoning")
@@ -192,23 +209,35 @@ def extract_request_requirements(
             coding_preferred = True
 
     # 7. Context window requirement (explicit min_context and estimated prompt + completion tokens)
-    total_chars = 0
-    if messages and isinstance(messages, list):
-        for m in messages:
-            if isinstance(m, dict):
-                c = m.get("content")
-                if isinstance(c, str):
-                    total_chars += len(c)
-                elif isinstance(c, list):
-                    for part in c:
-                        if isinstance(part, dict) and isinstance(part.get("text"), str):
-                            total_chars += len(part["text"])
-    elif prompt and isinstance(prompt, str):
-        total_chars = len(prompt)
+    # Include protocol overhead, function arguments and schemas. UTF-8 bytes are a
+    # conservative dependency-free upper bound for text BPE tokens, not chars/4.
+    # Image payload bytes are excluded; reserve a documented per-image allowance.
+    def token_bound(value: Any) -> int:
+        if isinstance(value, str):
+            return len(value.encode("utf-8"))
+        if isinstance(value, list):
+            return sum(token_bound(item) for item in value)
+        if isinstance(value, dict):
+            if value.get("type") in ("image", "image_url", "input_image"):
+                return 4096
+            if value.get("type") in ("input_audio", "audio_url"):
+                return 4096
+            return sum(token_bound(k) + token_bound(v) for k, v in value.items()) + 8
+        return len(json.dumps(value, default=str))
 
-    req_max_tokens = kwargs.get("max_tokens") or kwargs.get("max_completion_tokens") or 0
-    extra_tokens = int(req_max_tokens) if isinstance(req_max_tokens, int) and req_max_tokens > 0 else 0
-    estimated_tokens = (total_chars // 4) + extra_tokens
+    extra_tokens = 0
+    for name in ("max_tokens", "max_completion_tokens"):
+        value = kwargs.get(name)
+        if value is not None:
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"{name} must be a nonnegative integer")
+            extra_tokens = max(extra_tokens, value)
+    if min_context is not None and (isinstance(min_context, bool) or not isinstance(min_context, int) or min_context < 0):
+        raise ValueError("min_context must be a nonnegative integer")
+    estimated_tokens = token_bound(messages or prompt or "") + extra_tokens
+    for name in ("tools", "functions", "response_format", "schema", "json_schema", "guided_json"):
+        if kwargs.get(name) is not None:
+            estimated_tokens += token_bound(kwargs[name])
 
     effective_min_context = max(min_context or 0, estimated_tokens)
     if effective_min_context > 0:
@@ -238,6 +267,10 @@ def extract_request_requirements(
             if explicit_parsed.streaming is True:
                 req_caps.streaming = True
                 strict_reqs.add("streaming")
+            for name in ("audio_input", "audio_output"):
+                if getattr(explicit_parsed, name) is True:
+                    setattr(req_caps, name, True)
+                    strict_reqs.add(name)
             if explicit_parsed.context_window > req_caps.context_window:
                 req_caps.context_window = explicit_parsed.context_window
                 strict_reqs.add("context_window")

@@ -16,14 +16,14 @@ from ntg.core.models import (
     QuotaScope,
 )
 from ntg.core.utils import sanitize_secret
-from ntg.providers.base import DiscoveryErrorCategory, apply_stored_state, classify_discovery_error
+from ntg.providers.base import enrich_capabilities, DiscoveryErrorCategory, apply_stored_state, classify_discovery_error
 
 logger = logging.getLogger("ntg.providers.groq")
 
 
 def infer_groq_capabilities(model_id: str, context_window: int = 8192) -> ModelCapabilities:
     """Infer normalized ModelCapabilities for a Groq model using provider metadata."""
-    return ModelCapabilities(
+    return enrich_capabilities("groq/" + model_id, ModelCapabilities(
         coding=None,
         reasoning=None,
         vision=None,
@@ -31,7 +31,7 @@ def infer_groq_capabilities(model_id: str, context_window: int = 8192) -> ModelC
         structured_output=None,
         streaming=True,
         context_window=context_window,
-    )
+    ))
 
 
 def discover_groq_models(
