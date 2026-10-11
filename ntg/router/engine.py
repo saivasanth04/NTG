@@ -32,6 +32,8 @@ from ntg.core.config import (
 )
 from ntg.core.exceptions import (
     CATEGORY_AUTH_ERROR,
+    CATEGORY_REQUEST_ERROR,
+    CATEGORY_SERVER_ERROR,
     parse_provider_error,
 )
 from ntg.core.models import (
@@ -115,9 +117,7 @@ class UnifiedNTGRouter:
 
         # 2. Build LiteLLM model_list deployment pool
         active_deployments = [
-            dep
-            for dep in self.deployments
-            if dep.api_key and dep.api_key.strip() and dep.available
+            dep for dep in self.deployments if dep.is_pool_active()
         ]
 
         model_list: List[Dict[str, Any]] = []
@@ -173,12 +173,17 @@ class UnifiedNTGRouter:
             cooldown_time=60.0,
             allowed_fails=1,
             num_retries=self.num_retries,
-            retry_policy=self.retry_policy,
+            retry_policy=None,
+            default_max_parallel_requests=None,
             fallbacks=None,
+            max_fallbacks=max(100, len(self.deployments) * 2 + 20),
+            retry_after=0,
             model_group_alias={
                 MODEL_GROUP_NTG_AUTO: MODEL_GROUP_AUTO,
             },
         )
+        self.router.max_fallbacks = max(100, len(self.deployments) * 2 + 20)
+        self.router.retry_after = 0
 
         # 6. Synchronization and request context
         self._model_pool_lock = threading.Lock()
@@ -208,6 +213,168 @@ class UnifiedNTGRouter:
         litellm.input_callback = [cb for cb in litellm.input_callback if _keep_cb(cb)]
         litellm.input_callback.append(self.telemetry_logger)
 
+        self._configure_router_failover_hooks()
+
+    def _configure_router_failover_hooks(self) -> None:
+        """Configure LiteLLM Router retry and completion hooks to integrate with NTG state."""
+        self.router._time_to_sleep_before_retry = lambda *a, **kw: 0.0
+
+        def _should_retry_this_error(
+            error: Exception,
+            healthy_deployments: Any = None,
+            all_deployments: Any = None,
+            context_window_fallbacks: Any = None,
+            content_policy_fallbacks: Any = None,
+            **kwargs: Any,
+        ) -> bool:
+            req_id = getattr(self._request_context, "active_request_id", None)
+            active_req = self._get_active_request(req_id) if req_id else None
+
+            dep: Optional[Deployment] = None
+            if isinstance(all_deployments, list) and all_deployments:
+                first_item = all_deployments[0]
+                if isinstance(first_item, dict):
+                    dep_id = first_item.get("model_info", {}).get("id") or first_item.get("model_name")
+                    if dep_id:
+                        dep = self.deployment_map.get(dep_id)
+            if dep is None and active_req and active_req.attempted_deployments:
+                dep = active_req.attempted_deployments[-1]
+
+            info = parse_provider_error(error, provider=dep.provider if dep else None)
+
+            # Never retry or fallback on permanent client request errors (e.g. HTTP 400 invalid params)
+            if info.category == CATEGORY_REQUEST_ERROR and not info.should_quarantine:
+                if active_req is not None:
+                    if active_req.fallback_list is not None:
+                        active_req.fallback_list.clear()
+                    active_req.fallback_targets.clear()
+                raise error
+
+            # Rate limits, quota exhaustion, auth errors, and unsupported models must immediately
+            # advance to the next deployment in the fallback chain rather than retrying the same deployment.
+            if info.category != CATEGORY_SERVER_ERROR:
+                raise error
+
+            # For transient server/timeout errors: if other eligible fallback deployments exist,
+            # fail over to them immediately; only retry the same deployment if no fallbacks remain
+            # and the deployment is still healthy.
+            if active_req is not None and active_req.fallback_targets:
+                attempted_ids = {d.id for d in active_req.attempted_deployments}
+                has_remaining_fb = any(
+                    fb_id not in attempted_ids
+                    and fb_id in self.deployment_map
+                    and self.deployment_map[fb_id].is_eligible(request_id=req_id)
+                    for fb_id in active_req.fallback_targets
+                )
+                if has_remaining_fb:
+                    raise error
+
+            if dep is not None and dep.is_eligible(request_id=req_id):
+                return True
+
+            raise error
+
+        self.router.should_retry_this_error = _should_retry_this_error
+
+        orig_completion = self.router._completion
+
+        def _wrapped_completion(*args: Any, **kwargs: Any) -> Any:
+            model_id = kwargs.get("model") or (args[0] if args else None)
+            dep = self.deployment_map.get(model_id) if isinstance(model_id, str) else None
+            meta = kwargs.get("metadata") if isinstance(kwargs.get("metadata"), dict) else {}
+            req_id = meta.get("ntg_request_id") or getattr(
+                self._request_context, "active_request_id", None
+            )
+            active_req = self._get_active_request(req_id) if req_id else None
+
+            if dep is not None and not dep.is_eligible(request_id=req_id):
+                self._sync_router_model_pool()
+                raise ValueError(
+                    f"Deployment {dep.id} is not eligible ({dep.circuit_state.value}: {dep.state_reason})"
+                )
+
+            before_cb = active_req.callback_events_count if active_req else 0
+            start_t = time.time()
+            call_id = f"{req_id or 'req'}_{model_id}_{uuid.uuid4().hex[:8]}"
+
+            try:
+                resp = orig_completion(*args, **kwargs)
+                if dep is not None and resp is not None:
+                    try:
+                        setattr(resp, "_ntg_deployment", dep)
+                    except Exception:
+                        pass
+                if (
+                    active_req is not None
+                    and active_req.callback_events_count == before_cb
+                    and dep is not None
+                ):
+                    cb_kwargs = {
+                        "model": dep.litellm_model,
+                        "litellm_call_id": call_id,
+                        "metadata": {
+                            "ntg_request_id": req_id,
+                            "ntg_router_id": self.router_id,
+                            "deployment_id": dep.id,
+                        },
+                        "litellm_params": {
+                            "model_info": {"id": dep.id},
+                            "metadata": {
+                                "ntg_request_id": req_id,
+                                "ntg_router_id": self.router_id,
+                                "deployment_id": dep.id,
+                            },
+                        },
+                    }
+                    self.telemetry_logger.log_pre_api_call(
+                        dep.litellm_model, kwargs.get("messages"), cb_kwargs
+                    )
+                    self.telemetry_logger.log_success_event(
+                        cb_kwargs, resp, start_t, time.time()
+                    )
+                return resp
+            except Exception as exc:
+                if (
+                    active_req is not None
+                    and active_req.callback_events_count == before_cb
+                    and dep is not None
+                    and not (isinstance(exc, ValueError) and "No deployments available" in str(exc))
+                ):
+                    cb_kwargs = {
+                        "model": dep.litellm_model,
+                        "litellm_call_id": call_id,
+                        "exception": exc,
+                        "metadata": {
+                            "ntg_request_id": req_id,
+                            "ntg_router_id": self.router_id,
+                            "deployment_id": dep.id,
+                        },
+                        "litellm_params": {
+                            "model_info": {"id": dep.id},
+                            "metadata": {
+                                "ntg_request_id": req_id,
+                                "ntg_router_id": self.router_id,
+                                "deployment_id": dep.id,
+                            },
+                        },
+                    }
+                    self.telemetry_logger.log_pre_api_call(
+                        dep.litellm_model, kwargs.get("messages"), cb_kwargs
+                    )
+                    self.telemetry_logger.log_failure_event(
+                        cb_kwargs, exc, start_t, time.time()
+                    )
+                if dep is not None:
+                    info = parse_provider_error(exc, provider=dep.provider)
+                    if info.category == CATEGORY_REQUEST_ERROR and not info.should_quarantine:
+                        if active_req is not None:
+                            if active_req.fallback_list is not None:
+                                active_req.fallback_list.clear()
+                            active_req.fallback_targets.clear()
+                raise
+
+        self.router._completion = _wrapped_completion
+
     def close(self) -> None:
         """Deregister callbacks and release resources."""
         if hasattr(self, "telemetry_logger") and self.telemetry_logger:
@@ -231,6 +398,7 @@ class UnifiedNTGRouter:
         if deployment not in self.deployments:
             self.deployments.append(deployment)
         self.deployment_map[deployment.id] = deployment
+        self.router.max_fallbacks = max(100, len(self.deployments) * 2 + 20)
         self._sync_router_model_pool()
 
     def remove_deployment(self, deployment_id: str) -> bool:
@@ -289,14 +457,13 @@ class UnifiedNTGRouter:
                 return
 
             self.deployment_map = {dep.id: dep for dep in self.deployments}
+            self.router.max_fallbacks = max(100, len(self.deployments) * 2 + 20)
 
             models: List[Dict[str, Any]] = []
             registered_pairs: Set[tuple[str, str]] = set()
 
             for dep in self.deployments:
-                if not dep.api_key or not dep.api_key.strip():
-                    continue
-                if dep.is_quarantined or not dep.available:
+                if not dep.is_pool_active():
                     continue
 
                 litellm_dict = dep.to_litellm_dict()
@@ -700,7 +867,7 @@ class UnifiedNTGRouter:
                     if d.api_key
                     and d.api_key.strip()
                     and not d.is_quarantined
-                    and d.is_available(ts)
+                    and d.is_available(ts, request_id=request_id)
                 ]
             )
 
@@ -729,7 +896,11 @@ class UnifiedNTGRouter:
                 parsed_caps.context_window = min_context
             reqs = RequestRequirements(capabilities=parsed_caps)
 
-        has_explicit_coding = any(d.capabilities.coding is True for d in candidates)
+        has_explicit_coding = any(
+            d.capabilities.coding is True
+            for d in self.deployments
+            if d.api_key and d.api_key.strip()
+        )
         effective_req_caps = reqs.capabilities
         if effective_req_caps.coding is True and not has_explicit_coding:
             effective_req_caps = ModelCapabilities(
@@ -772,7 +943,7 @@ class UnifiedNTGRouter:
                     if dep not in claimed_probes:
                         claimed_probes.append(dep)
             else:
-                if not dep.is_available(ts):
+                if not dep.is_available(ts, request_id=request_id):
                     continue
 
             eligible.append(dep)
@@ -788,6 +959,72 @@ class UnifiedNTGRouter:
                 eligible = coding_matches
 
         return eligible
+
+    def _order_tier_deployments_account_first(
+        self,
+        deployments: List[Deployment],
+        exclude_id: Optional[str] = None,
+        deprioritize_account: Optional[str] = None,
+    ) -> List[Deployment]:
+        """Order a provider tier's deployments so distinct accounts are interleaved first.
+
+        Preserves account-level failover across distinct accounts before trying additional
+        models on the same account, using LiteLLM's simple_shuffle within each account.
+        """
+        filtered = [d for d in deployments if d.id != exclude_id]
+        if len(filtered) <= 1:
+            return filtered
+
+        by_account: Dict[str, List[Deployment]] = {}
+        for d in filtered:
+            by_account.setdefault(d.account, []).append(d)
+
+        ordered_per_account: Dict[str, List[Deployment]] = {}
+        for acc, acc_deps in by_account.items():
+            if len(acc_deps) == 1:
+                ordered_per_account[acc] = list(acc_deps)
+            else:
+                remaining = list(acc_deps)
+                shuffled: List[Deployment] = []
+                while remaining:
+                    if len(remaining) == 1:
+                        shuffled.append(remaining.pop(0))
+                    else:
+                        cand_dicts = [d.to_litellm_dict(group_override=d.id) for d in remaining]
+                        chosen = simple_shuffle(self.router, cand_dicts, acc)
+                        chosen_id = (
+                            chosen.get("model_info", {}).get("id") or chosen.get("model_name")
+                        )
+                        picked = next(
+                            (d for d in remaining if d.id == chosen_id), remaining[0]
+                        )
+                        shuffled.append(picked)
+                        remaining.remove(picked)
+                ordered_per_account[acc] = shuffled
+
+        other_accounts = [
+            acc for acc in ordered_per_account if acc != deprioritize_account
+        ]
+        if len(other_accounts) > 1:
+            random.shuffle(other_accounts)
+        account_order = list(other_accounts)
+        if deprioritize_account and deprioritize_account in ordered_per_account:
+            account_order.append(deprioritize_account)
+
+        interleaved: List[Deployment] = []
+        idx = 0
+        while True:
+            added_in_round = False
+            for acc in account_order:
+                acc_list = ordered_per_account[acc]
+                if idx < len(acc_list):
+                    interleaved.append(acc_list[idx])
+                    added_in_round = True
+            if not added_in_round:
+                break
+            idx += 1
+
+        return interleaved
 
     def _build_request_pool_and_fallbacks(
         self,
@@ -810,8 +1047,47 @@ class UnifiedNTGRouter:
             request_id=request_id,
         )
 
+        is_global = target_model in (
+            MODEL_GROUP_AUTO,
+            MODEL_GROUP_NTG_AUTO,
+            "auto",
+            "ntg-auto",
+        )
+        is_cap_group = target_model in (
+            "coding",
+            "reasoning",
+            "vision",
+            "tool_calling",
+            "structured_output",
+            "streaming",
+        )
+
+        primary_provider: Optional[str] = None
+        if not is_global and not is_cap_group:
+            if target_model in self.provider_fallbacks or any(
+                d.provider == target_model or d.logical_model == target_model
+                for d in self.deployments
+            ):
+                primary_provider = target_model
+            else:
+                matched = next(
+                    (
+                        d
+                        for d in self.deployments
+                        if d.id == target_model
+                        or d.model == target_model
+                        or d.litellm_model == target_model
+                    ),
+                    None,
+                )
+                if matched is not None:
+                    primary_provider = matched.provider
+
+        same_provider_fallbacks: List[Deployment] = []
+        fallback_tiers: List[List[Deployment]] = []
         fallback_deployments: List[Deployment] = []
         user_specified_dests: Optional[List[str]] = None
+
         if caller_fallbacks:
             validated_fb = self._validate_user_fallbacks(
                 caller_fallbacks,
@@ -830,24 +1106,57 @@ class UnifiedNTGRouter:
                             fallback_deployments.append(dst_dep)
                         if dst not in user_specified_dests:
                             user_specified_dests.append(dst)
-        elif target_model in self.provider_fallbacks:
-            for fb_group in self.provider_fallbacks[target_model]:
-                fb_eligible = self._filter_eligible_deployments(
-                    model_group=fb_group,
+        elif primary_provider is not None:
+            # If caller targeted a specific deployment ID or model name under a provider,
+            # preserve same-provider account/model failover first before cross-provider fallback
+            # only when cross-provider policy or multi-account pool exists.
+            if target_model != primary_provider and primary_provider in self.provider_fallbacks:
+                same_prov_all = self._filter_eligible_deployments(
+                    model_group=primary_provider,
                     requirements=requirements,
                     now=ts,
                     claim_probe=claim_probe,
                     claimed_probes=claimed_probes,
                     request_id=request_id,
                 )
-                for fb_dep in fb_eligible:
-                    if fb_dep not in primary_eligible and fb_dep not in fallback_deployments:
-                        fallback_deployments.append(fb_dep)
+                for sp_dep in same_prov_all:
+                    if sp_dep not in primary_eligible and sp_dep not in same_provider_fallbacks:
+                        same_provider_fallbacks.append(sp_dep)
+                        fallback_deployments.append(sp_dep)
+
+            if primary_provider in self.provider_fallbacks:
+                for fb_group in self.provider_fallbacks[primary_provider]:
+                    fb_eligible = self._filter_eligible_deployments(
+                        model_group=fb_group,
+                        requirements=requirements,
+                        now=ts,
+                        claim_probe=claim_probe,
+                        claimed_probes=claimed_probes,
+                        request_id=request_id,
+                    )
+                    tier_deps: List[Deployment] = []
+                    for fb_dep in fb_eligible:
+                        if (
+                            fb_dep not in primary_eligible
+                            and fb_dep not in same_provider_fallbacks
+                            and fb_dep not in fallback_deployments
+                        ):
+                            tier_deps.append(fb_dep)
+                            fallback_deployments.append(fb_dep)
+                    if tier_deps:
+                        fallback_tiers.append(tier_deps)
 
         if not primary_eligible and not fallback_deployments:
             return None, None, []
 
-        candidates = primary_eligible if primary_eligible else fallback_deployments
+        if primary_eligible:
+            candidates = primary_eligible
+        elif same_provider_fallbacks:
+            candidates = same_provider_fallbacks
+        elif fallback_tiers:
+            candidates = fallback_tiers[0]
+        else:
+            candidates = fallback_deployments
 
         if len(candidates) == 1:
             selected_dep = candidates[0]
@@ -857,8 +1166,10 @@ class UnifiedNTGRouter:
             chosen_id = chosen.get("model_info", {}).get("id") or chosen.get("model_name")
             selected_dep = self.deployment_map.get(chosen_id, candidates[0])
 
-        if not selected_dep.is_eligible(ts):
-            still_eligible = [d for d in candidates if d.is_eligible(ts)]
+        if not selected_dep.is_eligible(ts, request_id=request_id):
+            still_eligible = [
+                d for d in candidates if d.is_eligible(ts, request_id=request_id)
+            ]
             if still_eligible:
                 selected_dep = still_eligible[0]
             else:
@@ -868,18 +1179,54 @@ class UnifiedNTGRouter:
             remaining_fallbacks = [
                 dst for dst in user_specified_dests if dst != selected_dep.id
             ]
-        else:
-            rem_primary = [d.id for d in primary_eligible if d.id != selected_dep.id]
-            rem_secondary = [
-                d.id
-                for d in fallback_deployments
-                if d not in primary_eligible and d.id != selected_dep.id
+        elif is_global or is_cap_group:
+            same_prov_deps = [
+                d for d in primary_eligible if d.provider == selected_dep.provider
             ]
-            if len(rem_primary) > 1:
-                rem_primary = random.sample(rem_primary, len(rem_primary))
-            if len(rem_secondary) > 1:
-                rem_secondary = random.sample(rem_secondary, len(rem_secondary))
-            remaining_fallbacks = rem_primary + rem_secondary
+            ordered_same_prov = self._order_tier_deployments_account_first(
+                same_prov_deps,
+                exclude_id=selected_dep.id,
+                deprioritize_account=selected_dep.account,
+            )
+            remaining_fallbacks = [d.id for d in ordered_same_prov]
+
+            prov_order = list(self.provider_fallbacks.get(selected_dep.provider, []))
+            for d in primary_eligible:
+                if d.provider != selected_dep.provider and d.provider not in prov_order:
+                    prov_order.append(d.provider)
+
+            for prov in prov_order:
+                prov_deps = [d for d in primary_eligible if d.provider == prov]
+                if prov_deps:
+                    ordered_prov = self._order_tier_deployments_account_first(
+                        prov_deps, exclude_id=selected_dep.id
+                    )
+                    remaining_fallbacks.extend(d.id for d in ordered_prov)
+        else:
+            ordered_primary = self._order_tier_deployments_account_first(
+                primary_eligible,
+                exclude_id=selected_dep.id,
+                deprioritize_account=(
+                    selected_dep.account if selected_dep in primary_eligible else None
+                ),
+            )
+            ordered_same_prov = self._order_tier_deployments_account_first(
+                same_provider_fallbacks,
+                exclude_id=selected_dep.id,
+                deprioritize_account=selected_dep.account,
+            )
+            remaining_fallbacks = [d.id for d in ordered_primary] + [
+                d.id for d in ordered_same_prov
+            ]
+            for tier in fallback_tiers:
+                ordered_tier = self._order_tier_deployments_account_first(
+                    tier,
+                    exclude_id=selected_dep.id,
+                    deprioritize_account=(
+                        selected_dep.account if selected_dep in tier else None
+                    ),
+                )
+                remaining_fallbacks.extend(d.id for d in ordered_tier)
 
         seen_fb = set()
         clean_fallbacks = []
@@ -967,7 +1314,7 @@ class UnifiedNTGRouter:
                                     if d not in claimed_probes:
                                         claimed_probes.append(d)
                             else:
-                                if not d.is_available(ts):
+                                if not d.is_available(ts, request_id=request_id):
                                     continue
 
                             if d.id not in clean_dst:
@@ -1124,6 +1471,10 @@ class UnifiedNTGRouter:
             )
             return None, None, err, reqs, now
 
+        # Ensure any deployment that transitioned OPEN -> HALF_OPEN during refresh is synced
+        # back into the shared LiteLLM model pool prior to execution.
+        self._sync_router_model_pool()
+
         call_kwargs = dict(kwargs)
         call_kwargs["num_retries"] = effective_retries
         if fallbacks:
@@ -1134,6 +1485,9 @@ class UnifiedNTGRouter:
         call_kwargs["metadata"] = meta
 
         active_req = self._register_active_request(request_id, selected_dep)
+        if fallbacks:
+            active_req.fallback_list = fallbacks
+            active_req.fallback_targets = list(fallbacks[0].get(selected_dep.id, []))
         self._request_context.active_request_id = request_id
 
         try:
@@ -1144,6 +1498,13 @@ class UnifiedNTGRouter:
             )
 
             deployment = self._get_response_deployment(response, eligible)
+            if deployment is None and active_req.fulfilling_dep is not None:
+                deployment = active_req.fulfilling_dep
+                if response is not None:
+                    try:
+                        setattr(response, "_ntg_deployment", deployment)
+                    except Exception:
+                        pass
             self._record_user_request_metric(active_req, deployment, selected_dep)
 
             return response, deployment, None, reqs, now

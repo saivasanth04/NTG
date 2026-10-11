@@ -275,98 +275,52 @@ def parse_provider_error(error: Exception, provider: str = "") -> ParsedErrorInf
     if cooldown is None and reset_raw is not None:
         reset_ts, cooldown = parse_reset_header(reset_raw)
 
-    # 1. Status 400 Bad Request
-    if status_code == 400 or "bad_request" in err_lower or "invalid_argument" in err_lower:
-        return ParsedErrorInfo(
-            category=CATEGORY_REQUEST_ERROR,
-            status_code=400,
-            is_retryable=False,
-            should_quarantine=False,
-            cooldown_seconds=0.0,
-            reset_timestamp=None,
-            limit_type="bad_request",
-            quota_scope=QuotaScope.UNKNOWN,
-            provider_name=provider_name,
-            message=msg,
-            raw_payload=payload,
+    has_quota_or_rate_kw = any(
+        kw in err_lower
+        for kw in (
+            "rate limit",
+            "ratelimit",
+            "rate_limit",
+            "quota",
+            "insufficient_quota",
+            "too many requests",
+            "resource_exhausted",
+            "free tier limit",
+            "tokens per min",
+            "requests per min",
+            "requests per day",
         )
+    )
 
-    # 2. Status 404 Not Found (Distinguish Model Not Found vs General 404)
-    if status_code == 404 or "not found" in err_lower or "model_not_found" in err_lower:
-        is_model_specific = (
-            (
-                "model" in err_lower
-                and any(
-                    kw in err_lower
-                    for kw in (
-                        "not found",
-                        "does not exist",
-                        "not exist",
-                        "access",
-                        "unknown",
-                        "unavailable",
-                        "recognized",
-                        "invalid",
-                        "could not find",
-                        "no such",
-                    )
-                )
-            )
-            or any(
-                pattern in err_lower
-                for pattern in (
-                    "model not found",
-                    "model_not_found",
-                    "models/",
-                )
-            )
-            or (isinstance(err_data, dict) and err_data.get("code") == "model_not_found")
-        )
-
-        if is_model_specific:
-            return ParsedErrorInfo(
-                category=CATEGORY_NOT_FOUND,
-                status_code=404,
-                is_retryable=False,
-                should_quarantine=True,
-                cooldown_seconds=86400.0,
-                reset_timestamp=None,
-                limit_type="not_found",
-                quota_scope=QuotaScope.MODEL,
-                provider_name=provider_name,
-                message=msg,
-                raw_payload=payload,
-            )
-        else:
-            return ParsedErrorInfo(
-                category=CATEGORY_REQUEST_ERROR,
-                status_code=404,
-                is_retryable=False,
-                should_quarantine=False,
-                cooldown_seconds=0.0,
-                reset_timestamp=None,
-                limit_type="not_found",
-                quota_scope=QuotaScope.UNKNOWN,
-                provider_name=provider_name,
-                message=msg,
-                raw_payload=payload,
-            )
-
-    # 3. Status 401/403 Authentication / Permission Error
+    # 1. Status 401/403 Authentication / Permission Error (including HTTP 400 API_KEY_INVALID)
     if (
-        status_code in (401, 403)
-        or "401" in err_lower
-        or "403" in err_lower
-        or "unauthorized" in err_lower
-        or "invalid api key" in err_lower
-        or "api_key_invalid" in err_lower
-        or "permission_denied" in err_lower
-        or "authentication" in err_lower
+        status_code == 401
+        or (status_code == 403 and not has_quota_or_rate_kw)
+        or any(
+            kw in err_lower
+            for kw in (
+                "unauthorized",
+                "unauthenticated",
+                "invalid api key",
+                "invalid_api_key",
+                "api_key_invalid",
+                "api key not valid",
+                "api key expired",
+                "permission_denied",
+                "authentication",
+                "invalid token",
+                "incorrect api key",
+            )
+        )
+        or (
+            not status_code
+            and ("401" in err_lower or ("403" in err_lower and not has_quota_or_rate_kw))
+        )
     ):
         safe_msg = sanitize_secret(msg)
         return ParsedErrorInfo(
             category=CATEGORY_AUTH_ERROR,
-            status_code=status_code or 401,
+            status_code=status_code if status_code in (401, 403) else 401,
             is_retryable=False,
             should_quarantine=True,
             cooldown_seconds=0.0,
@@ -379,15 +333,12 @@ def parse_provider_error(error: Exception, provider: str = "") -> ParsedErrorInf
             reset_source="auth_quarantine",
         )
 
-    # 4. Status 429 Rate Limit / Quota Exhaustion
+    # 2. Status 429 / 402 Rate Limit / Quota Exhaustion
     is_429 = (
-        status_code == 429
+        status_code in (429, 402)
         or "429" in err_lower
-        or "rate limit" in err_lower
-        or "ratelimit" in err_lower
-        or "quota" in err_lower
-        or "too many requests" in err_lower
-        or "resource_exhausted" in err_lower
+        or has_quota_or_rate_kw
+        or (status_code == 403 and "credits" in err_lower)
     )
 
     if is_429:
@@ -483,9 +434,101 @@ def parse_provider_error(error: Exception, provider: str = "") -> ParsedErrorInf
             reset_source=reset_source,
         )
 
-    # 5. Status 500 / 502 / 503 / 504 / Timeout Upstream Server Error
+    # 3. Model Not Found / Unsupported / Decommissioned Model (404 or model-specific 400)
+    err_code = str(err_data.get("code") or "").lower() if isinstance(err_data, dict) else ""
+    is_model_specific = (
+        (
+            "model" in err_lower
+            and any(
+                kw in err_lower
+                for kw in (
+                    "not found",
+                    "does not exist",
+                    "not exist",
+                    "access",
+                    "unknown",
+                    "unavailable",
+                    "recognized",
+                    "could not find",
+                    "no such",
+                    "decommissioned",
+                    "deprecated",
+                    "not supported",
+                    "unsupported",
+                    "no endpoints",
+                )
+            )
+        )
+        or (status_code == 404 and "model" in err_lower and "invalid" in err_lower)
+        or any(
+            pattern in err_lower
+            for pattern in (
+                "model not found",
+                "model_not_found",
+                "model_decommissioned",
+                "no endpoints found",
+                "unsupported model",
+                "models/",
+            )
+        )
+        or err_code in ("model_not_found", "model_decommissioned", "model_not_supported")
+    )
+
+    if is_model_specific:
+        return ParsedErrorInfo(
+            category=CATEGORY_NOT_FOUND,
+            status_code=404,
+            is_retryable=False,
+            should_quarantine=True,
+            cooldown_seconds=86400.0,
+            reset_timestamp=None,
+            limit_type="not_found",
+            quota_scope=QuotaScope.MODEL,
+            provider_name=provider_name,
+            message=msg,
+            raw_payload=payload,
+        )
+
+    if status_code == 404 or "not found" in err_lower:
+        return ParsedErrorInfo(
+            category=CATEGORY_REQUEST_ERROR,
+            status_code=404,
+            is_retryable=False,
+            should_quarantine=False,
+            cooldown_seconds=0.0,
+            reset_timestamp=None,
+            limit_type="not_found",
+            quota_scope=QuotaScope.UNKNOWN,
+            provider_name=provider_name,
+            message=msg,
+            raw_payload=payload,
+        )
+
+    # 4. Status 400 / 422 Permanent Invalid Request
     if (
-        status_code in (500, 502, 503, 504)
+        status_code in (400, 422)
+        or "bad_request" in err_lower
+        or "badrequest" in err_lower
+        or "invalid_argument" in err_lower
+        or "invalid_request" in err_lower
+    ):
+        return ParsedErrorInfo(
+            category=CATEGORY_REQUEST_ERROR,
+            status_code=400,
+            is_retryable=False,
+            should_quarantine=False,
+            cooldown_seconds=0.0,
+            reset_timestamp=None,
+            limit_type="bad_request",
+            quota_scope=QuotaScope.UNKNOWN,
+            provider_name=provider_name,
+            message=msg,
+            raw_payload=payload,
+        )
+
+    # 5. Status 500 / 502 / 503 / 504 / 408 / Timeout Upstream Server Error
+    if (
+        status_code in (408, 500, 502, 503, 504, 520, 521, 522, 523, 524)
         or "500" in err_lower
         or "502" in err_lower
         or "503" in err_lower
@@ -495,6 +538,8 @@ def parse_provider_error(error: Exception, provider: str = "") -> ParsedErrorInf
         or "connection error" in err_lower
         or "service unavailable" in err_lower
         or "internal server error" in err_lower
+        or "bad gateway" in err_lower
+        or "overloaded" in err_lower
     ):
         return ParsedErrorInfo(
             category=CATEGORY_SERVER_ERROR,

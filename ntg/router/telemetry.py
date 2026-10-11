@@ -35,10 +35,15 @@ class ActiveRequest:
     request_id: str
     router_id: str
     selected_dep: Optional[Deployment] = None
+    fulfilling_dep: Optional[Deployment] = None
     attempted_deployments: List[Deployment] = field(default_factory=list)
     recorded_attempt_ids: Set[str] = field(default_factory=set)
+    completed_attempt_ids: Set[str] = field(default_factory=set)
+    fallback_list: Optional[List[Any]] = None
+    fallback_targets: List[str] = field(default_factory=list)
     active_dispatch_id: Optional[str] = None
     dispatch_counter: int = 0
+    callback_events_count: int = 0
     dispatched_at: float = 0.0
     user_request_recorded: bool = False
     lock: threading.Lock = field(default_factory=threading.Lock)
@@ -223,6 +228,13 @@ class NTGTelemetryLogger(CustomLogger):
                         active_req.dispatch_counter += 1
                         attempt_id = f"{active_req.request_id}_dispatch_{active_req.dispatch_counter}"
 
+                    if attempt_id in active_req.completed_attempt_ids:
+                        return
+                    active_req.completed_attempt_ids.add(attempt_id)
+                    active_req.callback_events_count += 1
+                    if deployment:
+                        active_req.fulfilling_dep = deployment
+
                     if attempt_id not in active_req.recorded_attempt_ids:
                         active_req.recorded_attempt_ids.add(attempt_id)
                         if deployment:
@@ -312,6 +324,11 @@ class NTGTelemetryLogger(CustomLogger):
                     else:
                         active_req.dispatch_counter += 1
                         attempt_id = f"{active_req.request_id}_dispatch_{active_req.dispatch_counter}"
+
+                    if attempt_id in active_req.completed_attempt_ids:
+                        return
+                    active_req.completed_attempt_ids.add(attempt_id)
+                    active_req.callback_events_count += 1
 
                     if attempt_id not in active_req.recorded_attempt_ids:
                         active_req.recorded_attempt_ids.add(attempt_id)

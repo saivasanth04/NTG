@@ -637,7 +637,9 @@ class Deployment:
         """Formatted human-readable deployment label without exposing secrets."""
         return f"{self.provider.title()} {self.account} ({self.model})"
 
-    def is_eligible(self, now: Optional[float] = None) -> bool:
+    def is_eligible(
+        self, now: Optional[float] = None, request_id: Optional[str] = None
+    ) -> bool:
         """Check if deployment is eligible to receive traffic.
 
         Behavior:
@@ -657,14 +659,37 @@ class Deployment:
             return False
         if self.circuit_state == CircuitState.HALF_OPEN:
             with self._state_lock:
+                if request_id and request_id in self._active_probe_request_ids:
+                    return True
                 if len(self._active_probe_request_ids) >= self.max_half_open_probes:
                     return False
             return True
         return True
 
-    def is_available(self, now: Optional[float] = None) -> bool:
+    def is_available(
+        self, now: Optional[float] = None, request_id: Optional[str] = None
+    ) -> bool:
         """Alias for is_eligible."""
-        return self.is_eligible(now)
+        return self.is_eligible(now, request_id=request_id)
+
+    def is_pool_active(self, now: Optional[float] = None) -> bool:
+        """Check if deployment should be registered in the shared LiteLLM model pool.
+
+        Includes HEALTHY and HALF_OPEN deployments (even while a probe slot is claimed),
+        while excluding OPEN, QUARANTINED, AUTH_FAILED, or quota-cooled deployments.
+        """
+        if not self.api_key or not self.api_key.strip():
+            return False
+        if self.circuit_state in (
+            CircuitState.OPEN,
+            CircuitState.QUARANTINED,
+            CircuitState.AUTH_FAILED,
+        ):
+            return False
+        current_time = now if now is not None else time.time()
+        if self.quota.reset_at and current_time < self.quota.reset_at:
+            return False
+        return True
 
     def claim_half_open_probe(self, request_id: Optional[str] = None) -> bool:
         """Atomically claim a controlled probe slot in HALF_OPEN state.
@@ -722,6 +747,8 @@ class Deployment:
         with self._state_lock:
             self.consecutive_failures = 0
             self.circuit_open_until = 0.0
+            self.quota.reset_at = None
+            self.quota.retry_after = None
             if request_id:
                 self._active_probe_request_ids.discard(request_id)
             else:
@@ -874,7 +901,7 @@ class Deployment:
             self.quota.reset_at,
             self.quota.rpm_remaining,
             self.quota.rpd_remaining,
-            self.available,
+            self.is_pool_active(),
             self.is_stale,
             tuple(sorted(self.capabilities.to_tags())),
             self.capabilities.context_window,

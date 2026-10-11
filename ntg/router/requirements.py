@@ -119,10 +119,17 @@ def extract_request_requirements(
     response_format = kwargs.get("response_format")
     schema = kwargs.get("schema")
     fmt = kwargs.get("format")
-    if (
+    has_structured_response_format = bool(
         response_format is not None
+        and not (
+            (isinstance(response_format, dict) and response_format.get("type") == "text")
+            or response_format == "text"
+        )
+    )
+    if (
+        has_structured_response_format
         or schema is not None
-        or fmt == "json"
+        or fmt in ("json", "json_object", "json_schema")
         or kwargs.get("json_schema") is not None
         or kwargs.get("guided_json") is not None
     ):
@@ -184,10 +191,30 @@ def extract_request_requirements(
         if "```" in text_to_check or "def " in text_to_check or "class " in text_to_check:
             coding_preferred = True
 
-    # 7. Context window requirement
-    if min_context and min_context > 0:
-        req_caps.context_window = min_context
-        strict_reqs.add("context_window")
+    # 7. Context window requirement (explicit min_context and estimated prompt + completion tokens)
+    total_chars = 0
+    if messages and isinstance(messages, list):
+        for m in messages:
+            if isinstance(m, dict):
+                c = m.get("content")
+                if isinstance(c, str):
+                    total_chars += len(c)
+                elif isinstance(c, list):
+                    for part in c:
+                        if isinstance(part, dict) and isinstance(part.get("text"), str):
+                            total_chars += len(part["text"])
+    elif prompt and isinstance(prompt, str):
+        total_chars = len(prompt)
+
+    req_max_tokens = kwargs.get("max_tokens") or kwargs.get("max_completion_tokens") or 0
+    extra_tokens = int(req_max_tokens) if isinstance(req_max_tokens, int) and req_max_tokens > 0 else 0
+    estimated_tokens = (total_chars // 4) + extra_tokens
+
+    effective_min_context = max(min_context or 0, estimated_tokens)
+    if effective_min_context > 0:
+        req_caps.context_window = effective_min_context
+        if (min_context and min_context > 0) or effective_min_context > 4096:
+            strict_reqs.add("context_window")
 
     # 8. Explicit capabilities argument
     if capabilities is not None:

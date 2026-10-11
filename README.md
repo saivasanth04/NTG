@@ -117,7 +117,7 @@ REQUEST REQUIREMENTS (`extract_request_requirements`: tools, structured_output, 
     ↓
 NTG ELIGIBILITY FILTER (`_filter_eligible_deployments`: capabilities + quota + auth quarantine + circuit state + HALF_OPEN probe claim)
     ↓
-ELIGIBLE DEPLOYMENT POOL & FALLBACKS (`simple_shuffle` initial selection + randomized remaining pool fallbacks)
+ELIGIBLE DEPLOYMENT POOL & FALLBACKS (`simple_shuffle` initial selection + account-first & cross-provider fallback chain)
     ↓
 LITELLM ROUTER (persistent Router instance, bounded retry budget [default=1, max=2], automatic failover)
     ↓

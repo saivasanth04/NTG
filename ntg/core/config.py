@@ -69,9 +69,39 @@ CIRCUIT_BREAKER_MAX_FAILURES: int = int(os.getenv("NTG_CIRCUIT_BREAKER_MAX_FAILU
 CIRCUIT_BREAKER_RECOVERY_TIME: float = float(os.getenv("NTG_CIRCUIT_BREAKER_RECOVERY_TIME", "30.0"))
 CIRCUIT_BREAKER_HALF_OPEN_PROBES: int = 1
 
-# Explicit cross-provider fallback mappings (empty by default so provider-specific
-# requests never jump to unrelated providers unless explicitly configured)
-PROVIDER_FALLBACKS: Dict[str, List[str]] = {}
+# Automatic cross-provider fallback mappings across all configured providers
+PROVIDER_FALLBACKS: Dict[str, List[str]] = {
+    MODEL_GROUP_OPENROUTER: [
+        MODEL_GROUP_GROQ,
+        MODEL_GROUP_GEMINI,
+        MODEL_GROUP_NVIDIA,
+        MODEL_GROUP_COHERE,
+    ],
+    MODEL_GROUP_GROQ: [
+        MODEL_GROUP_GEMINI,
+        MODEL_GROUP_OPENROUTER,
+        MODEL_GROUP_NVIDIA,
+        MODEL_GROUP_COHERE,
+    ],
+    MODEL_GROUP_GEMINI: [
+        MODEL_GROUP_GROQ,
+        MODEL_GROUP_OPENROUTER,
+        MODEL_GROUP_NVIDIA,
+        MODEL_GROUP_COHERE,
+    ],
+    MODEL_GROUP_NVIDIA: [
+        MODEL_GROUP_GROQ,
+        MODEL_GROUP_GEMINI,
+        MODEL_GROUP_OPENROUTER,
+        MODEL_GROUP_COHERE,
+    ],
+    MODEL_GROUP_COHERE: [
+        MODEL_GROUP_GROQ,
+        MODEL_GROUP_GEMINI,
+        MODEL_GROUP_OPENROUTER,
+        MODEL_GROUP_NVIDIA,
+    ],
+}
 
 # OpenRouter configuration
 OPENROUTER_ACTUAL_MODEL: str = "nvidia/nemotron-3-ultra-550b-a55b:free"
