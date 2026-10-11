@@ -90,6 +90,7 @@ from ntg.agent import (
     run_verification_command,
     validate_query_answer,
     verify_python_syntax,
+    verify_retrieval_context,
 )
 from ntg.cli import (
     print_account_status,
@@ -120,6 +121,7 @@ __all__ = [
     "UnifiedNTGRouter",
     "OpenRouterFallbackRouter",
     "CodeIntelligence",
+    "verify_retrieval_context",
     "build_planning_prompt",
     "build_query_prompt",
     "validate_query_answer",

@@ -113,11 +113,14 @@ def extract_response_content(planning_response: Any) -> str:
     )
 
 
-def _evaluate_source_verification(context: dict[str, Any] | None) -> dict[str, Any]:
-    """Evaluate per-source verification and fingerprint state without assuming unverified sources are healthy."""
+def _evaluate_source_verification(
+    context: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Evaluate index freshness and inventory coverage without treating generation as verification."""
     if not isinstance(context, dict):
         return {
             "inventory_verified": False,
+            "inventory_status": "unverified",
             "graphify_verified": False,
             "graphify_fresh": False,
             "graphify_fingerprint_verified": False,
@@ -137,36 +140,56 @@ def _evaluate_source_verification(context: dict[str, Any] | None) -> dict[str, A
         else {}
     )
     mem_st = (
-        index_dict.get("memory") if isinstance(index_dict.get("memory"), dict) else {}
+        index_dict.get("memory")
+        if isinstance(index_dict.get("memory"), dict)
+        else {}
     )
     coverage = (
-        context.get("coverage") if isinstance(context.get("coverage"), dict) else {}
+        context.get("coverage")
+        if isinstance(context.get("coverage"), dict)
+        else {}
     )
+    inventory = context.get("repository_inventory")
     raw_errors = context.get("errors")
     errors = [str(e) for e in raw_errors] if isinstance(raw_errors, list) else []
 
-    inventory_verified = bool(
-        coverage.get("complete_inventory_available")
-        and isinstance(context.get("repository_inventory"), dict)
+    inventory_status = str(
+        coverage.get("inventory_status") or "unverified"
     )
+    inventory_verified = bool(
+        isinstance(inventory, dict)
+        and inventory_status == "verified"
+        and coverage.get("inventory_missing_files_count", 1) == 0
+        and coverage.get("inventory_unreadable_files_count", 1) == 0
+    )
+
     graphify_fp = bool(graph_st.get("fingerprint_verified"))
     graphify_ast = bool(graph_st.get("ast_symbols_verified"))
-    graphify_verified = bool(graph_st.get("verified") and graphify_fp and graphify_ast)
-    graphify_fresh = bool(graphify_verified and graph_st.get("fresh"))
+    graphify_verified = bool(
+        graph_st.get("verified") and graphify_fp and graphify_ast
+    )
+    graphify_fresh = bool(
+        graphify_verified and graph_st.get("fresh")
+    )
 
     memory_fp = bool(mem_st.get("fingerprint_verified"))
-    memory_verified = bool(mem_st.get("verified") and memory_fp)
-    memory_fresh = bool(memory_verified and mem_st.get("fresh"))
+    memory_verified = bool(
+        mem_st.get("verified") and memory_fp
+    )
+    memory_fresh = bool(
+        memory_verified and mem_st.get("fresh")
+    )
 
     all_verified = bool(
         inventory_verified
         and graphify_fresh
         and memory_fresh
-        and len(errors) == 0
+        and not errors
     )
 
     return {
         "inventory_verified": inventory_verified,
+        "inventory_status": inventory_status,
         "graphify_verified": graphify_verified,
         "graphify_fresh": graphify_fresh,
         "graphify_fingerprint_verified": graphify_fp,
@@ -177,6 +200,56 @@ def _evaluate_source_verification(context: dict[str, Any] | None) -> dict[str, A
         "errors": errors,
         "all_verified": all_verified,
     }
+
+
+def verify_retrieval_context(
+    context: dict[str, Any] | None,
+    strict: bool = False,
+) -> dict[str, Any]:
+    """Verify that all codebase intelligence sources (AST inventory, Graphify graph,
+    and Codebase Memory MCP) are fresh, fingerprint-verified, and retrieved without error.
+    When `strict=True`, raises `RuntimeError` if any source is unverified, stale, or failed retrieval.
+    """
+    ver = _evaluate_source_verification(context)
+    if strict and not ver["all_verified"]:
+        reasons: list[str] = list(ver["errors"])
+        if not ver["inventory_verified"]:
+            reasons.append("repository AST inventory is missing or unverified")
+        if not ver["graphify_fresh"]:
+            reasons.append("Graphify index is unverified or stale")
+        if not ver.get("graphify_data_present", True):
+            reasons.append("Graphify query context was not retrieved")
+        if not ver["memory_fresh"]:
+            reasons.append("Codebase Memory MCP index is unverified or stale")
+        if not ver.get("memory_data_present", True):
+            reasons.append(
+                "Codebase Memory MCP architecture/symbol context was not retrieved"
+            )
+        dedup_reasons = list(dict.fromkeys(r for r in reasons if r))
+        raise RuntimeError(
+            "Strict retrieval verification failed — refusing to invoke model with incomplete context: "
+            + ("; ".join(dedup_reasons) or "unverified knowledge sources")
+        )
+    return ver
+
+
+def _is_full_retrieval_context(context: dict[str, Any] | None) -> bool:
+    """Return True when `context` is a retrieval context dictionary from `gather_context()`
+    (containing verification/index/coverage/error fields) rather than a minimal synthetic snippet.
+    """
+    if not isinstance(context, dict):
+        return False
+    return any(
+        k in context
+        for k in (
+            "index_status",
+            "coverage",
+            "errors",
+            "retrieval_verified",
+            "retrieval_complete",
+            "repository_inventory",
+        )
+    )
 
 
 def _append_context_sections(
@@ -338,12 +411,16 @@ def _append_context_sections(
 def build_planning_prompt(
     request: str,
     context: dict[str, Any] | None = None,
+    strict: bool = True,
 ) -> str:
     """Construct an architecture-aware planning prompt combining the user request
     with deterministic repository inventory, Graphify, and Codebase Memory MCP context.
+    When `strict=True` (default), refuses to build a prompt if retrieval context verification failed.
     """
     if not isinstance(request, str) or not request.strip():
         raise ValueError("request must be a non-empty string.")
+    if _is_full_retrieval_context(context):
+        verify_retrieval_context(context, strict=strict)
 
     sections: list[str] = [
         "You are an architecture-aware AI coding agent for this repository.",
@@ -437,9 +514,45 @@ _PYTHON_BUILTIN_IDENTIFIERS: frozenset[str] = frozenset(
 
 
 def _is_repo_wide_query(query: str) -> bool:
-    """Return True if the query asks for a project-wide explanation, file inventory, or reading order."""
-    q_lower = (query or "").lower()
+    """Detect clear repository-wide intent using normalized phrase variants.
+
+    This is a heuristic, not a semantic proof. The resolved scope should
+    remain visible in the structured query diagnostics.
+    """
+    q = re.sub(r"[^a-z0-9_./\-]+", " ", (query or "").lower())
+    q = re.sub(r"\s+", " ", q).strip()
+
     keywords = (
+        "whole repository",
+        "entire repository",
+        "entire repo",
+        "whole repo",
+        "repository wide",
+        "project wide",
+        "codebase wide",
+        "across the repository",
+        "across the repo",
+        "all files",
+        "every file",
+        "complete file inventory",
+        "full file inventory",
+        "repository inventory",
+        "project inventory",
+        "repository overview",
+        "project overview",
+        "codebase overview",
+        "understand this project",
+        "understand the project",
+        "understand this repo",
+        "understand the repo",
+        "understand this codebase",
+        "understand the codebase",
+        "explain this project",
+        "explain the project",
+        "explain this repo",
+        "explain the repo",
+        "explain this codebase",
+        "explain the codebase",
         "sequence of files",
         "seqence of files",
         "reading order",
@@ -448,22 +561,16 @@ def _is_repo_wide_query(query: str) -> bool:
         "files that i should read",
         "files to read",
         "which files to read",
-        "understand this project",
-        "understand the project",
-        "understand this repo",
-        "understand the codebase",
-        "explain this project",
-        "explain the project",
-        "explain the codebase",
-        "explain this repo",
-        "all files",
-        "every file",
-        "repository overview",
-        "project overview",
-        "architecture",
         "walkthrough",
     )
-    return any(k in q_lower for k in keywords)
+
+    return any(phrase in q for phrase in keywords) or bool(
+        re.search(
+            r"\b(all|every|each)\s+(source\s+)?files?\b",
+            q,
+        )
+        and re.search(r"\b(repo|repository|project|codebase)\b", q)
+    )
 
 
 def _is_early_tier_file(
@@ -873,6 +980,11 @@ def analyze_query_requirements(
     return {
         "scope": scope,
         "is_repo_wide": is_repo_wide,
+        "scope_detection": "heuristic",
+        "scope_note": (
+            "Scope was inferred from query wording and inventory matches; "
+            "review target_files and exclusions for ambiguous requests."
+        ),
         "target_files": target_files,
         "queried_symbols": queried_symbols,
         "unmatched_targets": unmatched_targets,
@@ -902,15 +1014,25 @@ def analyze_query_requirements(
     }
 
 
+_RETRIEVAL_REFUSAL_NOTICE = (
+    "Answer generation was refused because codebase retrieval or index verification failed. "
+    "No model answer was generated from incomplete or unverified context."
+)
+
+
 def build_query_prompt(
     query: str,
     context: dict[str, Any] | None = None,
+    strict: bool = True,
 ) -> str:
     """Construct a question-aware, architecture-grounded prompt dynamically derived
     from the verified repository inventory without hard-coded file or step assumptions.
+    When `strict=True` (default), refuses to build a prompt if retrieval context verification failed.
     """
     if not isinstance(query, str) or not query.strip():
         raise ValueError("query must be a non-empty string.")
+    if _is_full_retrieval_context(context):
+        verify_retrieval_context(context, strict=strict)
 
     req = analyze_query_requirements(query=query, context=context)
     target_files = req["target_files"]
@@ -922,6 +1044,8 @@ def build_query_prompt(
     rules: list[str] = [
         "1. Reference the exact file paths, modules, classes, functions, and internal dependencies from the Verified Repository File Inventory below.",
         "2. Never invent, guess, or hallucinate files, modules, classes, functions, or dependencies that are not present in the verified inventory.",
+        "Static-analysis limitation: AST imports, calls, and dependency order are approximations; do not claim they prove actual runtime behavior.",
+        "Scope limitation: Follow the resolved target_files, disclose excluded/unreadable files, and state scope uncertainty instead of claiming exhaustive semantic coverage.",
     ]
 
     if req["unmatched_targets"]:
@@ -1017,6 +1141,7 @@ def _strip_diagnostic_footers(answer_text: str) -> str:
         idx = text.find(marker)
         if idx != -1:
             text = text[:idx]
+    text = text.replace(_RETRIEVAL_REFUSAL_NOTICE, "").strip()
     return text.strip()
 
 
@@ -2307,14 +2432,19 @@ def validate_query_answer(
         "unmatched_targets": req["unmatched_targets"],
         "retrieval_healthy": ver["all_verified"],
         "critical_retrieval_failed": critical_retrieval_failed,
+        "retrieval_blocked": critical_retrieval_failed,
+        "model_invoked": bool(answer_body.strip()) and not critical_retrieval_failed,
         "inventory_verified": ver["inventory_verified"],
+        "inventory_status": ver["inventory_status"],
         "graphify_verified": ver["graphify_verified"],
         "graphify_fresh": ver["graphify_fresh"],
         "graphify_fingerprint_verified": ver["graphify_fingerprint_verified"],
         "graphify_ast_symbols_verified": ver["graphify_ast_symbols_verified"],
+        "graphify_data_present": ver.get("graphify_data_present", True),
         "memory_verified": ver["memory_verified"],
         "memory_fresh": ver["memory_fresh"],
         "memory_fingerprint_verified": ver["memory_fingerprint_verified"],
+        "memory_data_present": ver.get("memory_data_present", True),
         "total_repo_files": len(all_repo_paths),
         "target_files_count": len(target_files),
         "covered_files_count": len(covered_files),
@@ -2331,6 +2461,7 @@ def validate_query_answer(
         "unsatisfied_deliverables": unsatisfied_deliverables,
         "uncertainty_notes": uncertainty_notes,
         "epistemic_limitations": epistemic_limitations,
+        "semantic_validation": "static_evidence_checks_only",
         "retrieval_errors": ver["errors"],
         "warnings": warnings,
     }
@@ -2341,15 +2472,16 @@ def finalize_grounded_answer(
     query: str,
     context: dict[str, Any] | None = None,
     validation: dict[str, Any] | None = None,
-    strict: bool = False,
+    strict: bool = True,
     include_diagnostics: bool = False,
 ) -> str:
     """Validate and finalize an answer against verified inventory and dependency evidence.
-    - In strict mode (`strict=True`), raises `RuntimeError` if critical retrieval/indexing failed,
-      required evidence is missing/unverifiable, or the finalized answer is incomplete.
-    - In non-strict mode (`strict=False`), supplements missing file/symbol/dependency facts only
-      from the verified AST inventory when safe (no contradictions), and explicitly marks any
-      remaining incomplete or degraded result with a visible warning banner and diagnostics.
+    - In strict mode (`strict=True`, default), raises `RuntimeError` if critical retrieval/indexing
+      failed, required evidence is missing/unverifiable, or the finalized answer is incomplete.
+    - In non-strict mode (`strict=False`), if critical retrieval/indexing failed, refuses to present
+      any LLM answer attempt and emits only a retrieval-failure refusal notice and diagnostics;
+      otherwise supplements missing file/symbol/dependency facts only from the verified AST inventory
+      when safe (no contradictions).
     """
     val = validation or validate_query_answer(
         answer=answer, query=query, context=context
@@ -2396,17 +2528,20 @@ def finalize_grounded_answer(
         if isinstance(item, dict) and item.get("path")
     }
 
-    body_text = (answer or "").strip()
-
-    # Supplement from the verified AST inventory ONLY when the inventory is verified and no contradictory claims exist
-    can_supplement = bool(
-        body_text
-        and val["inventory_verified"]
-        and not val["hallucinated_files"]
-        and not val["unsupported_claims"]
-        and not val["ordering_violations"]
-        and not val.get("unmatched_targets")
-    )
+    if val["critical_retrieval_failed"]:
+        # Never hide a retrieval/indexing failure behind an answer attempt, even in non-strict mode
+        body_text = ""
+        can_supplement = False
+    else:
+        body_text = (answer or "").strip()
+        can_supplement = bool(
+            body_text
+            and val["inventory_verified"]
+            and not val["hallucinated_files"]
+            and not val["unsupported_claims"]
+            and not val["ordering_violations"]
+            and not val.get("unmatched_targets")
+        )
 
     if can_supplement and val["omitted_files"] and (ro_by_path or files_by_path):
         supp_lines: list[str] = [
@@ -2467,7 +2602,10 @@ def finalize_grounded_answer(
             f"This response could not be verified as complete. Reasons: {reasons}"
         )
 
-    output_blocks.append(body_text)
+    if post_val["critical_retrieval_failed"]:
+        output_blocks.append(_RETRIEVAL_REFUSAL_NOTICE)
+    elif body_text:
+        output_blocks.append(body_text)
 
     if (
         post_val["hallucinated_files"]
@@ -2560,6 +2698,7 @@ def finalize_grounded_answer(
             "---",
             "### Verification & Coverage Diagnostics",
             f"- **Completeness Status**: `{post_val['status']}` (`complete={post_val['complete']}`)",
+            f"- **Model Generation Gate**: model_invoked=`{post_val['model_invoked']}`, retrieval_blocked=`{post_val['retrieval_blocked']}`",
             f"- **Query Scope & Deliverables**: scope=`{post_val['query_scope']}`, "
             f"requested={deliv_v['requested_deliverables']}, "
             f"satisfied={deliv_v['satisfied_deliverables']}, "
@@ -2606,18 +2745,50 @@ def build_change_plan(
     request: str,
     planning_response: Any,
     context: dict[str, Any] | None = None,
+    strict: bool = True,
 ) -> dict[str, Any]:
-    """Create a reviewable plan from the model's planning response."""
+    """Create a reviewable plan from the model's planning response.
+    When `context` is a retrieval context dictionary, verifies that all knowledge sources
+    succeeded (`strict=True` raises `RuntimeError` on degraded retrieval; `strict=False`
+    marks the plan `status='degraded'` so it cannot be approved).
+    """
     if not isinstance(request, str) or not request.strip():
         raise ValueError("request must be a non-empty string.")
 
+    ver: dict[str, Any] | None = None
+    if _is_full_retrieval_context(context):
+        ver = verify_retrieval_context(context, strict=strict)
+
+    if ver is not None and not ver["all_verified"]:
+        plan_dict: dict[str, Any] = {
+            "request": request,
+            "plan": "",
+            "status": "degraded",
+            "complete": False,
+            "approved": False,
+            "model_invoked": False,
+            "retrieval_blocked": True,
+            "retrieval_verified": False,
+            "errors": list(ver["errors"]),
+            "files_changed": [],
+            "validation_results": [],
+        }
+        if context is not None:
+            plan_dict["context"] = context
+        return plan_dict
+
     content = extract_response_content(planning_response)
 
-    plan_dict: dict[str, Any] = {
+    plan_dict = {
         "request": request,
         "plan": content or "",
         "status": "awaiting_review",
+        "complete": bool(content and content.strip()),
         "approved": False,
+        "model_invoked": True,
+        "retrieval_blocked": False,
+        "retrieval_verified": True if ver is not None else None,
+        "errors": [],
         "files_changed": [],
         "validation_results": [],
     }

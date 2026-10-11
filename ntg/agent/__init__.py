@@ -20,6 +20,7 @@ from ntg.agent.planner import (
     reject_plan,
     require_approved_plan,
     validate_query_answer,
+    verify_retrieval_context,
 )
 from ntg.agent.verifier import (
     CodeVerifier,
@@ -35,6 +36,7 @@ __all__ = [
     "query_directory_structured",
     "CodeIntelligence",
     "analyze_query_requirements",
+    "verify_retrieval_context",
     "extract_response_content",
     "build_planning_prompt",
     "build_query_prompt",

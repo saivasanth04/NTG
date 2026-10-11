@@ -105,6 +105,11 @@ def run_cli(argv: Optional[List[str]] = None) -> None:
         plan_mode = True
         args = [a for a in args if a != "--plan"]
 
+    strict_mode = True
+    if "--non-strict" in args:
+        strict_mode = False
+        args = [a for a in args if a != "--non-strict"]
+
     selected_model = None
     if "--model" in args:
         idx = args.index("--model")
@@ -146,9 +151,13 @@ def run_cli(argv: Optional[List[str]] = None) -> None:
             model=selected_model,
             capabilities=selected_capability,
             auto_build_graph=True,
+            strict=strict_mode,
         )
         print("\n=== Architecture-Aware Change Plan ===")
-        print(f"Status: {plan['status']} (approved={plan['approved']})\n")
+        print(
+            f"Status: {plan['status']} (complete={plan.get('complete')}, "
+            f"approved={plan['approved']}, model_invoked={plan.get('model_invoked')})\n"
+        )
         print(plan["plan"])
         return
 
@@ -159,8 +168,16 @@ def run_cli(argv: Optional[List[str]] = None) -> None:
             model=selected_model,
             capabilities=selected_capability,
             auto_build_graph=True,
+            strict=strict_mode,
+            include_diagnostics=True,
         )
-        print(f"\n=== Directory Query Answer ({result['repo_root']}) ===\n")
+        print(f"\n=== Directory Query Answer ({result['repo_root']}) ===")
+        print(
+            f"Verification: status={result['status']}, complete={result['complete']}, "
+            f"model_invoked={result.get('model_invoked')}, "
+            f"retrieval_blocked={result.get('retrieval_blocked')}, "
+            f"errors={len(result.get('errors', []))}\n"
+        )
         print(result["answer"])
         return
 

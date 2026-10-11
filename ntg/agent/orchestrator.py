@@ -19,6 +19,7 @@ from ntg.agent.planner import (
     reject_plan,
     require_approved_plan,
     validate_query_answer,
+    verify_retrieval_context,
 )
 from ntg.agent.verifier import CodeVerifier
 from ntg.router.engine import UnifiedNTGRouter
@@ -87,7 +88,7 @@ class ArchitectureAwareAgent:
         symbol_pattern: str | None = None,
         project: str | None = None,
         auto_build: bool = False,
-        strict: bool = False,
+        strict: bool = True,
     ) -> dict[str, Any]:
         """Collect structural context from Graphify and Codebase Memory MCP."""
         effective_project = project or self.project
@@ -145,12 +146,13 @@ class ArchitectureAwareAgent:
         project: str | None = None,
         model: str | None = None,
         capabilities: list[str] | None = None,
-        auto_build_graph: bool = False,
-        strict: bool = False,
+        auto_build_graph: bool = True,
+        strict: bool = True,
     ) -> dict[str, Any]:
         """Gather codebase intelligence from Graphify and Codebase Memory MCP,
-        route an architecture-aware planning prompt through UnifiedNTGRouter,
-        and return a reviewable plan gated on human approval.
+        verify that retrieval and indexes are healthy (refusing to invoke the model
+        if retrieval failed), route an architecture-aware planning prompt through
+        UnifiedNTGRouter, and return a reviewable plan gated on human approval.
         """
         if not isinstance(request, str) or not request.strip():
             raise ValueError("request must be a non-empty string.")
@@ -160,19 +162,39 @@ class ArchitectureAwareAgent:
             symbol_pattern=symbol_pattern,
             project=project,
             auto_build=auto_build_graph,
+            strict=False,
+        )
+        ver = verify_retrieval_context(context, strict=False)
+        if not ver["all_verified"]:
+            degraded_plan = build_change_plan(
+                request=request,
+                planning_response="",
+                context=context,
+                strict=False,
+            )
+            self.last_result = degraded_plan
+            if strict:
+                verify_retrieval_context(context, strict=True)
+            return degraded_plan
+
+        prompt = build_planning_prompt(
+            request=request,
+            context=context,
             strict=strict,
         )
-        prompt = build_planning_prompt(request=request, context=context)
         response = self._invoke_router(
             prompt=prompt,
             model=model,
             capabilities=capabilities,
         )
-        return build_change_plan(
+        plan_dict = build_change_plan(
             request=request,
             planning_response=response,
             context=context,
+            strict=strict,
         )
+        self.last_result = plan_dict
+        return plan_dict
 
     def approve(self, plan: dict[str, Any]) -> dict[str, Any]:
         """Explicitly approve a pending plan for execution."""
@@ -317,35 +339,90 @@ class ArchitectureAwareAgent:
         model: str | None = None,
         capabilities: list[str] | None = None,
         auto_build_graph: bool = True,
-        strict: bool = False,
-        include_diagnostics: bool = False,
+        strict: bool = True,
+        include_diagnostics: bool = True,
+        require_indexes: bool = True,
     ) -> dict[str, Any]:
-        """Answer a natural-language query about `self.repo_root` using Graphify,
-        Codebase Memory MCP, deterministic AST inventory, and UnifiedNTGRouter.
+        """Answer a repository query with explicit retrieval and completeness policy.
 
-        Returns a structured dictionary containing:
-        - `answer`: Finalized grounded answer string (with degraded banner/diagnostics if incomplete)
-        - `raw_answer`: Raw LLM response string prior to supplementation/diagnostics
-        - `complete`: Boolean indicating whether all index, coverage, description, and ordering checks passed
-        - `status`: `"complete"` when `complete=True`, `"degraded"` when critical retrieval/indexing failed,
-          or `"incomplete"` when answer coverage/grounding/ordering checks reported warnings
-        - `validation`: Detailed validation dictionary (`description_validation`, `ordering_validation`,
-          `unsupported_claims`, `ungrounded_descriptions`, `ordering_violations`, `uncertainty_notes`, etc.)
-        - `initial_validation`: Pre-supplementation validation dictionary
-        - `index_status`: Per-index freshness and SHA-256 fingerprint verification status
-        - `coverage`: Repository file coverage and exclusion counts
-        - `errors`: List of retrieval or indexing error strings
+        Strict mode refuses LLM generation when required evidence is incomplete.
+        Best-effort mode may generate from partial context, but validation must not
+        label the result complete unless all required checks pass.
         """
         if not isinstance(query, str) or not query.strip():
             raise ValueError("query must be a non-empty string.")
 
+        # Keep retrieval errors available as structured data so policy is enforced here.
         context = self.gather_context(
             request=query,
             symbol_pattern=symbol_pattern,
             project=project,
             auto_build=auto_build_graph,
-            strict=strict,
+            strict=False,
         )
+
+        context_errors = [str(e) for e in context.get("errors", [])]
+        index_status = context.get("index_status") or {}
+        graph_st = (
+            index_status.get("graphify")
+            if isinstance(index_status.get("graphify"), dict)
+            else {}
+        )
+        memory_st = (
+            index_status.get("memory")
+            if isinstance(index_status.get("memory"), dict)
+            else {}
+        )
+
+        graph_ok = bool(
+            graph_st.get("verified")
+            and graph_st.get("fresh")
+            and graph_st.get("fingerprint_verified")
+            and graph_st.get("ast_symbols_verified")
+        )
+        memory_ok = bool(
+            memory_st.get("verified")
+            and memory_st.get("fresh")
+            and memory_st.get("fingerprint_verified")
+        )
+
+        inventory = context.get("repository_inventory")
+        coverage = (
+            context.get("coverage")
+            if isinstance(context.get("coverage"), dict)
+            else {}
+        )
+        inventory_ok = bool(
+            isinstance(inventory, dict)
+            and inventory.get("total_files", 0) > 0
+            and coverage.get("inventory_status") == "verified"
+            and coverage.get("inventory_missing_files_count", 1) == 0
+            and coverage.get("inventory_unreadable_files_count", 1) == 0
+        )
+
+        indexes_ok = (graph_ok and memory_ok) if require_indexes else True
+        prerequisites_ok = inventory_ok and indexes_ok
+
+        if strict and (not prerequisites_ok or context_errors):
+            details = list(context_errors)
+
+            if not inventory_ok:
+                details.append(
+                    "Repository inventory was not verified against the discoverable filesystem."
+                )
+            if require_indexes and not graph_ok:
+                details.append("Graphify is not verified and fresh.")
+            if require_indexes and not memory_ok:
+                details.append("Codebase Memory MCP is not verified and fresh.")
+
+            details = list(dict.fromkeys(details)) or [
+                "Required retrieval prerequisites were not satisfied."
+            ]
+            raise RuntimeError(
+                "Strict query refused before LLM generation because required "
+                "context is incomplete: " + "; ".join(details)
+            )
+
         prompt = build_query_prompt(query=query, context=context)
         response = self._invoke_router(
             prompt=prompt,
@@ -353,6 +430,7 @@ class ArchitectureAwareAgent:
             capabilities=capabilities,
         )
         raw_answer = extract_response_content(response)
+
         initial_validation = validate_query_answer(
             answer=raw_answer,
             query=query,
@@ -371,6 +449,7 @@ class ArchitectureAwareAgent:
             query=query,
             context=context,
         )
+
         if final_validation["complete"]:
             overall_status = "complete"
         elif final_validation["critical_retrieval_failed"]:
@@ -391,9 +470,18 @@ class ArchitectureAwareAgent:
             "index_status": context.get("index_status"),
             "coverage": context.get("coverage"),
             "errors": context.get("errors", []),
+            "retrieval_policy": {
+                "strict": strict,
+                "require_indexes": require_indexes,
+                "prerequisites_ok": prerequisites_ok,
+                "inventory_ok": inventory_ok,
+                "graphify_ok": graph_ok,
+                "memory_ok": memory_ok,
+            },
             "context": context,
             "response": response,
         }
+
         self.last_result = result
         return result
 
@@ -405,13 +493,11 @@ def query_directory_structured(
     model: str | None = None,
     capabilities: list[str] | None = None,
     auto_build_graph: bool = True,
-    strict: bool = False,
-    include_diagnostics: bool = False,
+    strict: bool = True,
+    include_diagnostics: bool = True,
+    require_indexes: bool = True,
 ) -> dict[str, Any]:
-    """Query any target directory and return the full structured result dictionary from
-    `ArchitectureAwareAgent.ask()`, including `answer`, `complete`, `status`, `validation`,
-    `index_status`, `coverage`, and `errors`.
-    """
+    """Return the complete structured answer and diagnostics for a repository query."""
     agent = ArchitectureAwareAgent(repo_root=directory)
     return agent.ask(
         query=query,
@@ -421,6 +507,7 @@ def query_directory_structured(
         auto_build_graph=auto_build_graph,
         strict=strict,
         include_diagnostics=include_diagnostics,
+        require_indexes=require_indexes,
     )
 
 
@@ -431,16 +518,15 @@ def query_directory(
     model: str | None = None,
     capabilities: list[str] | None = None,
     auto_build_graph: bool = True,
-    strict: bool = False,
-    include_diagnostics: bool = False,
-    return_structured: bool = False,
+    strict: bool = True,
+    include_diagnostics: bool = True,
+    return_structured: bool = True,
+    require_indexes: bool = True,
 ) -> str | dict[str, Any]:
-    """Query any target directory using NTG's CodeIntelligence and UnifiedNTGRouter.
+    """Query a repository; structured diagnostics are returned by default.
 
-    By default (`return_structured=False`), returns the finalized answer string (`str`)
-    to preserve backward compatibility for existing callers.
-    Pass `return_structured=True` (or call `query_directory_structured()`) to retrieve
-    the full structured result dictionary from `ArchitectureAwareAgent.ask()`.
+    Set return_structured=False only for legacy callers that explicitly need a string.
+    Strict mode refuses model generation if required evidence sources are unavailable.
     """
     result = query_directory_structured(
         directory=directory,
@@ -451,10 +537,10 @@ def query_directory(
         auto_build_graph=auto_build_graph,
         strict=strict,
         include_diagnostics=include_diagnostics,
+        require_indexes=require_indexes,
     )
     if return_structured:
         return result
     return result["answer"]
-
 
 CodingAgent = ArchitectureAwareAgent

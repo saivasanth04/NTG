@@ -2532,47 +2532,109 @@ class CodeIntelligence:
         return call_graph_edges, execution_flows
 
     def build_repository_inventory(self) -> dict[str, Any]:
-        """Build a complete, deterministic inventory of all relevant repository files,
-        their AST symbols, signatures, docstrings, call-graph edges, runtime execution flows,
-        internal/external dependencies, excluded files, and a dependency-aware reading order.
-        """
+        """Build AST/dependency metadata and report analyzed or excluded files."""
         py_files, other_files, excluded_dirs, excluded_files = (
             self._discover_repo_files_with_exclusions()
         )
         mod_to_rel = self._module_map_for_repo(py_files)
 
         records: list[dict[str, Any]] = []
-        for other_path in other_files:
-            records.append(self._analyze_config_or_doc_file(other_path))
-        for py_path in py_files:
-            records.append(self._analyze_python_file(py_path, mod_to_rel))
+        unreadable_files: list[dict[str, str]] = []
 
-        # Compute reverse dependency map (`imported_by`)
-        imported_by: dict[str, list[str]] = {r["path"]: [] for r in records}
-        for rec in records:
-            for dep in rec.get("internal_dependencies", []):
-                if dep in imported_by:
-                    imported_by[dep].append(rec["path"])
+        for path in other_files:
+            try:
+                records.append(self._analyze_config_or_doc_file(path))
+            except (OSError, UnicodeError, SyntaxError) as exc:
+                unreadable_files.append({
+                    "path": path.relative_to(self.repo_root).as_posix(),
+                    "reason": f"{type(exc).__name__}: {exc}",
+                })
 
-        for rec in records:
-            rec["imported_by"] = sorted(imported_by.get(rec["path"], []))
+        for path in py_files:
+            try:
+                records.append(self._analyze_python_file(path, mod_to_rel))
+            except (OSError, UnicodeError, SyntaxError) as exc:
+                unreadable_files.append({
+                    "path": path.relative_to(self.repo_root).as_posix(),
+                    "reason": f"{type(exc).__name__}: {exc}",
+                })
+
+        analyzed_paths = {
+            str(record.get("path"))
+            for record in records
+            if record.get("path")
+        }
+        discovered_paths = {
+            path.relative_to(self.repo_root).as_posix()
+            for path in [*py_files, *other_files]
+        }
+
+        missing_paths = sorted(discovered_paths - analyzed_paths)
+        already_reported = {
+            entry["path"]
+            for entry in unreadable_files
+        }
+        for path in missing_paths:
+            if path not in already_reported:
+                unreadable_files.append({
+                    "path": path,
+                    "reason": "discovered_but_not_analyzed",
+                })
+
+        imported_by: dict[str, list[str]] = {
+            record["path"]: []
+            for record in records
+        }
+        for record in records:
+            for dependency in record.get("internal_dependencies", []):
+                if dependency in imported_by:
+                    imported_by[dependency].append(record["path"])
+
+        for record in records:
+            record["imported_by"] = sorted(imported_by.get(record["path"], []))
 
         reading_order = self._compute_reading_order(records)
         call_graph_edges, execution_flows = (
-            self._compute_call_graph_and_execution_flows(records, reading_order)
+            self._compute_call_graph_and_execution_flows(
+                records,
+                reading_order,
+            )
+        )
+
+        inventory_status = (
+            "verified"
+            if records and not missing_paths and not unreadable_files
+            else "partial" if records else "unavailable"
         )
 
         return {
             "repo_root": str(self.repo_root),
+            "inventory_status": inventory_status,
             "total_files": len(records),
             "python_files_count": len(py_files),
             "config_doc_files_count": len(other_files),
+            "analyzed_files_count": len(analyzed_paths),
+            "discovered_files_count": len(discovered_paths),
+            "missing_files": missing_paths,
+            "unreadable_files": unreadable_files,
             "excluded_dirs": excluded_dirs,
             "excluded_files": excluded_files,
             "files": records,
             "reading_order": reading_order,
             "call_graph_edges": call_graph_edges,
             "execution_flows": execution_flows,
+            "analysis_scope": {
+                "included": (
+                    "Python source and configured documentation/"
+                    "configuration formats"
+                ),
+                "excluded_directories": excluded_dirs,
+                "excluded_files": excluded_files,
+                "semantic_guarantee": (
+                    "Static AST/source evidence only; runtime semantics "
+                    "are not proven."
+                ),
+            },
         }
 
     def format_inventory_for_prompt(
@@ -2847,35 +2909,39 @@ class CodeIntelligence:
         auto_build: bool = False,
         strict: bool = False,
     ) -> dict[str, Any]:
-        """Gather comprehensive codebase context from:
-        1. Deterministic AST repository inventory (all files, docstrings, symbols, signatures,
-           call-graph edges, runtime execution flows, dependencies, and reading order)
-        2. Scoped direct source-file inspection for targeted file/symbol queries
-        3. Graphify structural graph (`graphify-out/graph.json` + `GRAPH_REPORT.md`) — queried ONLY if verified fresh
-        4. Codebase Memory MCP (`get_architecture` with `aspects=["all"]` + symbol search) — queried ONLY if verified fresh
-        """
+        """Gather AST inventory and optional index context, preserving diagnostics."""
         errors: list[str] = []
-
-        # 1. Deterministic full-repository AST inventory, call graph, execution flows & reading order
         inventory = self.build_repository_inventory()
         formatted_inventory = self.format_inventory_for_prompt(inventory)
         scoped_source_excerpts = self._extract_scoped_source_excerpts(
             question, inventory
         )
 
-        # 2. Graphify verification, auto-refresh, and structural query (never query unverified index data)
         graphify_status: dict[str, Any] = {}
         graphify_ctx: str | None = None
         graphify_report_summary: str | None = None
 
         try:
-            if auto_build:
-                graphify_status = self.ensure_graphify_graph(force_rebuild=False)
-            else:
-                graphify_status = self.inspect_graphify_status()
+            graphify_status = (
+                self.ensure_graphify_graph(force_rebuild=False)
+                if auto_build
+                else self.inspect_graphify_status()
+            )
         except Exception as exc:
             errors.append(f"Graphify index verification/update error: {exc}")
-            graphify_status = self.inspect_graphify_status()
+            try:
+                graphify_status = self.inspect_graphify_status()
+            except Exception as inspect_exc:
+                graphify_status = {
+                    "repo_root": str(self.repo_root),
+                    "valid": False,
+                    "fresh": False,
+                    "verified": False,
+                    "needs_refresh": True,
+                    "reasons": [
+                        f"Follow-up status inspection failed: {inspect_exc}"
+                    ],
+                }
 
         graphify_verified_and_fresh = bool(
             graphify_status.get("valid")
@@ -2890,7 +2956,9 @@ class CodeIntelligence:
 
         if graphify_verified_and_fresh:
             try:
-                graphify_ctx = self.graphify_query(question, budget=token_budget)
+                graphify_ctx = self.graphify_query(
+                    question, budget=token_budget
+                )
             except Exception as exc:
                 errors.append(f"Graphify query error: {exc}")
 
@@ -2905,42 +2973,62 @@ class CodeIntelligence:
                         if isinstance(f, dict) and f.get("path")
                     }
                     report_py_refs = re.findall(
-                        r"(?<![A-Za-z0-9_./\\-])((?:[A-Za-z0-9_.-]+/)+[A-Za-z0-9_.-]+\.py)\b",
+                        r"(?<![A-Za-z0-9_./\\-])"
+                        r"((?:[A-Za-z0-9_.-]+/)+[A-Za-z0-9_.-]+\.py)\b",
                         report_text,
                     )
                     if not any(
-                        ref.replace("\\", "/").lstrip("./") not in valid_repo_paths
+                        ref.replace("\\", "/").lstrip("./")
+                        not in valid_repo_paths
                         for ref in report_py_refs
                     ):
                         graphify_report_summary = "\n".join(
                             report_text.splitlines()[:80]
                         )
-                except OSError:
-                    pass
+                except OSError as exc:
+                    errors.append(f"Graphify report read error: {exc}")
         else:
-            reasons_str = "; ".join(graphify_status.get("reasons", [])) or "index is stale or unverified"
+            reasons = (
+                "; ".join(graphify_status.get("reasons", []))
+                or "index is stale or unverified"
+            )
             errors.append(
-                f"Refusing to query unverified/stale Graphify index: {reasons_str}"
+                f"Refusing to query unverified/stale Graphify index: {reasons}"
             )
 
-        # 3. Codebase Memory MCP verification, project resolution, architecture & symbols (never query unverified index data)
         memory_status: dict[str, Any] = {}
         resolved_project: str | None = None
         memory_arch: Any = None
         memory_symbols: Any = None
 
         try:
-            if auto_build:
-                memory_status = self.ensure_memory_index(
+            memory_status = (
+                self.ensure_memory_index(
                     project=project, force_refresh=False
                 )
-            else:
-                memory_status = self.inspect_memory_status(project=project)
+                if auto_build
+                else self.inspect_memory_status(project=project)
+            )
             resolved_project = memory_status.get("project")
         except Exception as exc:
-            errors.append(f"Codebase Memory index verification/update error: {exc}")
-            memory_status = self.inspect_memory_status(project=project)
-            resolved_project = memory_status.get("project")
+            errors.append(
+                f"Codebase Memory index verification/update error: {exc}"
+            )
+            try:
+                memory_status = self.inspect_memory_status(project=project)
+                resolved_project = memory_status.get("project")
+            except Exception as inspect_exc:
+                memory_status = {
+                    "repo_root": str(self.repo_root),
+                    "project": None,
+                    "valid": False,
+                    "fresh": False,
+                    "verified": False,
+                    "needs_refresh": True,
+                    "reasons": [
+                        f"Follow-up status inspection failed: {inspect_exc}"
+                    ],
+                }
 
         memory_verified_and_fresh = bool(
             resolved_project
@@ -2955,48 +3043,81 @@ class CodeIntelligence:
 
         if memory_verified_and_fresh and resolved_project:
             try:
-                raw_arch = self.memory_architecture(resolved_project, aspects=["all"])
+                raw_arch = self.memory_architecture(
+                    resolved_project, aspects=["all"]
+                )
                 try:
                     memory_arch = json.loads(raw_arch)
                 except ValueError:
                     memory_arch = raw_arch
             except Exception as exc:
-                errors.append(f"Codebase Memory architecture error: {exc}")
+                errors.append(
+                    f"Codebase Memory architecture error: {exc}"
+                )
 
             effective_patterns = (
                 [symbol_pattern.strip()]
                 if isinstance(symbol_pattern, str) and symbol_pattern.strip()
                 else self._extract_candidate_symbols(question, inventory)
             )
-            pattern_str = "|".join(effective_patterns)
             try:
-                raw_syms = self.memory_query(
-                    resolved_project, pattern_str, limit=100
+                raw_symbols = self.memory_query(
+                    resolved_project,
+                    "|".join(effective_patterns),
+                    limit=100,
                 )
                 try:
-                    memory_symbols = json.loads(raw_syms)
+                    memory_symbols = json.loads(raw_symbols)
                 except ValueError:
-                    memory_symbols = raw_syms
+                    memory_symbols = raw_symbols
             except Exception as exc:
-                errors.append(f"Codebase Memory symbol query error: {exc}")
+                errors.append(
+                    f"Codebase Memory symbol query error: {exc}"
+                )
         else:
-            reasons_str = "; ".join(memory_status.get("reasons", [])) or "index is stale or unverified"
+            reasons = (
+                "; ".join(memory_status.get("reasons", []))
+                or "index is stale or unverified"
+            )
             errors.append(
-                f"Refusing to query unverified/stale Codebase Memory MCP index: {reasons_str}"
+                f"Refusing to query unverified/stale Codebase Memory MCP index: {reasons}"
             )
 
+        missing_files = list(inventory.get("missing_files") or [])
+        unreadable_files = list(inventory.get("unreadable_files") or [])
+        inventory_status = str(
+            inventory.get("inventory_status") or "unavailable"
+        )
+
         coverage = {
-            "total_repo_files": inventory["total_files"],
-            "python_files": inventory["python_files_count"],
-            "config_doc_files": inventory["config_doc_files_count"],
-            "call_graph_edges_count": len(inventory.get("call_graph_edges", [])),
-            "execution_flows_count": len(inventory.get("execution_flows", [])),
+            "total_repo_files": inventory.get("total_files", 0),
+            "discovered_files_count": inventory.get(
+                "discovered_files_count", 0
+            ),
+            "analyzed_files_count": inventory.get(
+                "analyzed_files_count", 0
+            ),
+            "python_files": inventory.get("python_files_count", 0),
+            "config_doc_files": inventory.get("config_doc_files_count", 0),
+            "call_graph_edges_count": len(
+                inventory.get("call_graph_edges", [])
+            ),
+            "execution_flows_count": len(
+                inventory.get("execution_flows", [])
+            ),
             "scoped_source_excerpts_count": len(scoped_source_excerpts),
             "excluded_dirs_count": len(inventory.get("excluded_dirs", [])),
             "excluded_files_count": len(inventory.get("excluded_files", [])),
             "excluded_dirs": inventory.get("excluded_dirs", []),
             "excluded_files": inventory.get("excluded_files", []),
-            "graphify_indexed_files": len(graphify_status.get("indexed_files", [])),
+            "inventory_status": inventory_status,
+            "inventory_missing_files": missing_files,
+            "inventory_missing_files_count": len(missing_files),
+            "inventory_unreadable_files": unreadable_files,
+            "inventory_unreadable_files_count": len(unreadable_files),
+            "graphify_indexed_files": len(
+                graphify_status.get("indexed_files", [])
+            ),
             "graphify_missing_files": graphify_status.get("missing_files", []),
             "graphify_deleted_files": graphify_status.get("deleted_files", []),
             "graphify_stale_files": graphify_status.get("stale_files", []),
@@ -3006,28 +3127,42 @@ class CodeIntelligence:
             "graphify_ast_symbols_verified": bool(
                 graphify_status.get("ast_symbols_verified")
             ),
-            "memory_indexed_files": len(memory_status.get("indexed_files", [])),
+            "memory_indexed_files": len(
+                memory_status.get("indexed_files", [])
+            ),
             "memory_missing_files": memory_status.get("missing_files", []),
             "memory_deleted_files": memory_status.get("deleted_files", []),
             "memory_stale_files": memory_status.get("stale_files", []),
             "memory_fingerprint_verified": bool(
                 memory_status.get("fingerprint_verified")
             ),
-            "complete_inventory_available": inventory["total_files"] > 0,
+            "complete_inventory_available": (
+                inventory_status == "verified"
+            ),
+            "semantic_validation": "static_ast_and_source_evidence_only",
         }
 
         if strict and (
             errors
+            or inventory_status != "verified"
             or not graphify_verified_and_fresh
             or not memory_verified_and_fresh
         ):
+            reasons = list(errors)
+            if inventory_status != "verified":
+                reasons.append(
+                    f"Repository inventory status is '{inventory_status}'; "
+                    f"missing={len(missing_files)}, "
+                    f"unreadable={len(unreadable_files)}"
+                )
+            if not reasons:
+                reasons.append(
+                    f"graphify_fresh={graphify_status.get('fresh')}, "
+                    f"memory_fresh={memory_status.get('fresh')}"
+                )
             raise RuntimeError(
                 "Strict context verification failed: "
-                + (
-                    "; ".join(errors)
-                    if errors
-                    else f"graphify_fresh={graphify_status.get('fresh')}, memory_fresh={memory_status.get('fresh')}"
-                )
+                + "; ".join(dict.fromkeys(reasons))
             )
 
         return {
@@ -3036,7 +3171,7 @@ class CodeIntelligence:
             "project": resolved_project,
             "repository_inventory": inventory,
             "formatted_inventory": formatted_inventory,
-            "reading_order": inventory["reading_order"],
+            "reading_order": inventory.get("reading_order", []),
             "execution_flows": inventory.get("execution_flows", []),
             "call_graph_edges": inventory.get("call_graph_edges", []),
             "scoped_source_excerpts": scoped_source_excerpts,
@@ -3052,6 +3187,18 @@ class CodeIntelligence:
             },
             "coverage": coverage,
             "errors": errors,
+            "context_status": (
+                "verified"
+                if inventory_status == "verified"
+                and graphify_verified_and_fresh
+                and memory_verified_and_fresh
+                and not errors
+                else "degraded"
+            ),
+            "semantic_validation": (
+                "Static AST/source evidence; dynamic runtime behavior "
+                "and unrestricted natural-language correctness are not proven."
+            ),
         }
 
     def refresh_knowledge(self, project: str | None = None) -> dict[str, Any]:
