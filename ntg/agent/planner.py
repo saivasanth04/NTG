@@ -1,69 +1,38 @@
 """Architecture-aware change planner, deterministic evidence validator, and human-in-the-loop approval lifecycle."""
 
 from __future__ import annotations
-
+import re
 import json
 from pathlib import Path
 import re
 from typing import Any
+import builtins
+import keyword
 
+from spacy.lang.en.stop_words import STOP_WORDS
 
 _STOP_WORDS: frozenset[str] = frozenset(
-    {
-        "this",
-        "that",
-        "with",
-        "from",
-        "into",
-        "file",
-        "files",
-        "module",
-        "modules",
-        "read",
-        "reading",
-        "should",
-        "understand",
-        "project",
-        "codebase",
-        "used",
-        "uses",
-        "using",
-        "provides",
-        "provide",
-        "defines",
-        "define",
-        "contains",
-        "contain",
-        "step",
-        "layer",
-        "order",
-        "after",
-        "before",
-        "when",
-        "where",
-        "which",
-        "their",
-        "there",
-        "these",
-        "those",
-        "also",
-        "only",
-        "each",
-        "both",
-        "such",
-        "than",
-        "then",
-        "them",
-        "they",
-        "have",
-        "has",
-        "been",
-        "were",
-        "will",
-        "would",
-        "could",
-    }
-)
+    word.lower() for word in STOP_WORDS
+) | frozenset({
+    "file",
+    "files",
+    "module",
+    "modules",
+    "read",
+    "reading",
+    "understand",
+    "project",
+    "codebase",
+    "provides",
+    "provide",
+    "defines",
+    "define",
+    "contains",
+    "contain",
+    "step",
+    "layer",
+    "order",
+})
 
 
 def extract_response_content(planning_response: Any) -> str:
@@ -461,137 +430,83 @@ def build_planning_prompt(
     return "\n\n".join(sections)
 
 
-_GENERIC_SNAKE_TERMS: frozenset[str] = frozenset(
-    {
-        "reading_order",
-        "file_path",
-        "file_paths",
-        "code_base",
-        "source_code",
-        "entry_point",
-        "entry_points",
-        "api_key",
-        "api_keys",
-        "rate_limit",
-        "rate_limits",
-        "circuit_breaker",
-        "circuit_breakers",
-        "step_by_step",
-        "end_to_end",
-        "high_level",
-        "top_level",
-        "command_line",
-        "open_router",
-        "error_handling",
-        "data_flow",
-        "call_graph",
+_GENERIC_SNAKE_TERMS: frozenset[str] = frozenset({
+    "_".join(re.findall(r"[a-z0-9]+", term.lower()))
+    for term in {
+        "reading order",
+        "file path",
+        "file paths",
+        "code base",
+        "source code",
+        "entry point",
+        "entry points",
+        "step by step",
+        "end to end",
+        "high level",
+        "top level",
+        "command line",
+        "error handling",
+        "data flow",
     }
-)
+})
 
 _PYTHON_BUILTIN_IDENTIFIERS: frozenset[str] = frozenset(
-    {
-        "True",
-        "False",
-        "None",
-        "Any",
-        "Optional",
-        "Union",
-        "Callable",
-        "Iterable",
-        "Iterator",
-        "Sequence",
-        "Mapping",
-        "Path",
-        "dict",
-        "list",
-        "set",
-        "frozenset",
-        "tuple",
-        "str",
-        "int",
-        "float",
-        "bool",
-        "bytes",
-        "object",
-        "type",
-        "Exception",
-        "RuntimeError",
-        "ValueError",
-        "TypeError",
-        "KeyError",
-        "OSError",
-        "PermissionError",
-        "FileNotFoundError",
-        "SyntaxError",
-        "dataclass",
-        "Enum",
-        "main",
-        "self",
-        "cls",
-        "args",
-        "kwargs",
-    }
+    set(dir(builtins))
+    | set(keyword.kwlist)
 )
 
 
 def _is_repo_wide_query(query: str) -> bool:
-    """Detect clear repository-wide intent using normalized phrase variants.
+    """Infer repository-wide intent from combinations of linguistic signals."""
+    tokens = set(re.findall(r"[a-z0-9]+", (query or "").lower()))
 
-    This is a heuristic, not a semantic proof. The resolved scope should
-    remain visible in the structured query diagnostics.
-    """
-    q = re.sub(r"[^a-z0-9_./\-]+", " ", (query or "").lower())
-    q = re.sub(r"\s+", " ", q).strip()
+    repository_terms = {
+        "repo", "repository", "project", "codebase",
+    }
+    breadth_terms = {
+        "all", "every", "entire", "whole", "complete", "full",
+        "across", "throughout", "overall",
+    }
+    overview_actions = {
+        "understand", "explain", "overview", "summarize",
+        "summary", "map", "document", "walkthrough",
+        "explore", "review", "analyze", "describe", "learn",
+    }
+    inventory_terms = {
+        "file", "files", "module", "modules", "architecture",
+        "structure", "components", "inventory",
+    }
+    reading_terms = {
+        "read", "reading", "order", "sequence",
+    }
 
-    keywords = (
-        "whole repository",
-        "entire repository",
-        "entire repo",
-        "whole repo",
-        "repository wide",
-        "project wide",
-        "codebase wide",
-        "across the repository",
-        "across the repo",
-        "all files",
-        "every file",
-        "complete file inventory",
-        "full file inventory",
-        "repository inventory",
-        "project inventory",
-        "repository overview",
-        "project overview",
-        "codebase overview",
-        "understand this project",
-        "understand the project",
-        "understand this repo",
-        "understand the repo",
-        "understand this codebase",
-        "understand the codebase",
-        "explain this project",
-        "explain the project",
-        "explain this repo",
-        "explain the repo",
-        "explain this codebase",
-        "explain the codebase",
-        "sequence of files",
-        "seqence of files",
-        "reading order",
-        "order of files",
-        "order to read",
-        "files that i should read",
-        "files to read",
-        "which files to read",
-        "walkthrough",
-    )
+    has_repository_scope = bool(tokens & repository_terms)
+    has_breadth = bool(tokens & breadth_terms)
+    has_overview_intent = bool(tokens & overview_actions)
+    has_inventory_intent = bool(tokens & inventory_terms)
+    has_reading_intent = bool(tokens & reading_terms)
 
-    return any(phrase in q for phrase in keywords) or bool(
-        re.search(
-            r"\b(all|every|each)\s+(source\s+)?files?\b",
-            q,
-        )
-        and re.search(r"\b(repo|repository|project|codebase)\b", q)
-    )
+    # Explicitly broad requests, such as "all files across the repository".
+    if has_repository_scope and has_breadth:
+        return True
+
+    # General project understanding or inventory requests.
+    if (
+        has_repository_scope
+        and has_overview_intent
+        and (has_inventory_intent or len(tokens) <= 5)
+    ):
+        return True
+
+    # Requests for a repository-wide reading order.
+    if (
+        has_repository_scope
+        and has_reading_intent
+        and has_inventory_intent
+    ):
+        return True
+
+    return False
 
 
 def _is_early_tier_file(
