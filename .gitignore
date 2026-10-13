@@ -3,3 +3,4 @@ Provider_Free_API_allowance.txt
 __pycache__/
 *.pyc
 .venv/
+.ntg-routing.json*

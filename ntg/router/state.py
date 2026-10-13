@@ -23,7 +23,7 @@ def duration(value):
         return sum(float(n) * {"ms": .001, "s": 1, "m": 60, "h": 3600, "d": 86400}[u]
                    for n, u in parts) if parts else None
 
-def classify(error):
+def classify(error, provider=None):
     response = getattr(error, "response", None)
     headers = {k.lower(): v for k, v in dict(getattr(response, "headers", {}) or {}).items()}
     body = getattr(error, "body", None)
@@ -78,7 +78,7 @@ def classify(error):
         category = "invalid_credentials"
     elif code == 402 or any(s in text for s in ("insufficient credit", "credit balance", "depleted", "payment required")):
         category = "depleted_credits"
-    elif any(s in text for s in ("perday", "per_day", "daily", "permonth", "monthly", "per_month")) and (code == 429 or "quota" in text or "limit" in text):
+    elif any(s in text for s in ("perday", "per_day", "per day", "daily", "permonth", "monthly", "per_month", "per month", "neuron")) and (code == 429 or "quota" in text or "limit" in text):
         category = "long_term_exhaustion"
     elif code == 429 or "resource_exhausted" in text:
         category = "throttled"
@@ -92,7 +92,7 @@ def classify(error):
         category = "malformed_request"
     else:
         category = "transport_failure"
-    if category == "long_term_exhaustion" and retry is not None and retry - now < 3600:
+    if provider == "gemini" and category == "long_term_exhaustion" and retry is not None and retry - now < 3600:
         retry = None  # A minute Retry-After does not establish a daily/monthly reset.
     scope = "model"
     if category == "invalid_credentials":
@@ -100,8 +100,43 @@ def classify(error):
     elif category == "depleted_credits":
         scope = "group"
     elif category in ("throttled", "long_term_exhaustion"):
-        # Unknown quota scope conservatively covers the configured shared group.
-        scope = "group_model" if any(s in text for s in ("permodel", "per_model", '"model"')) else "group"
+        # Defaults follow the documented quota scope, not the mere presence of
+        # a model name in an error. Explicit shared quotas override defaults.
+        scope = "group_model" if provider in ("gemini", "groq") else "group"
+        if provider == "cohere" and category == "throttled":
+            scope = "group_model"
+        if any(s in text for s in ("permodel", "per_model", "per model", "per-model")):
+            scope = "group_model"
+        model_quota, shared_quota = False, False
+        def quota_scope(node):
+            nonlocal model_quota, shared_quota
+            if isinstance(node, dict):
+                dimensions = node.get("quotaDimensions", {})
+                quota_id = str(node.get("quotaId", "")).lower()
+                if quota_id or dimensions:
+                    if dimensions.get("model") or "permodel" in quota_id:
+                        model_quota = True
+                    else:
+                        shared_quota = True
+                for val in node.values():
+                    quota_scope(val)
+            elif isinstance(node, list):
+                for val in node:
+                    quota_scope(val)
+        quota_scope(body)
+        if model_quota:
+            scope = "group_model"
+        if shared_quota or any(s in text for s in ("all models", "all_models", "account-wide", "project-wide", "organization-wide")):
+            scope = "group"
+        if provider == "cohere" and category == "long_term_exhaustion":
+            scope = "group"
+        if provider == "cloudflare" and "neuron" in text:
+            scope = "group"
+        if provider == "openrouter":
+            if "upstream_provider_shared_pool" in text or "rate-limited upstream" in text:
+                scope = "provider_model"
+            if category == "long_term_exhaustion" or "free-models-per" in text or "free model daily" in text:
+                scope = "group"
     return category, retry, scope
 
 def backoff(failures):

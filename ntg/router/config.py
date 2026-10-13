@@ -1,4 +1,4 @@
-"""Explicit eligibility, not inferred quotas or billing status."""
+"""Provider credentials and default model pools; access is provider-enforced."""
 from dataclasses import dataclass, field
 import os
 import re
@@ -7,8 +7,6 @@ from dotenv import dotenv_values
 
 PREFIX = {"gemini": "gemini", "groq": "groq", "openrouter": "openrouter",
           "cloudflare": "cloudflare", "cohere": "cohere_chat"}
-PLANS = {"gemini": "free_project", "groq": "free_plan", "openrouter": "free_models",
-         "cloudflare": "workers_free", "cohere": "trial_noncommercial"}
 
 @dataclass
 class Account:
@@ -17,7 +15,7 @@ class Account:
     key: str = field(repr=False)
     account_id: str = field(default="", repr=False)
     group: str = ""
-    plan: str = "unknown"
+    plan: str = "unknown"  # Legacy metadata; never an admission gate.
     models: tuple[str, ...] = ()
 
     @property
@@ -44,12 +42,8 @@ def load_accounts(path=".env"):
     return accounts
 
 def eligibility(account, model):
-    if account.plan != PLANS[account.provider]:
-        return "free eligibility unverified"
     if account.provider == "cloudflare" and not re.fullmatch(r"[a-fA-F0-9]{32}", account.account_id):
         return "missing/invalid Cloudflare account ID"
-    if account.provider == "openrouter" and model != "openrouter/free" and not model.endswith(":free"):
-        return "only explicit :free variants or openrouter/free allowed"
-    if model not in account.models:
-        return "model not explicitly approved for free use"
+    if model == "unconfigured":
+        return "no default model configured; specify a model"
     return None

@@ -5,19 +5,17 @@ Python 3.11+. This rebuilds the existing `ntg.router.engine.UnifiedNTGRouter`; i
 ```powershell
 python -m pip install -r requirements.txt
 python -m ntg --status
-python -m ntg "Explain async Python briefly" --provider groq --model llama-3.3-70b-versatile
+python -m ntg "Explain async Python briefly" --provider groq --model openai/gpt-oss-120b
 python -m ntg "Hello" --provider openrouter --model openrouter/free
 ```
 
 The local `.env` contains the 24 supplied credentials; `.env.example` contains placeholders. Both `.env` and the original credential text are ignored by Git. Do not commit either. Numbered keys can be added without code changes. Environment variables override `.env`.
 
-**Before inference**, confirm the account in its provider console and set each `PROVIDER_N_FREE_PLAN`: Gemini `free_project` (billing disabled), Groq `free_plan`, Cloudflare `workers_free` (no paid Workers plan or AI Gateway billing), Cohere `trial_noncommercial`, OpenRouter `free_models`. Defaults are `unknown`, which excludes the route. The supplied text's “free tier” labels are not billing verification. Cohere trial keys are not for production/commercial use. Groq is distinct from xAI Grok; no Grok allowance is assumed.
+The configured accounts have billing disabled, as confirmed by the user. All accounts participate without a local free-plan declaration. Their default pools now contain current free-tier text-chat models checked against official documentation and live catalogs. See [the provider review](docs/provider-model-review.md), [model pools](docs/free-model-pools.json), and [per-account catalog evidence](docs/model-catalog-audit.json).
 
-Set `PROVIDER_N_MODELS` to comma-separated **native model identifiers** whose free access you have verified in current official documentation and your account. Suggested identifiers in the example are supported interface examples, not proof of eligibility. Cloudflare's current example is `@cf/meta/llama-3.1-8b-instruct-fp8`; its earlier non-FP8 identifier is unavailable in the current catalog. OpenRouter is configured locally with `openrouter/free`, which automatically selects an available free model. Explicit `:free` variants are also supported. The free router has a local 4,096 output-token policy ceiling; selected providers still validate their own limits. Every OpenRouter attempt checks its public model metadata for zero prices and sets zero prompt/completion price ceilings, disables upstream provider fallback, and requires parameter support. Paid variants, paid routers such as `openrouter/auto`, BYOK and plugins are not enabled. Metadata retrieval is not an inference probe and stores no quota state.
+Set `PROVIDER_N_MODELS` to comma-separated native identifiers in the desired fallback order. Requests stay within these configured pools. Explicit unlisted or deprecated model IDs are not added automatically; with normal fallback, a configured alternative is attempted. Provider APIs enforce actual access and quota, and `.env` must be reviewed again when catalogs change.
 
-Model APIs generally cannot prove the account's billing plan. Strict free-only enforcement therefore depends on the explicit plan declaration and provider-side billing controls. Unverified accounts and models remain excluded; changing a plan outside this program invalidates its declaration. Never mark a paid plan as free merely because it includes an allowance. Model discovery and successful calls do not establish free eligibility.
-
-Use `PROVIDER_N_QUOTA_GROUP` to assign the same stable project/organization/team identifier to keys sharing limits. Cloudflare keys are automatically grouped by their account ID. When a provider exposes a model-specific quota, that group/model is blocked; otherwise the shared group is conservatively blocked. Incorrect grouping can cause unnecessary failures. These identifiers are configuration, not quota tables.
+Use `PROVIDER_N_QUOTA_GROUP` to identify keys sharing a project, organization or account. Gemini and Groq limits usually apply per model within that shared group. Cohere chat limits are per model, while its monthly trial cap is shared. OpenRouter account-wide free caps and Cloudflare task/daily limits are shared. Explicit quota scopes in provider errors override defaults. Cloudflare keys are grouped automatically by account ID. Additional keys sharing an account do not create more allowance.
 
 ```python
 import asyncio
@@ -28,7 +26,7 @@ async def main():
     try:
         result = await router.acompletion(
             [{"role": "user", "content": "Hello"}],
-            providers=["groq"], model="llama-3.3-70b-versatile",
+            providers=["groq"], model="openai/gpt-oss-120b",
             max_tokens=128, max_attempts=5, deadline_seconds=30)
         print(result.response.choices[0].message.content)
         print(result.provider, result.account_id, result.model, result.attempts)
@@ -41,15 +39,19 @@ async def main():
 asyncio.run(main())
 ```
 
-Keep one router per event loop for fair distribution and shared operational state. CLI invocations start fresh. Explicit models are preserved across accounts. To permit model changes use `allow_model_fallback=True, fallback_models=[...]` or CLI `--fallback-model MODEL` (repeatable). With no model, all configured compatible routes participate from the first request. Provider restrictions always apply. A qualified model uses the public provider name, e.g. `cohere/command-a-03-2025`; transport uses LiteLLM's `cohere_chat/` prefix internally.
+Keep one router per event loop so requests share operational cooldowns. CLI quota cooldowns start fresh, while routing positions persist across commands. New requests rotate **provider → account → model**, giving eligible providers equal starting turns, accounts equal turns within each provider, and models equal turns within each account. The initial provider order is Gemini, Groq, OpenRouter, Cloudflare, Cohere. After a failed attempt, fallback remains **next model → next account → next provider**. A requested configured model starts first. Automatic model fallback is enabled by default; use `allow_model_fallback=False` or CLI `--exact-model` to preserve an exact model. `fallback_models=[...]` / `--fallback-model` narrows the pool. Explicit provider restrictions always apply, so `--provider groq` never calls Gemini or another provider. Without `--provider`, exhausted providers can fall through to the next one.
 
-Supported caller parameters are validated, never silently removed. Tools/schema support and context/output limits use LiteLLM's pinned bundled metadata, request-time OpenRouter model API metadata, or the documented Cloudflare FP8 profile (32,000 context, a conservative 4,096 output policy ceiling). Unknown capabilities are excluded. Multimodal inputs are currently excluded. Text token counting is an estimate; `input_tokens` can supply a stricter caller count. Provider context errors remain authoritative. No messages are truncated. Default output limit is 256; pass an explicit limit when needed. Tools must be caller-supplied function tools, not provider paid built-ins.
+The CLI stores only rotation positions in `.ntg-routing.json` beside the env file, with a process lock for simultaneous commands. It contains no credentials, messages or quota counters and is ignored by Git. API users can share this behavior using `routing_state_path=".ntg-routing.json"`; otherwise a single router keeps its rotation in memory. Explicit model/provider selections constrain balancing. Failed or unavailable routes can make actual completed-call counts uneven.
+
+The default attempt budget covers all selected routes within the overall deadline. Use `--attempts` for a smaller cap or `--deadline` to change the default 60-second deadline. Transport timeouts are capped at 15 seconds per attempt. Slow requests may reach the deadline before exhausting the pool.
+
+The router validates its public parameter names and text-only message format. Model availability, parameter support, and context/output limits are validated by the provider API, rather than a potentially stale local catalog. Parameters are never silently removed and messages are never truncated. No output-token cap is sent by default; providers use their own defaults and model limits. Pass `--max-tokens` or `max_tokens` only when you want an explicit cap. `input_tokens` is retained for custom capability checks but the default adapter does not prefilter by token estimates. Tools must be caller-supplied function tools.
 
 For streaming, pass `stream=True`, iterate `result.response`, and **always close it** in `finally` with `await result.response.aclose()`. The first chunk is fetched within the fallback cycle; after a chunk is returned there is no replay. In-flight reservations last through consumption/close. Latency for streams is time to first chunk; subsequent chunks share the same overall deadline.
 
-Availability reports `eligible`, `unknown` (configured but untried), `temporarily_blocked`, or `disabled`. Reset times are Unix timestamps. Retry-After, reset headers and structured RetryInfo are used when supplied. Missing short-term resets use bounded jittered backoff; daily/monthly exhaustion without a reset suspends the scope for this session. Invalid keys need reload. Failures contain sanitized categories and HTTP status, never raw exception text or credentials. No remaining quota is calculated or displayed. Restart learns availability again through ordinary requests. Free service availability and complete allowance consumption are not guaranteed.
+Availability reports `eligible`, `unknown` (configured but untried), `temporarily_blocked`, or `disabled`. Reset times are Unix timestamps. Retry-After, reset headers and structured RetryInfo are used when supplied. Missing short-term resets use bounded jittered backoff; daily/monthly exhaustion without a reset suspends the scope for this session. Invalid keys need reload. Failures contain sanitized categories and HTTP status, never raw exception text or credentials. No remaining quota is calculated or displayed. Restart learns availability again through ordinary requests. Provider availability and quota depend on the account and service.
 
-Validation: temporary inline simulations passed sequential/concurrent distribution, unequal model pools, bounded fallback, shared quota scopes, exhaustion/manual re-enable, request deadlines, stream closure and no replay. A mocked real LiteLLM Cloudflare call preserved HTTP 429/Retry-After and made exactly one request. Syntax and whitespace checks passed. No live inference calls or test files were used.
+Validation: `python -m unittest discover -s tests -v` covers hierarchical fallback, per-model and shared quota scopes, exact/provider restrictions, more than six attempts, deadline cleanup, cooldown expiry, and stream failure without replay. All 24 configured keys retrieved model catalogs successfully. Catalog evidence alone is not a live completion or remaining-quota guarantee.
 
 Official references checked 2026-10-13:
 

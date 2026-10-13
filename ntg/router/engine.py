@@ -1,10 +1,11 @@
-"""NTG owns fair admission and fallback; LiteLLM owns protocol conversion."""
+"""NTG owns model/account/provider fallback; LiteLLM converts protocols."""
 import asyncio
 from dataclasses import dataclass
 import time
 from .config import load_accounts, eligibility
 from .state import Block, classify, backoff
-from .transport import send, compatible, ManagedStream, openrouter_metadata
+from .transport import send, compatible, ManagedStream
+from .scheduler import RoundRobin
 
 class RoutingError(Exception):
     def __init__(self, failures, availability, reason="No eligible route succeeded"):
@@ -24,22 +25,24 @@ class CompletionResult:
     routing_reason: str
 
 class UnifiedNTGRouter:
-    def __init__(self, env_path=".env", *, accounts=None, transport=send, capability_check=compatible):
+    def __init__(self, env_path=".env", *, accounts=None, transport=send, capability_check=compatible,
+                 provider_order=("gemini", "groq", "openrouter", "cloudflare", "cohere"), routing_state_path=None):
         self.env_path = env_path
         self.accounts = load_accounts(env_path) if accounts is None else accounts
         self.transport = transport
         self.capability_check = capability_check
+        self.provider_order = tuple(provider_order)
+        self.scheduler = RoundRobin(routing_state_path)
         self.blocks = {}
         self.inflight = {}
         self.seen = set()
-        self.cursor = 0
-        self.model_cursors = {}
         self.lock = asyncio.Lock()
 
     def _keys(self, account, model):
         return [("account", account.id), ("model", account.id, model),
                 ("group", account.provider, account.group),
-                ("group_model", account.provider, account.group, model)]
+                ("group_model", account.provider, account.group, model),
+                ("provider_model", account.provider, model)]
 
     def _block(self, account, model):
         now = time.time()
@@ -77,8 +80,8 @@ class UnifiedNTGRouter:
                     del self.blocks[key]
 
     async def _failure(self, account, model, error):
-        category, until, scope = classify(error)
-        keys = dict(zip(("account", "model", "group", "group_model"), self._keys(account, model)))
+        category, until, scope = classify(error, account.provider)
+        keys = dict(zip(("account", "model", "group", "group_model", "provider_model"), self._keys(account, model)))
         async with self.lock:
             key = keys[scope]
             old = self.blocks.get(key)
@@ -92,10 +95,10 @@ class UnifiedNTGRouter:
             self.blocks[key] = Block(category, until, failures)
         return category
 
-    async def acompletion(self, messages, *, model=None, providers=None, allow_model_fallback=False,
-                          fallback_models=(), max_attempts=6, deadline_seconds=60, input_tokens=None,
+    async def acompletion(self, messages, *, model=None, providers=None, allow_model_fallback=True,
+                          fallback_models=(), max_attempts=None, deadline_seconds=60, input_tokens=None,
                           **params):
-        if not messages or max_attempts < 1 or not 0 < deadline_seconds < float("inf"):
+        if not messages or (max_attempts is not None and max_attempts < 1) or not 0 < deadline_seconds < float("inf"):
             raise ValueError("Messages, positive attempts and a finite positive deadline are required")
         allowed = {"temperature", "top_p", "max_tokens", "max_completion_tokens", "tools", "tool_choice",
                    "response_format", "stream", "stop", "seed", "presence_penalty", "frequency_penalty", "n"}
@@ -103,62 +106,62 @@ class UnifiedNTGRouter:
             raise ValueError("Unsupported parameters: " + ", ".join(sorted(set(params) - allowed)))
         if any(tool.get("type") != "function" for tool in params.get("tools", [])):
             raise ValueError("Only caller-provided function tools are allowed")
-        if "max_tokens" not in params and "max_completion_tokens" not in params:
-            params["max_tokens"] = 256
         if any(not isinstance(params[k], int) or params[k] < 1 for k in ("max_tokens", "max_completion_tokens") if k in params):
             raise ValueError("Output limits must be positive integers")
         start = time.monotonic()
         end = start + deadline_seconds
         tried, failures = set(), []
-        metadata = {}
-        if self.transport is send and any(a.provider == "openrouter" and
-                (not providers or "openrouter" in providers) and any(not eligibility(a, m) for m in a.models)
-                for a in self.accounts):
-            try:
-                async with asyncio.timeout_at(end):
-                    metadata = await openrouter_metadata(min(10, deadline_seconds))
-            except Exception:
-                failures.append({"provider": "openrouter", "category": "free_metadata_unavailable"})
+        model_pools = {}
+        provider_names = {a.provider for a in self.accounts}
+        order = list(dict.fromkeys(providers or self.provider_order))
+        order.extend(p for p in sorted(provider_names) if p not in order)
+        # A known requested model starts with its provider, while unrestricted
+        # fallback can still reach other providers' configured free pools.
+        preferred = next((a.provider for a in self.accounts if model in a.models or
+                          any(model == f"{a.provider}/{m}" for m in a.models)), None)
+        if preferred and not providers:
+            order.remove(preferred)
+            order.insert(0, preferred)
+        for a in self.accounts:
+            pool = list(a.models)
+            exact = [m for m in pool if model in (m, f"{a.provider}/{m}")]
+            pool = exact + [m for m in pool if m not in exact]
+            if fallback_models:
+                pool = [m for m in pool if m in exact or m in fallback_models or f"{a.provider}/{m}" in fallback_models]
+            if model is not None and not allow_model_fallback:
+                pool = exact
+            model_pools[a.id] = tuple(pool)
+        ordered_accounts = sorted(self.accounts, key=lambda a: (order.index(a.provider), int(a.id.rsplit('-', 1)[-1])))
+        if max_attempts is None:
+            max_attempts = sum(len(model_pools[a.id]) for a in ordered_accounts)
+        plan = None
         for attempt in range(1, max_attempts + 1):
             async with self.lock:
                 routes = []
-                for a in self.accounts:
+                for a in ordered_accounts:
                     if providers and a.provider not in providers:
                         continue
-                    for m in a.models:
-                        qualified = f"{a.provider}/{m}"
-                        exact = model in (m, qualified)
-                        fallback = allow_model_fallback and (m in fallback_models or qualified in fallback_models)
-                        if model is not None and not exact and not fallback:
-                            continue
-                        if model is None and fallback_models and m not in fallback_models and qualified not in fallback_models:
-                            continue
+                    for m in model_pools[a.id]:
                         if (a.id, m) in tried or eligibility(a, m) or self._block(a, m):
                             continue
                         try:
-                            if self.capability_check is compatible and a.provider == "openrouter":
-                                info = metadata.get(m)
-                                supported = bool(info) and all(k == "stream" or k in info["parameters"] for k in params) and compatible(
-                                    a.provider, m, messages, params, input_tokens, metadata=info)
-                            else:
-                                supported = self.capability_check(a.provider, m, messages, params, input_tokens)
+                            supported = self.capability_check(a.provider, m, messages, params, input_tokens)
                         except Exception:
                             supported = False
                         if supported:
                             routes.append((a, m))
                 if not routes or time.monotonic() >= end:
                     break
-                # Account load first, then route load; cyclic tie-breaking across the entire compatible pool.
-                minimum = min(self.inflight.get(a.id, 0) for a, m in routes)
-                ties = [(a, m) for a, m in routes if self.inflight.get(a.id, 0) == minimum]
-                universe = [a.id for a in self.accounts]
-                a = min((a for a, m in ties), key=lambda a: (universe.index(a.id) - self.cursor) % len(universe))
-                self.cursor = (universe.index(a.id) + 1) % len(universe)
-                models = [m for candidate, m in ties if candidate.id == a.id]
-                model_load = min(self.inflight.get((a.id, m), 0) for m in models)
-                m = min((m for m in models if self.inflight.get((a.id, m), 0) == model_load),
-                        key=lambda m: (a.models.index(m) - self.model_cursors.get(a.id, 0)) % len(a.models))
-                self.model_cursors[a.id] = (a.models.index(m) + 1) % len(a.models)
+                if plan is None:
+                    plan = await asyncio.to_thread(self.scheduler.plan, routes, order, model)
+                available = {(a.id, m) for a, m in routes}
+                routes = [(a, m) for a, m in plan if (a.id, m) in available]
+                if not routes or time.monotonic() >= end:
+                    break
+                # Exhaust this account's models, then its provider's accounts,
+                # before moving to the next provider. Cooldowns skip only the
+                # quota scope actually reported by the service.
+                a, m = routes[0]
                 tried.add((a.id, m))
                 self.inflight[a.id] = self.inflight.get(a.id, 0) + 1
                 self.inflight[(a.id, m)] = self.inflight.get((a.id, m), 0) + 1
@@ -166,11 +169,11 @@ class UnifiedNTGRouter:
             response = None
             try:
                 async with asyncio.timeout_at(end):
-                    response = await self.transport(a, m, messages, max(.001, end - time.monotonic()), **params)
+                    response = await self.transport(a, m, messages, max(.001, min(15, end - time.monotonic())), **params)
                     first = await anext(response) if params.get("stream") else None
                 actual = getattr(first if first is not None else response, "model", None) or m
                 self.seen.add((a.id, m))
-                reason = "least in-flight with round-robin tie break" + ("; fallback after provider failure" if attempt > 1 else "")
+                reason = "round-robin provider, account and model; model then account then provider fallback" + ("; fallback after provider failure" if attempt > 1 else "")
                 if params.get("stream"):
                     upstream = response
                     async def close_stream(account=a, selected_model=m, source=upstream):
@@ -190,8 +193,6 @@ class UnifiedNTGRouter:
                 category = await self._failure(a, m, error)
                 failures.append({"provider": a.provider, "account_id": a.masked, "model": m,
                                  "category": category, "status_code": getattr(error, "status_code", None)})
-                if category == "malformed_request":
-                    break
             finally:
                 if not handed_off:
                     try:
