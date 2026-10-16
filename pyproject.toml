@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ntg-router"
+version = "0.1.0"
+description = "Free-access-aware LiteLLM routing foundation"
+requires-python = ">=3.11"
+dependencies = ["litellm==1.98.0", "fastapi==0.139.0", "httpx==0.28.1", "python-dotenv==1.2.2", "uvicorn>=0.34,<1", "jsonschema>=4.23,<5"]
+
+[project.optional-dependencies]
+test = ["pytest>=9,<10", "pytest-asyncio>=1,<2"]
+
+[project.scripts]
+ntg = "ntg.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["ntg*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

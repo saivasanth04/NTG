@@ -1,0 +1,20 @@
+{
+  "models": {
+    "groq/openai/gpt-oss-20b": {
+      "source": "https://console.groq.com/docs/models",
+      "reviewed_on": "2026-10-16",
+      "capabilities": ["chat", "tools", "json", "json_schema"],
+      "context": 131072,
+      "max_output": 65536,
+      "free_eligible": true
+    },
+    "gemini/gemini-2.5-flash": {
+      "source": "https://ai.google.dev/gemini-api/docs/models",
+      "reviewed_on": "2026-10-16",
+      "capabilities": ["chat", "tools", "json", "json_schema"],
+      "context": 1048576,
+      "max_output": 65536,
+      "free_eligible": true
+    }
+  }
+}

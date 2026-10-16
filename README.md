@@ -1,63 +1,102 @@
-# NTG smart router
+# NTG model routing foundation
 
-Python 3.11+. This rebuilds the existing `ntg.router.engine.UnifiedNTGRouter`; it does not introduce a second router. The old implementation depended on missing modules and persisted quota estimates. No database, rate-limit tables, usage counters, or availability probes are used here.
+A Python interface and local OpenAI-compatible chat gateway built on LiteLLM. It filters free-use evidence, capabilities and context before routing; balances accounts; coordinates bounded concurrency; and applies scoped cooldowns and bounded fallback. It contains no agents or tool execution.
+
+Read [feasibility and all feature decisions](docs/feasibility.md), [architecture](docs/architecture.md), and [validation results](docs/validation.md).
+
+## Setup (PowerShell, Python 3.11+)
 
 ```powershell
-python -m pip install -r requirements.txt
-python -m ntg --status
-python -m ntg "Explain async Python briefly" --provider groq --model openai/gpt-oss-120b
-python -m ntg "Hello" --provider openrouter --model openrouter/free
+python -m venv .venv
+.\.venv\Scripts\python -m pip install -e '.[test]'
+# Keep the existing .env. For a new installation only:
+# Copy-Item .env.example .env
+.\.venv\Scripts\python -m ntg discover
+.\.venv\Scripts\python -m ntg smoke
+.\.venv\Scripts\python -m pytest -q
 ```
 
-The local `.env` contains the 24 supplied credentials; `.env.example` contains placeholders. Both `.env` and the original credential text are ignored by Git. Do not commit either. Numbered keys can be added without code changes. Environment variables override `.env`.
+Discovery writes secret-free metadata to ignored `runtime/catalog.json`; it makes metadata requests, not paid inference probes. Smoke sends one small chat request with up to three attempts, and prints only routing/usage metadata. For POSIX use `.venv/bin/python`.
 
-The configured accounts have billing disabled, as confirmed by the user. All accounts participate without a local free-plan declaration. Their default pools now contain current free-tier text-chat models checked against official documentation and live catalogs. See [the provider review](docs/provider-model-review.md), [model pools](docs/free-model-pools.json), and [per-account catalog evidence](docs/model-catalog-audit.json).
+## Configure free access safely
 
-Set `PROVIDER_N_MODELS` to comma-separated native identifiers in the desired fallback order. Requests stay within these configured pools. Explicit unlisted or deprecated model IDs are not added automatically; with normal fallback, a configured alternative is attempted. Provider APIs enforce actual access and quota, and `.env` must be reviewed again when catalogs change.
+`PROVIDER_API_KEY_1`, `_2`, ... are detected without a fixed count for GEMINI, GROQ, OPENROUTER, CLOUDFLARE and COHERE. Unnumbered `PROVIDER_API_KEY` is also accepted as slot 1; configure one spelling per slot. Each account may have `PROVIDER_1_MODELS` (comma-separated allowlist), `PROVIDER_1_QUOTA_GROUP` and `PROVIDER_1_FREE_VERIFIED`. Cloudflare also requires `CLOUDFLARE_ACCOUNT_ID_1`. Environment variables override `.env` values. Values are never exported into provider-global environment state. See [.env.example](.env.example).
 
-Use `PROVIDER_N_QUOTA_GROUP` to identify keys sharing a project, organization or account. Gemini and Groq limits usually apply per model within that shared group. Cohere chat limits are per model, while its monthly trial cap is shared. OpenRouter account-wide free caps and Cloudflare task/daily limits are shared. Explicit quota scopes in provider errors override defaults. Cloudflare keys are grouped automatically by account ID. Additional keys sharing an account do not create more allowance.
+Use the **same quota group** for keys that share project/organization/owner limits. If unsure, omit groups; the default shares provider capacity conservatively. Existing supplied quota groups are respected; the software cannot verify that they are truly independent.
+
+OpenRouter's explicit `:free` models are automatically eligible only when live metadata reports zero for every pricing field; the transport also requests zero-price upstream routing. `openrouter/free` is excluded because its downstream model/capabilities are opaque. Listing, successful authentication and zero account balance do not establish other providers' free eligibility.
+
+Other providers stay blocked for inference until both of these are true:
+
+1. Verify in the provider dashboard that the key belongs to a free-only / evaluation plan with billing disabled and that your use is allowed. Set that account's `PROVIDER_1_FREE_VERIFIED=true`.
+2. Add a documented model entry to `policy.json` with `source`, `reviewed_on`, `capabilities`, `context`, `max_output` and `free_eligible`. See [policy.example.json](policy.example.json); recheck the linked model documentation before enabling it. An API catalog cannot verify the operator's attestation.
+
+Model policy evidence must be reviewed within 30 days. Expired entries cannot broaden eligibility or capabilities. Unknown pricing or stale model evidence fails closed.
+
+Do not enable paid keys merely because they have trial credits, an included allowance, or a consumer subscription. Configure provider-side spending controls as well. `.env` is ignored; never commit it. This project does not edit existing credentials or account plans.
+
+## Python interface
 
 ```python
 import asyncio
-from ntg.router import UnifiedNTGRouter, RoutingError
+from ntg import RoutingService, ChatRequest, RoutingError
 
 async def main():
-    router = UnifiedNTGRouter()
+    router = await RoutingService.from_env()  # create once and share among agents
     try:
-        result = await router.acompletion(
-            [{"role": "user", "content": "Hello"}],
-            providers=["groq"], model="openai/gpt-oss-120b",
-            max_tokens=128, max_attempts=5, deadline_seconds=30)
-        print(result.response.choices[0].message.content)
-        print(result.provider, result.account_id, result.model, result.attempts)
-    except RoutingError as error:
-        print(error.details)
-    print(router.availability())
-    await router.reenable("groq-1")  # session exhaustion/server blocks; cannot clear invalid credentials
-    await router.reload()            # reload configuration and clear operational state; requires idle router
+        response = await router.chat(ChatRequest(
+            messages=[{"role": "user", "content": "Write a Python add function."}],
+            max_tokens=256,
+            deadline_seconds=45,
+            # tools=[...], tool_choice="auto",
+            # response_format={"type": "json_schema", "json_schema": {...}},
+        ))
+        print(response["choices"][0]["message"]["content"])
+        print(response["routing"])
+    except RoutingError as exc:
+        print(exc.public())  # sanitized error and fallback history
 
 asyncio.run(main())
 ```
 
-Keep one router per event loop so requests share operational cooldowns. CLI quota cooldowns start fresh, while routing positions persist across commands. New requests rotate **provider → account → model**, giving eligible providers equal starting turns, accounts equal turns within each provider, and models equal turns within each account. The initial provider order is Gemini, Groq, OpenRouter, Cloudflare, Cohere. After a failed attempt, fallback remains **next model → next account → next provider**. A requested configured model starts first. Automatic model fallback is enabled by default; use `allow_model_fallback=False` or CLI `--exact-model` to preserve an exact model. `fallback_models=[...]` / `--fallback-model` narrows the pool. Explicit provider restrictions always apply, so `--provider groq` never calls Gemini or another provider. Without `--provider`, exhausted providers can fall through to the next one.
+`model="auto"` selects the compatible pool. A raw provider model ID constrains fallback to that ID across accounts; an ID from `/v1/models` (`account-alias/model-id`) pins the deployment. Required tools and JSON/schema capabilities are inferred from request fields. `required_capabilities` can impose additional constraints. `input_tokens` can increase the conservative local context bound. UTF-8 byte sizing intentionally underuses context to avoid optimistic model-independent token estimates. Streaming, arbitrary provider parameters and non-chat operations return errors or are absent; this is a documented chat-completions subset.
 
-The CLI stores only rotation positions in `.ntg-routing.json` beside the env file, with a process lock for simultaneous commands. It contains no credentials, messages or quota counters and is ignored by Git. API users can share this behavior using `routing_state_path=".ntg-routing.json"`; otherwise a single router keeps its rotation in memory. Explicit model/provider selections constrain balancing. Failed or unavailable routes can make actual completed-call counts uneven.
+## Gateway
 
-The default attempt budget covers all selected routes within the overall deadline. Use `--attempts` for a smaller cap or `--deadline` to change the default 60-second deadline. Transport timeouts are capped at 15 seconds per attempt. Slow requests may reach the deadline before exhausting the pool.
+Set a random secret in your current shell (or privately add it to `.env`):
 
-The router validates its public parameter names and text-only message format. Model availability, parameter support, and context/output limits are validated by the provider API, rather than a potentially stale local catalog. Parameters are never silently removed and messages are never truncated. No output-token cap is sent by default; providers use their own defaults and model limits. Pass `--max-tokens` or `max_tokens` only when you want an explicit cap. `input_tokens` is retained for custom capability checks but the default adapter does not prefilter by token estimates. Tools must be caller-supplied function tools.
+```powershell
+$env:NTG_GATEWAY_KEY = & .\.venv\Scripts\python -c "import secrets; print(secrets.token_urlsafe(32))"
+.\.venv\Scripts\python -m ntg serve
+```
 
-For streaming, pass `stream=True`, iterate `result.response`, and **always close it** in `finally` with `await result.response.aclose()`. The first chunk is fetched within the fallback cycle; after a chunk is returned there is no replay. In-flight reservations last through consumption/close. Latency for streams is time to first chunk; subsequent chunks share the same overall deadline.
+The server listens at `127.0.0.1:8000`, one worker. Authenticated routes: `POST /v1/chat/completions`, `GET /v1/models`, `GET /status`. `/healthz` is public process health. Access logs, content logs and automatic API docs are disabled. Do not enable debug logging in application dependencies. Prompts still go to the selected provider under its data policy.
 
-Availability reports `eligible`, `unknown` (configured but untried), `temporarily_blocked`, or `disabled`. Reset times are Unix timestamps. Retry-After, reset headers and structured RetryInfo are used when supplied. Missing short-term resets use bounded jittered backoff; daily/monthly exhaustion without a reset suspends the scope for this session. Invalid keys need reload. Failures contain sanitized categories and HTTP status, never raw exception text or credentials. No remaining quota is calculated or displayed. Restart learns availability again through ordinary requests. Provider availability and quota depend on the account and service.
+```python
+import os
+from openai import OpenAI
 
-Validation: `python -m unittest discover -s tests -v` covers hierarchical fallback, per-model and shared quota scopes, exact/provider restrictions, more than six attempts, deadline cleanup, cooldown expiry, and stream failure without replay. All 24 configured keys retrieved model catalogs successfully. Catalog evidence alone is not a live completion or remaining-quota guarantee.
+client = OpenAI(base_url="http://127.0.0.1:8000/v1",
+                api_key=os.environ["NTG_GATEWAY_KEY"], max_retries=0, timeout=60)
+result = client.chat.completions.create(model="auto", messages=[
+    {"role": "user", "content": "Explain Python generators."}], max_tokens=256)
+print(result.choices[0].message.content)
+```
 
-Official references checked 2026-10-13:
+Disable client retries to keep a single retry owner. An OpenAI SDK timeout should exceed `deadline_seconds` (default 45s). Custom deadline/capability fields can be passed via SDK `extra_body`. Bodies are limited to 1 MiB. Put TLS/authenticated network controls in front of any remote deployment. One gateway secret grants all local routes; tenant isolation and virtual keys are deferred.
 
-- [Gemini billing](https://ai.google.dev/gemini-api/docs/billing/) and [models](https://ai.google.dev/gemini-api/docs/models)
-- [Groq Free plan billing](https://console.groq.com/docs/billing-faqs), [models](https://console.groq.com/docs/models), [rate-limit headers](https://console.groq.com/docs/rate-limits)
-- [OpenRouter free variants](https://openrouter.ai/docs/guides/routing/model-variants/free)
-- [Cloudflare pricing](https://developers.cloudflare.com/workers-ai/platform/pricing/) and [FP8 model profile](https://developers.cloudflare.com/workers-ai/models/llama-3.1-8b-instruct-fp8/)
-- [Cohere pricing/trial restrictions](https://cohere.com/pricing) and [models](https://docs.cohere.com/docs/models)
-- [LiteLLM Cohere v2](https://docs.litellm.ai/docs/providers/cohere) and [Cloudflare](https://docs.litellm.ai/docs/providers/cloudflare_workers)
+## Operations and extension
+
+Defaults: four active attempts, sixteen waiting callers, one concurrent attempt per quota group, three attempts per request, 20s per attempt, 45s overall request deadline. Configure these through `RoutingService(...)` / `from_env(...)` and inject the service into `create_app(service, token)`. Scope-specific cooldowns and Retry-After/reset handling do not assume fixed provider quotas. Unknown quota allows conservative probing, not an assertion of spare capacity.
+
+Catalog evidence expires after 24h. Restart a long-running service to refresh discovery; the CLI discovery report does not hot-reload the running service. Avoid frequent refreshes. Runtime state is in memory and lost on restart. Single-process coordination is intentional: do not run multiple workers or replicas without shared atomic state. The queue is bounded admission with fair deployment selection, not a durable FIFO job queue.
+
+Responses include provider, model, account alias, total latency, usage and attempt history. `cost_usd` remains unknown unless a trustworthy provider value is present; no invoice verification is performed. Status exposes safe model metadata, counters, cooldowns and latency EWMA. No prompt/response caching or content logging is configured.
+
+Run the optional bounded live validation with:
+
+```powershell
+.\.venv\Scripts\python scripts\validate_live.py
+```
+
+It submits chat/tools/schema probes plus two concurrent chat callers (up to three attempts each) and saves metadata to `runtime/live-validation.json`. It does not execute returned tools. Controlled failure tests need no API keys. See [architecture extensions](docs/architecture.md) for embeddings, images and eventual distributed gateway migration.
