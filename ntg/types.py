@@ -1,7 +1,7 @@
 from dataclasses import dataclass, field
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 @dataclass(repr=False)
@@ -40,6 +40,51 @@ class Deployment:
                     free=self.free, evidence=self.evidence, checked_at=self.checked_at)
 
 
+def default_response_format():
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "ntg_response",
+            "strict": True,
+            "schema": {
+                "type": "object",
+                "properties": {"answer": {"type": "string"}},
+                "required": ["answer"],
+                "additionalProperties": False,
+            },
+        },
+    }
+
+
+def tool_response_format():
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "ntg_tool_step",
+            "strict": True,
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "tool": {"type": ["string", "null"], "enum": [
+                        "read_file", "write_file", "list_files", None,
+                    ]},
+                    "arguments": {
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": ["string", "null"]},
+                            "content": {"type": ["string", "null"]},
+                        },
+                        "required": ["path", "content"],
+                        "additionalProperties": False,
+                    },
+                    "answer": {"type": ["string", "null"]},
+                },
+                "required": ["tool", "arguments", "answer"],
+                "additionalProperties": False,
+            },
+        },
+    }
+
 class ChatRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     model: str = "auto"
@@ -48,12 +93,17 @@ class ChatRequest(BaseModel):
     temperature: float | None = Field(default=None, ge=0, le=2)
     tools: list[dict[str, Any]] | None = None
     tool_choice: Any = None
-    response_format: dict[str, Any] | None = None
+    response_format: dict[str, Any] = Field(default_factory=default_response_format)
     required_capabilities: set[str] = Field(default_factory=set)
     # Caller can increase the conservative local input estimate, never reduce it.
     input_tokens: int | None = Field(default=None, ge=0)
     deadline_seconds: float = Field(default=45, gt=0, le=120)
     stream: bool = False
+
+    @field_validator("response_format", mode="before")
+    @classmethod
+    def default_structured_output(cls, value):
+        return default_response_format() if value is None else value
 
 
 class RoutingError(Exception):

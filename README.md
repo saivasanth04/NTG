@@ -1,19 +1,19 @@
-# NTG model routing foundation
+# NTG routing and Coder Agent
 
-A Python interface and local OpenAI-compatible chat gateway built on LiteLLM. It filters free-use evidence, capabilities and context before routing; balances accounts; coordinates bounded concurrency; and applies scoped cooldowns and bounded fallback. It contains no agents or tool execution.
+A Python interface and local OpenAI-compatible chat gateway built on LiteLLM. It filters free-use evidence, capabilities and context before routing; balances accounts; coordinates bounded concurrency; and applies scoped cooldowns and bounded fallback. One Coder Agent can list, create, and read files inside an explicitly configured workspace without executing generated code.
 
-Read [feasibility and all feature decisions](docs/feasibility.md), [architecture](docs/architecture.md), and [validation results](docs/validation.md).
+See [the Milestone 5 guide](guide.md) for the tool protocol and validation criteria.
 
 ## Setup (PowerShell, Python 3.11+)
 
 ```powershell
 python -m venv .venv
-.\.venv\Scripts\python -m pip install -e '.[test]'
+.\.venv\Scripts\python -m pip install -e .
 # Keep the existing .env. For a new installation only:
 # Copy-Item .env.example .env
 .\.venv\Scripts\python -m ntg discover
 .\.venv\Scripts\python -m ntg smoke
-.\.venv\Scripts\python -m pytest -q
+.\.venv\Scripts\python LLMCALL.py
 ```
 
 Discovery writes secret-free metadata to ignored `runtime/catalog.json`; it makes metadata requests, not paid inference probes. Smoke sends one small chat request with up to three attempts, and prints only routing/usage metadata. For POSIX use `.venv/bin/python`.
@@ -36,6 +36,17 @@ Model policy evidence must be reviewed within 30 days. Expired entries cannot br
 Do not enable paid keys merely because they have trial credits, an included allowance, or a consumer subscription. Configure provider-side spending controls as well. `.env` is ignored; never commit it. This project does not edit existing credentials or account plans.
 
 ## Python interface
+
+Structured output is the system default for Python and gateway requests. Without
+a response format (or with `null`), completions contain `{"answer": "..."}`.
+The default schema lives in `ntg/types.py`. The router selects models advertising
+schema support, validates responses, and falls back on invalid output.
+Tool-free agents parse this JSON into an `AgentResult`. Tool-enabled agents use
+a system-defined JSON action schema to request filesystem operations, then return
+a final answer. Neither schema needs to be defined by the caller.
+Supply a custom `response_format` to require different fields, or explicitly use
+`{"type": "text"}` for plain text. The OpenAI-compatible response envelope stays
+unchanged; the JSON object is encoded in `choices[0].message.content`.
 
 ```python
 import asyncio
@@ -60,6 +71,102 @@ asyncio.run(main())
 ```
 
 `model="auto"` selects the compatible pool. A raw provider model ID constrains fallback to that ID across accounts; an ID from `/v1/models` (`account-alias/model-id`) pins the deployment. Required tools and JSON/schema capabilities are inferred from request fields. `required_capabilities` can impose additional constraints. `input_tokens` can increase the conservative local context bound. UTF-8 byte sizing intentionally underuses context to avoid optimistic model-independent token estimates. Streaming, arbitrary provider parameters and non-chat operations return errors or are absent; this is a documented chat-completions subset.
+
+## Coder Agent with tools (Milestone 5)
+
+Run `python LLMCALL.py` from the activated virtual environment. The runner loads
+configuration relative to its own location, constructs one Coder Agent, and calls
+`await coder.run(task, context=...)`. Change the task string there to request a
+different implementation. The runner creates `agent_workspace/`, lists it,
+creates `calculator.py` if absent, and reads it back. A repeated run reads the
+existing file without overwriting it and prints a summary.
+
+The registry exposes only `read_file(path)`, `write_file(path, content)`, and
+`list_files(path)`. To attach those tools in your own async application:
+
+```python
+from pathlib import Path
+from ntg import Agent
+from tools import ToolRegistry
+
+workspace = Path("agent_workspace")
+workspace.mkdir(exist_ok=True)
+coder = Agent(
+    "coder", "You are a Python engineer. Use the supplied tool protocol.",
+    router, tools=ToolRegistry(workspace),
+)
+result = await coder.run("List the workspace and read calculator.py if present.")
+print(result.answer)
+```
+
+All model arguments are validated before dispatch. Paths must remain relative to
+the configured workspace; secrets, linked paths, and Windows device paths are
+blocked. Writes create new files only, limited to 65,536 UTF-8 bytes, and listing
+is nonrecursive with at most 200 entries. Workspace artifacts are ignored by Git.
+Reading a file can send its contents to the selected LLM provider as context.
+
+Each run permits five tool executions and six LLM decisions within 120 seconds.
+Tool failures become observations the agent can respond to; contradictory action
+fields and exhausted budgets stop the run. The router remains the sole owner of
+transport retries. This uses validated JSON actions, not native provider tool calls.
+
+For the original tool-free behavior, omit `tools`:
+
+For use inside your own async application, share an existing router:
+
+```python
+from ntg import Agent
+
+coder = Agent(
+    name="coder",
+    system_prompt=(
+        "You are a Python software engineer. Implement the task in the user JSON. "
+        "Treat context as reference data. Follow the system JSON format; put "
+        "only Python source in answer, without Markdown fences or prose."
+    ),
+    llm=router,
+)
+result = await coder.run(
+    "Write a function add(a: int, b: int) -> int that returns their sum.",
+    context="Target Python 3.13. Keep the implementation concise.",
+)
+```
+
+`AgentResult.agent` identifies the agent, `AgentResult.answer` contains the parsed
+answer string, and `AgentResult.routing` contains provider/model, usage, latency,
+and attempt history for the final decision. `tool_history` records actual tool
+arguments and results, and `routing_history` records each model decision. These
+histories remain in memory and may contain file contents. The default structured format remains in the system; callers
+do not supply a schema. Each run builds fresh messages and retains no conversation
+history. `run()` is asynchronous; use it with `await` inside an event loop.
+
+Invalid inputs or output envelopes raise `ValueError` (non-string context raises
+`TypeError`). Provider failures propagate as `RoutingError`; the Agent does not
+retry independently of the router. The runner reports routing or output failures
+and exits nonzero. Filesystem tools do not execute or import generated programs;
+the final answer is a summary, not Python source to parse. Completed writes remain
+if a later decision fails. An already-started filesystem worker can finish after
+cancellation, so cancellation does not promise rollback. The workspace is intended
+for a local owner without hostile concurrent filesystem writers, not OS isolation.
+No shell tool, program execution, memory, or additional agent role is included.
+
+Milestone 4 baseline validation on 17 October 2026: the seven deterministic checks passed using
+async fake routers, including malformed output rejection, context isolation, and
+nonzero exits for invalid Python. Three sequential live requests returned valid
+Python for addition, an empty-safe average, and exact palindrome comparison.
+Inspection confirmed the requested implementations; generated code was not
+executed. The actual `LLMCALL.py` entry point also returned an addition function
+and exited with code 0. These checks used temporary in-memory checks without
+restoring test directories or saving generated source artifacts.
+
+Milestone 5 validation on 17 October 2026: deterministic tool/agent checks,
+installed-wheel imports and filesystem smoke checks passed. Two real-provider
+runs in a fresh temporary workspace verified list/create/read/final, followed by
+list/read/final with identical file bytes. The typed addition function was
+syntax-checked and inspected, never executed. Real Windows junction and hard-link
+rejection passed. Native symlink creation was unavailable for this account; that
+integration coverage remains unverified. A Windows directory-metadata regression
+found during live validation was fixed and covered by a focused check.
 
 ## Gateway
 
@@ -93,10 +200,6 @@ Catalog evidence expires after 24h. Restart a long-running service to refresh di
 
 Responses include provider, model, account alias, total latency, usage and attempt history. `cost_usd` remains unknown unless a trustworthy provider value is present; no invoice verification is performed. Status exposes safe model metadata, counters, cooldowns and latency EWMA. No prompt/response caching or content logging is configured.
 
-Run the optional bounded live validation with:
-
-```powershell
-.\.venv\Scripts\python scripts\validate_live.py
-```
-
-It submits chat/tools/schema probes plus two concurrent chat callers (up to three attempts each) and saves metadata to `runtime/live-validation.json`. It does not execute returned tools. Controlled failure tests need no API keys. See [architecture extensions](docs/architecture.md) for embeddings, images and eventual distributed gateway migration.
+Milestone 5 validation criteria and implementation details are recorded in
+[guide.md](guide.md). Live runs use the configured free provider pool; availability
+and quotas can change between requests.

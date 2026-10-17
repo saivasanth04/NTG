@@ -16,7 +16,7 @@ test = ["pytest>=9,<10", "pytest-asyncio>=1,<2"]
 ntg = "ntg.cli:main"
 
 [tool.setuptools.packages.find]
-include = ["ntg*"]
+include = ["ntg*", "tools*"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

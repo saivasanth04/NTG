@@ -109,10 +109,13 @@ class RoutingService:
                          and self._ready_at(d) <= now
                          and self.group_active[d.account.quota_group] < self.group_concurrency]
                 if ready and self.active < self.max_active:
-                    # Fair account usage first; then least-used deployment, measured latency, jitter.
+                    tried_models = {(d.account.provider, d.model) for d in candidates if d.id in tried}
+                    # Try a different model after failure, then balance account usage,
+                    # deployment usage, measured latency and jitter.
                     # Accounts with many models do not receive proportionally more traffic.
                     self.rng.shuffle(ready)
-                    d = min(ready, key=lambda x: (self.account_calls[x.account.alias],
+                    d = min(ready, key=lambda x: ((x.account.provider, x.model) in tried_models,
+                            self.account_calls[x.account.alias],
                             self.states[x.id].calls, self.states[x.id].latency))
                     self.active += 1
                     self.group_active[d.account.quota_group] += 1
@@ -161,6 +164,11 @@ class RoutingService:
                 self._cool(d, "group", reset if reset is not None else 60)
 
     def _validate_output(self, request, response):
+        choices = response.get("choices") or []
+        message = choices[0].get("message", {}) if choices else {}
+        content = message.get("content")
+        if not (isinstance(content, str) and content.strip()) and not message.get("tool_calls"):
+            raise RoutingError("empty_completion", 502)
         choice = request.tool_choice
         if choice == "required" or isinstance(choice, dict):
             calls = (response.get("choices") or [{}])[0].get("message", {}).get("tool_calls") or []
@@ -239,7 +247,7 @@ class RoutingService:
                 except Exception as exc:
                     if isinstance(exc, RoutingError):
                         failure_code = exc.code
-                        if exc.code != "invalid_structured_output":
+                        if exc.code not in ("invalid_structured_output", "empty_completion"):
                             raise
                         from .failures import Failure
                         failure = Failure(failure_code, "deployment", 30)
