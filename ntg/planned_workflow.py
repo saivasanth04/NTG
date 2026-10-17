@@ -3,11 +3,13 @@ import asyncio
 import hashlib
 import json
 from dataclasses import dataclass, field
+from copy import deepcopy
 
 from .coding_workflow import WorkflowResult
 from .planner_agent import PlanResult
 from .types import RoutingError
-from .task_graph import TaskGraph
+from .project_state import ProjectState
+from .context import coder_context, researcher_context
 from .researcher_agent import ResearchResult
 
 
@@ -68,6 +70,8 @@ class PlannedResult:
     planning_error: dict | None = None
     task_graph: dict = field(default_factory=dict)
     execution_order: list[str] = field(default_factory=list)
+    project_state_path: str | None = None
+    state_revision: int | None = None
 
     @property
     def verified(self):
@@ -110,6 +114,7 @@ class PlannedResult:
             "reason": self.reason, "verified": self.verified,
             "planning_error": self.planning_error,
             "task_graph": self.task_graph, "execution_order": self.execution_order,
+            "project_state_path": self.project_state_path, "state_revision": self.state_revision,
         }
 
 
@@ -126,12 +131,13 @@ class PlannedWorkflow:
     @staticmethod
     def _store(workspace, path, data):
         try:
-            result = workspace.tools.execute("write_file", {
-                "path": path, "content": json.dumps(data, ensure_ascii=False, indent=2),
-            })
-            return result["ok"]
-        except (OSError, ValueError):
-            return False
+            workspace.artifacts.write_json(path, data)
+            return True
+        except (OSError, ValueError) as exc:
+            from tools.filesystem import ToolError
+            code = exc.code if isinstance(exc, ToolError) else (
+                "disk_full" if getattr(exc, "errno", None) == 28 else "io_error" if isinstance(exc, OSError) else "invalid_json")
+            raise ValueError("metadata_storage_failed_" + path.replace(".", "_") + "_" + code) from None
 
     def _approved_source(self, result):
         if not result.verified:
@@ -150,185 +156,155 @@ class PlannedWorkflow:
             raise ValueError("approved_artifact_unavailable")
         return source, digest
 
+    @staticmethod
+    def _result(project):
+        return PlannedResult(
+            status=project.status, goal=project.goal, plan=deepcopy(project.plan),
+            run_project_id=project.metadata.project_id if project.metadata else None,
+            tasks=deepcopy(project.tasks), final_project_id=project.final_project_id,
+            final_source_sha256=project.final_source_sha256,
+            reason=project.reason or "all_tasks_tested_and_reviewed",
+            planning_error=deepcopy(project.planning_error),
+            task_graph=project.graph.to_dict() if project.graph else {},
+            execution_order=project.execution_order,
+            project_state_path="project_state.json" if project.metadata else None,
+            state_revision=project.state_revision,
+        )
+
     async def run(self, goal):
-        if not isinstance(goal, str) or not goal.strip():
-            raise ValueError("Goal must be a nonempty string")
-        state = PlannedResult("blocked", goal)
-        metadata = None
-        active = None
-        graph = None
+        project = ProjectState(goal)
+        self.project_state = project  # Read-only progress access; execution uses local ownership.
         cancelled = False
         timeout = asyncio.timeout(self.RUN_TIMEOUT)
         try:
             async with timeout:
+                project.bind(self.workflow.workspace_manager.create())
                 try:
-                    plan = await self.planner.run(goal)
+                    plan = await self.planner.run(project.goal)
                     plan.validate()
-                    if plan.goal != goal:
+                    if plan.goal != project.goal:
                         raise ValueError("invalid_plan_output")
                 except RoutingError as exc:
-                    state.reason = "planning_failed"
-                    state.planning_error = exc.public()
-                    return state
+                    project.planning_error = exc.public()
+                    project.add_error(exc.code)
+                    raise ValueError("planning_failed") from None
                 except ValueError as exc:
-                    state.reason = "planning_timeout" if str(exc) == "planning_timeout" else "planning_failed"
-                    state.planning_error = {"code": str(exc)}
+                    project.planning_error = {"code": str(exc)}
+                    project.add_error(str(exc))
                     if hasattr(exc, "validation_reason"):
-                        state.planning_error["validation_reason"] = exc.validation_reason
-                    return state
-                state.plan = plan
-                graph = TaskGraph(plan.tasks)
-                metadata = self.workflow.workspace_manager.create()
-                state.run_project_id = metadata.project_id
-                if not self._store(metadata, "plan.json", plan.to_dict()):
+                        project.planning_error["validation_reason"] = exc.validation_reason
+                    raise ValueError("planning_timeout" if str(exc) == "planning_timeout" else "planning_failed") from None
+                project.attach_plan(plan)
+                if not self._store(project.metadata, "plan.json", plan.to_dict()):
                     raise ValueError("plan_storage_failed")
-                prior_source, prior_hash = None, None
-                completed = []
-                while not all(status == "passed" for status in graph.states.values()):
-                    plan.validate()
-                    ready = graph.ready()
+                project.seal(project.metadata, "plan.json")
+                while not all(s == "passed" for s in project.graph.states.values()):
+                    project.plan.validate()
+                    ready = project.graph.ready()
                     if not ready:
-                        state.status, state.reason = "failed", "scheduler_no_progress"
-                        break
+                        raise ValueError("scheduler_no_progress")
                     task = ready[0]
-                    # Recheck the last artifact immediately before dispatch.
-                    if state.tasks:
-                        prior_source, prior_hash = self._approved_source(state.tasks[-1].result)
-                    specification = json.dumps({
-                        "original_goal": goal, "current_task": task,
-                        "required_checks": self.workflow.tester.describe_checks(),
-                        "completed_tasks": completed,
-                        "acceptance_scope": (
-                            "Complete the current task and preserve all completed features. "
-                            + ("This is the final task: satisfy the whole original goal."
-                               if len(completed) == len(plan.tasks) - 1 else
-                               "This is an intermediate task: future tasks need not be implemented yet.")
-                        ),
-                    }, ensure_ascii=False)
-                    context = json.dumps({
-                        "plan_sha256": plan.plan_sha256, "tasks": plan.tasks,
-                        "current_task_id": task["id"], "completed_tasks": completed,
-                        "dependencies": task["dependencies"],
-                        "prior_source": prior_source, "prior_source_sha256": prior_hash,
-                    }, ensure_ascii=False)
+                    source, digest = project.approved_source()
                     execution = TaskExecution(task["id"], "failed", WorkflowResult(
-                        "failed", None, [], "execution_interrupted", review_required=True,
-                    ))
-                    graph.start(task["id"])
-                    state.execution_order.append(task["id"])
-                    state.tasks.append(execution)
-                    active = execution
-                    execution.research_questions = list(task.get("research_questions", []))
+                        "failed", None, [], "execution_interrupted", review_required=True),
+                        research_questions=list(task.get("research_questions", [])))
+                    project.start_task(task["id"], execution)
                     if execution.research_questions:
-                        if self.researcher is None:
-                            execution.research = ResearchResult(
+                        view = researcher_context(project, task)
+                        execution.research = (await self.researcher.run(
+                            "Research current task technical questions", task, view["plan_sha256"])
+                            if self.researcher else ResearchResult(
                                 "blocked", task["id"], plan.plan_sha256,
-                                execution.research_questions, reason="research_unavailable")
-                        else:
-                            execution.research = await self.researcher.run(goal, task, plan.plan_sha256)
+                                execution.research_questions, reason="research_unavailable"))
                         report = execution.research
                         execution.research_artifact = f"research_{task['id']}.json"
                         data = report.to_dict()
-                        if not self._store(metadata, execution.research_artifact, data):
-                            state.reason = "research_storage_failed"
-                        elif (report.verified and report.task_id == task["id"]
-                              and report.plan_sha256 == plan.plan_sha256
-                              and report.questions == execution.research_questions):
-                            execution.research_sha256 = hashlib.sha256(json.dumps(
-                                data, ensure_ascii=False, indent=2).encode("utf-8")).hexdigest()
-                        else:
-                            state.reason = report.reason or "invalid_research_output"
-                        if execution.research_sha256 is None:
-                            execution.status = "blocked"
-                            execution.result.reason = state.reason
-                            state.status = "blocked"
-                            # Keep active placeholder for common finalization and task metadata.
-                            break
-                        evidence = report.context()
-                        spec_data, context_data = json.loads(specification), json.loads(context)
-                        spec_data["research_evidence"] = evidence
-                        context_data["research_evidence"] = evidence
-                        specification = json.dumps(spec_data, ensure_ascii=False)
-                        context = json.dumps(context_data, ensure_ascii=False)
-                    result = await self.workflow.run(specification, context=context)
+                        if not self._store(project.metadata, execution.research_artifact, data):
+                            raise ValueError("research_storage_failed")
+                        if (not report.verified or report.task_id != task["id"]
+                                or report.plan_sha256 != project.plan.plan_sha256
+                                or report.questions != execution.research_questions):
+                            raise ValueError(report.reason or "invalid_research_output")
+                        execution.research_sha256 = hashlib.sha256(json.dumps(
+                            data, ensure_ascii=False, indent=2).encode("utf-8")).hexdigest()
+                        project.seal(project.metadata, execution.research_artifact, execution.research_sha256)
+                        project.set_stage("coding")
+                    specification, context = coder_context(project, task, source, digest,
+                                                            self.workflow.tester.describe_checks())
+                    result = await self.workflow.run(json.dumps(specification, ensure_ascii=False),
+                        context=json.dumps(context, ensure_ascii=False), project_state=project)
                     execution.result, execution.status = result, result.status
                     if result.verified:
-                        try:
-                            prior_source, prior_hash = self._approved_source(result)
-                            execution.approved_source_sha256 = prior_hash
-                        except ValueError:
-                            execution.status = "blocked"
-                            state.status, state.reason = "blocked", "approved_artifact_unavailable"
-                    elif result.status == "passed":
+                        _, execution.approved_source_sha256 = self._approved_source(result)
+                    if result.status == "passed" and not execution.verified:
                         execution.status = "blocked"
-                        state.status, state.reason = "blocked", "task_not_verified"
-                    else:
-                        state.status = result.status
-                        state.reason = f"{task['id']}: {result.reason}"
-                    if execution.status == "passed" and not execution.verified:
-                        execution.status = "blocked"
-                        state.status, state.reason = "blocked", "task_not_verified"
-                    graph.finish(task["id"], passed=execution.verified)
-                    summary = {"plan_sha256": plan.plan_sha256, **execution.to_dict()}
-                    stored = self._store(metadata, f"task_{task['id']}.json", summary)
-                    active = None
-                    if not stored:
-                        state.status, state.reason = "blocked", "task_summary_storage_failed"
+                        execution.result.reason = "task_not_verified"
+                    project.finish_task(task["id"])
+                    if not self._store(project.metadata, f"task_{task['id']}.json", {
+                            "plan_sha256": project.plan.plan_sha256, **execution.to_dict()}):
+                        raise ValueError("task_summary_storage_failed")
+                    if not execution.verified:
+                        project.finish("blocked" if execution.status == "blocked" else "failed",
+                                       f"{task['id']}: {execution.result.reason}")
                         break
-                    if execution.status != "passed":
-                        break
-                    completed.append(task.copy())
                 else:
-                    for finished in state.tasks:
+                    for finished in project.tasks:
                         if finished.research_artifact:
-                            saved = metadata.tools.execute("read_file", {"path": finished.research_artifact})
-                            if (not saved["ok"] or hashlib.sha256(saved["data"]["content"].encode("utf-8")).hexdigest()
-                                    != finished.research_sha256):
+                            if project.metadata.artifacts.file_sha256(finished.research_artifact) != finished.research_sha256:
                                 raise ValueError("research_artifact_mismatch")
-                    state.status, state.reason = "passed", "all_tasks_tested_and_reviewed"
-                    state.final_project_id = state.tasks[-1].result.final_project_id
-                    state.final_source_sha256 = state.tasks[-1].approved_source_sha256
+                    project.finish("passed")
+        except asyncio.CancelledError:
+            cancelled = True
+            project.finish("cancelled", "cancelled")
         except TimeoutError:
             if not timeout.expired():
                 raise
-            state.status, state.reason = "failed", "planned_workflow_deadline_exceeded"
-            if active is not None:
-                active.status = "failed"
-                active.result.reason = state.reason
-        except asyncio.CancelledError:
-            cancelled = True
-            state.status, state.reason = "failed", "cancelled"
-        except ValueError as exc:
-            if str(exc) not in ("workspace_unavailable", "workspace_allocation_failed",
-                                "approved_artifact_unavailable", "invalid_plan_output", "plan_storage_failed", "research_artifact_mismatch"):
-                raise
-            state.status, state.reason = "blocked", str(exc)
-        except OSError:
-            state.status, state.reason = "blocked", "workspace_io_error"
-        if graph is not None:
-            if active is not None:
-                if graph.states[active.task_id] == "running":
-                    if active.status != "blocked":
-                        active.status = "failed"
-                    active.result.reason = state.reason
-                    graph.finish(active.task_id, passed=False)
-            if state.status != "passed":
-                graph.stop(state.reason)
-                state.final_project_id = state.final_source_sha256 = None
-            state.task_graph = graph.to_dict()
+            project.finish("failed", "planned_workflow_deadline_exceeded")
+        except (ValueError, OSError) as exc:
+            code = str(exc) if isinstance(exc, ValueError) else "workspace_io_error"
+            if not code or len(code) > 100 or not all(c.isalnum() or c in "_: " for c in code):
+                code = "workflow_error"
+            project.finish("blocked", code)
+        # Terminal snapshots and DTOs are views of the same canonical records.
         try:
-            if metadata is not None:
-                if active is not None:
-                    if not self._store(metadata, f"task_{active.task_id}.json", {
-                        "plan_sha256": state.plan.plan_sha256, **active.to_dict(),
-                    }):
-                        state.status, state.reason = "blocked", "task_summary_storage_failed"
-                if not self._store(metadata, "result.json", state.to_dict()):
-                    state.status, state.reason = "blocked", "result_storage_failed"
-                    state.final_project_id = state.final_source_sha256 = None
+            if project.metadata is not None:
+                for execution in project.tasks:
+                    path = f"task_{execution.task_id}.json"
+                    try:
+                        project.metadata.artifacts.file_sha256(path)
+                    except FileNotFoundError:
+                        self._store(project.metadata, path, {
+                            "plan_sha256": project.plan.plan_sha256, **execution.to_dict()})
+                project.checkpoint()
+                result = self._result(project)
+                if project.status == "passed" and not result.verified:
+                    raise ValueError("state_storage_failed")
+                if not self._store(project.metadata, "result.json", result.to_dict()):
+                    raise ValueError("state_storage_failed")
+                if project.store.files.file_sha256("project_state.json") != project.store.digest:
+                    raise ValueError("state_storage_failed")
+                saved_state = project.store.files.read_json("project_state.json")
+                saved_result = project.metadata.artifacts.read_json("result.json")
+                for key in ("status", "goal", "run_project_id", "state_revision", "final_project_id", "final_source_sha256"):
+                    if saved_state[key] != saved_result[key]:
+                        raise ValueError("state_storage_failed")
+        except (ValueError, OSError):
+            project.storage_failed()
+            try:
+                project.checkpoint()
+            except (ValueError, OSError):
+                pass  # The last complete state remains readable; success is never returned.
+            if project.metadata:
+                try:
+                    failed_result = self._result(project).to_dict()
+                    try:
+                        old_digest = project.metadata.artifacts.file_sha256("result.json")
+                    except FileNotFoundError:
+                        old_digest = None
+                    project.metadata.artifacts.write_json("result.json", failed_result, old_digest)
+                except (ValueError, OSError):
+                    pass
         finally:
             if cancelled:
                 raise asyncio.CancelledError
-        if state.status != "passed":
-            state.final_project_id = state.final_source_sha256 = None
-        return state
+        return self._result(project)

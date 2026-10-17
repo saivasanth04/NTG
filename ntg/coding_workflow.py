@@ -5,7 +5,9 @@ import difflib
 import json
 from dataclasses import dataclass, field
 
-from .tester_agent import TestReport
+from .tester_agent import TestReport, TesterAgent
+from .project_state import ProjectState
+from .context import repair_context as build_repair_context
 from .reviewer_agent import ReviewReport
 from .types import RoutingError
 from .project import validate_entrypoint
@@ -97,10 +99,15 @@ class CodingWorkflow:
 
     @staticmethod
     def _save(workspace, path, data):
-        content = data if isinstance(data, str) else json.dumps(data, ensure_ascii=False, indent=2)
-        saved = workspace.tools.execute("write_file", {"path": path, "content": content})
-        if not saved["ok"]:
-            raise ValueError("revision_storage_failed")
+        try:
+            if isinstance(data, str):
+                result = workspace.artifacts.execute("write_file", {"path": path, "content": data})
+                if not result["ok"]:
+                    raise ValueError("revision_storage_failed")
+            else:
+                workspace.artifacts.write_json(path, data)
+        except (OSError, ValueError):
+            raise ValueError("revision_storage_failed") from None
 
     def _persist(self, record, source):
         workspace = record.workspace
@@ -133,14 +140,24 @@ class CodingWorkflow:
         from .tester_agent import check_passed
         return result | {c["name"] for c in report.checks if check_passed(c)}
 
-    async def run(self, task, *, context=None):
+    async def run(self, task, *, context=None, project_state=None):
         if not isinstance(task, str) or not task.strip():
             raise ValueError("Task must be a nonempty string")
         if context is not None and not isinstance(context, str):
             raise TypeError("Context must be a string or None")
-        history, seen_sources, seen_failures = [], set(), set()
+        owner = project_state or ProjectState.standalone(task, self.reviewer is not None)
+        if project_state is None:
+            owner.entrypoint = self.entrypoint
+        if owner.active is None or owner.active.result.revisions:
+            raise ValueError("invalid_state_transition")
+        history = owner.active.result.revisions
+        seen_sources, seen_failures = set(), set()
         workspace, active_report, last_attempt, rejection = None, None, None, None
         source = None
+
+        def persist(record, candidate):
+            self._persist(record, candidate)
+            owner.revision_finished(record, self.entrypoint)
 
         def record_interruption(reason):
             if history and not history[-1].progress:
@@ -148,7 +165,7 @@ class CodingWorkflow:
                 record.progress, record.failure_type = "interrupted", reason
                 record.failure_changed = (history[-2].failure_type != reason) if len(history) > 1 else None
                 try:
-                    self._persist(record, source)
+                    persist(record, source)
                 except (ValueError, OSError):
                     pass  # An unavailable/full workspace cannot promise durable evidence.
 
@@ -175,30 +192,25 @@ class CodingWorkflow:
                     record.base_source_sha256 = base_hash
                     record.source_sha256 = base_hash or ""
                     previous_report = active_report
-                    history.append(record)
+                    owner.register_revision(owner.current_task, record)
                     try:
                         if index == 0:
                             generated = await self.coder.run(task, context)
                         else:
-                            repair_context = {
-                                "task_context": context, "current_source_sha256": base_hash,
-                                "checks": self.tester.describe_checks(),
-                                "execution_evidence": active_report.to_dict() if active_report else None,
-                                "last_attempt_evidence": last_attempt.report.to_dict() if last_attempt and last_attempt.report else None,
-                                "review_findings": last_attempt.review.to_dict() if last_attempt and last_attempt.review else None,
-                                "feedback_history": [r.report.feedback for r in history[:-1] if r.report],
-                                "revision_history": [r.summary() for r in history[:-1]],
-                                "rejected_proposal": rejection,
-                            }
+                            repair_context = build_repair_context(
+                                context, base_hash, self.tester.describe_checks(), active_report,
+                                last_attempt, history[:-1], rejection)
                             generated = await self.coder.repair(task, base_source, repair_context)
                     except RoutingError as exc:
                         record.generation_error = exc.code
                         record.failure_type, record.progress = "generation_error", "provider_failure"
                         record.failure_changed = (last_attempt.failure_type != record.failure_type) if last_attempt else None
                         record.generation_routing = {"history": exc.history}
-                        self._persist(record, base_source)
+                        persist(record, base_source)
                         return finish("failed", None, "generation_failed")
                     except ValueError as exc:
+                        if str(exc) in ("context_budget_exceeded", "state_storage_failed", "state_conflict"):
+                            raise
                         record.generation_error = str(exc)
                         record.repair_proposal = getattr(exc, "repair_proposal", None)
                         record.failure_type = "invalid_repair" if index else "invalid_generation"
@@ -206,7 +218,7 @@ class CodingWorkflow:
                         record.failure_signature = hashlib.sha256(str(exc).encode()).hexdigest()
                         record.repeated_failure = record.failure_signature in seen_failures
                         record.progress = "rejected_patch"
-                        self._persist(record, base_source)
+                        persist(record, base_source)
                         if not index:
                             return finish("failed", None, "generation_failed")
                         if record.repeated_failure:
@@ -227,7 +239,7 @@ class CodingWorkflow:
                     if record.source_sha256 in seen_sources:
                         record.progress, record.failure_type = "stalled", "source_cycle"
                         record.failure_changed = (last_attempt.failure_type != record.failure_type) if last_attempt else None
-                        self._persist(record, source)
+                        persist(record, source)
                         return finish("failed", None, "repair_cycle_detected")
                     seen_sources.add(record.source_sha256)
                     if index == 0:
@@ -236,22 +248,31 @@ class CodingWorkflow:
                         workspace.tools.replace_file(self.entrypoint, source, base_hash)
                     record.source_snapshot = f"revision_{record.revision:03}_source.txt"
                     self._save(workspace, record.source_snapshot, source)
-                    report = await self.tester.run(workspace, task)
+                    if isinstance(self.tester, TesterAgent):
+                        report = await self.tester.run(workspace, {
+                            "entrypoint": self.entrypoint, "source_sha256": record.source_sha256},
+                            stage_hook=owner.set_stage)
+                    else:
+                        owner.set_stage("compiling")
+                        report = await self.tester.run(workspace, task)
+                        if report.compilation and report.compilation.passed:
+                            owner.set_stage("testing")
                     record.report = report
                     if report.project_id != record.project_id or report.source_sha256 != record.source_sha256:
                         record.failure_type, record.progress = "artifact_mismatch", "blocked"
-                        self._persist(record, source)
+                        persist(record, source)
                         return finish("blocked", None, "test_artifact_mismatch")
                     record.failure_type, record.failure_signature = report.failure_type, report.failure_signature
                     if report.verified and self.reviewer is not None:
+                        owner.set_stage("reviewing")
                         review = await self.reviewer.run(workspace, task, report)
                         record.review = review
                         if review.status not in ("approved", "rejected", "blocked"):
-                            self._persist(record, source)
+                            persist(record, source)
                             return finish("blocked", None, "invalid_review_output")
                         if review.project_id != record.project_id or review.source_sha256 != record.source_sha256:
                             record.failure_type, record.progress = "artifact_mismatch", "blocked"
-                            self._persist(record, source)
+                            persist(record, source)
                             return finish("blocked", None, "review_artifact_mismatch")
                         if review.status == "rejected":
                             record.failure_type = "review_rejected"
@@ -277,7 +298,7 @@ class CodingWorkflow:
                         record.progress = "stalled" if stalled else "no_observed_progress"
                     if report.verified and (self.reviewer is None or record.review.verified):
                         record.progress = "verified"
-                    self._persist(record, source)
+                    persist(record, source)
                     if report.status == "blocked":
                         return finish("blocked", None, report.feedback)
                     if record.review is not None and record.review.status == "blocked":
@@ -294,10 +315,14 @@ class CodingWorkflow:
                 return finish("failed", None, "repair_limit_exceeded")
         except ValueError as exc:
             if str(exc) not in ("workspace_unavailable", "workspace_allocation_failed", "source_unavailable",
-                                "source_changed", "revision_storage_failed", "path_not_allowed"):
+                                "source_changed", "revision_storage_failed", "path_not_allowed",
+                                "context_budget_exceeded", "state_storage_failed", "state_conflict"):
                 raise
             record_interruption(str(exc))
             return finish("blocked", None, str(exc))
+        except asyncio.CancelledError:
+            record_interruption("cancelled")
+            raise
         except OSError:
             record_interruption("workspace_io_error")
             return finish("blocked", None, "workspace_io_error")

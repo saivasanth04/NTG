@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -28,6 +28,12 @@ class Deployment:
     evidence: str = ""
     checked_at: float = 0
     available_after: float = 0
+    available_reason: str | None = None
+    priority: int = 0
+    model_classes: set[str] = field(default_factory=lambda: {"general"})
+    max_input: int = 0
+    limit_source: str = "unknown"
+    tokenizer_file: str | None = None
 
     @property
     def id(self):
@@ -36,7 +42,9 @@ class Deployment:
     def public(self):
         return dict(id=self.id, provider=self.account.provider, account=self.account.alias,
                     model=self.model, capabilities=sorted(self.capabilities), context=self.context,
-                    max_output=self.max_output, listed=self.listed, access=self.access,
+                    max_output=self.max_output, max_input=self.max_input, limit_source=self.limit_source,
+                    tokenizer_configured=bool(self.tokenizer_file), listed=self.listed, access=self.access,
+                    priority=self.priority, model_classes=sorted(self.model_classes),
                     free=self.free, evidence=self.evidence, checked_at=self.checked_at)
 
 
@@ -166,6 +174,9 @@ def plan_response_format():
 class ChatRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     model: str = "auto"
+    model_class: Literal["general", "fast", "reasoning", "coding"] = "general"
+    preferred_provider: str | None = None
+    preferred_model: str | None = None
     messages: list[dict[str, Any]] = Field(min_length=1)
     max_tokens: int = Field(default=512, ge=1, le=32768)
     temperature: float | None = Field(default=None, ge=0, le=2)

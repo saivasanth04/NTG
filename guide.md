@@ -1,246 +1,250 @@
 ---
-goal: Add one bounded Researcher Agent before coding tasks that require external technical evidence
+goal: Add revision-aware Python repository intelligence to the existing project workflow
 version: 1.0
-date_created: 2026-10-17
+date_created: 2026-10-18
 status: Completed
-tags: [milestone-13, researcher, evidence, task-graph]
+tags: [milestone-15, repository-intelligence, ast, context]
 ---
 
 # Introduction
 
-![Status: Completed](https://img.shields.io/badge/status-Completed-brightgreen)
+![Status: Completed](https://img.shields.io/badge/status-Completed-green)
 
-Milestone 13 adds one Researcher Agent to the existing dependency scheduler. Research is conditional, read-only, bounded, and supplied as compact structured context to Coder. Implemented on 17 October 2026; the contract and validation record below describe the delivered capability.
+Milestone 15 gives existing agents searchable information about project files, classes, functions, imports and calls. Build a small Python AST index, then retrieve exact relevant source through existing bounded read operations. The index is derived evidence; source hashes, tests, review and ProjectState remain authoritative.
+
+This replaces the historical Milestone 14 guide. The index and agent integration are implemented. The verification record below distinguishes deterministic checks, live model operations and complete workflow runs.
 
 ```text
-Planner -> validated task graph -> next ready task
-                                      |
-                             research questions?
-                              /             \
-                            none            present
-                             |                 |
-                             |          Researcher
-                             |          retrieve + summarize
-                             |                 |
-                             +-------> Coder <-+
-                                         |
-                              compile -> Tester -> Reviewer
-                                         |
-                              next ready task or failure
+Tracked ProjectFiles + current manifest
+                 |
+        File inventory / hashes
+                 |
+         ast.parse + visitor
+                 |
+   Symbols + imports + call sites
+                 |
+ Conservative relationship resolution
+                 |
+ Searchable, revision-bound local index
+                 |
+ Bounded agent query -> exact source read
+                 |
+ Existing edit -> compile -> test -> review
 ```
-
-Current repository baseline:
-
-- `ntg/planner_agent.py` produces one through six validated tasks; `ntg/types.py:plan_response_format()` defines their structured schema.
-- `ntg/task_graph.py` requires exactly id, description and dependencies. It validates unordered DAGs, selects numerically ordered ready tasks, and guards task states.
-- `ntg/planned_workflow.py` executes one ready task at a time, carries the latest approved cumulative app.py into the next task, and stops on failure. Results include graph states and execution order.
-- `ntg/coding_workflow.py` manages bounded targeted repairs, compilation, functional checks, and review tied to source hashes. Keep this intact.
-- RoutingService provides chat completions, not a web-search service. Existing model tools are workspace filesystem tools; none retrieves technical documentation. The Researcher needs actual retrieval capability, not a prompt asking an LLM to recall current documentation.
-- The current demo supports standard-library, single-file applications. Stripe checkout illustrates a research need; production payment integration, SDK installation, web servers and payment execution are outside this milestone.
 
 ## 1. Requirements & Constraints
 
-- **REQ-001**: Add one ResearcherAgent that receives goal, current task and explicit research questions, collects external technical documentation through host-controlled retrieval, and returns validated evidence. It does not implement code, execute programs, modify files or approve tasks.
-- **REQ-002**: Extend new Planner task JSON with `research_questions`: an array of zero through three distinct, nonblank questions, each at most 300 characters. An empty array means skip research. Do not add a redundant needs_research boolean or infer research with keyword matching.
-- **REQ-003**: Research happens once per dispatched task before Coder and remains within the overall planned-run deadline. Coder, Tester, Reviewer and repair attempts receive no web tools. Reuse the same evidence through that task's repairs; do not research again on every revision.
-- **REQ-004**: A successful research result must contain retrieved source identities, fetch timestamps and compact findings that reference those identities. Never present a search snippet, remembered URL or model assertion as a fetched document.
-- **REQ-005**: Required research that is unavailable, invalid, timed out or insufficient blocks coding and fails the scheduled task. Record the research reason, block dependent tasks, cancel remaining independent tasks under existing fail-fast policy, and retain a nonzero exit. Do not silently proceed with guesses.
-- **REQ-006**: Preserve source handoff, dependency verification and final result checks. Research completion is not task completion; tests and Reviewer must still verify the generated source.
-- **CON-001**: Keep one through six tasks, sequential execution, existing two-repair limit, Planner 60 seconds, CodingWorkflow 300 seconds and total workflow 1,200 seconds. Give each Researcher run 60 seconds including retrieval and summarization; all retrieval and model calls consume that one budget.
-- **CON-002**: Use existing httpx and JSON-schema dependencies plus the standard library. No framework, new research subagents, vector database, browser automation, persistent cache, background process, recursive crawler, new sandbox or Docker.
-- **CON-003**: Retrieval is bounded to three questions, one search request per question, three candidates per search, and three fetched documents total per task. Limit each fetched body to 64 KiB and each extracted text to 6,000 characters; aggregate extracted input at most 12,000 characters. Model summary output max_tokens=2048 and serialized Coder research context at most 8 KiB UTF-8.
-- **SEC-001**: Hosts and retrieval backends are selected by application configuration, never by model permission. Use HTTPS, port 443, no URL credentials, no URL fragments or secret query parameters; block local/private/link-local/loopback/multicast/reserved destinations and redirects to them. Validate every URL and redirect before access. Never forward provider credentials or workspace contents to documentation sites.
-- **SEC-002**: Treat retrieved text as untrusted reference data, clearly delimited from system instructions. Ignore embedded instructions to execute code, reveal secrets, change roles or bypass output contracts. Fetched code examples are not executable tool actions.
-- **PAT-001**: Keep retrieval, summarization and workflow dispatch separate. Host code records provenance; the LLM supplies only findings and unanswered questions referencing host-issued document IDs. A source reference establishes provenance, not proof that a claim is semantically correct.
+### Current baseline
 
-### Task schema and backward compatibility
+LLMCALL.py defaults to ProjectWorkflow.run in ntg/project_workflow.py. It already supports multiple tracked files, hierarchical tasks, serial candidate edits, integration gates, compile/test/review and validated resumption. Preserve this; do not restore the old six-task/single-file restriction.
 
-New Planner output includes all four fields:
+ProjectFiles in ntg/project.py owns paths, runtime_paths, manifest(), revision(), listing(), read(), search(), edit() and clone_to(). Existing search is literal source-text search, not a symbol/dependency index.
 
-```json
-{
-  "id": "T2",
-  "description": "Implement an HTTP API client using documented request fields.",
-  "dependencies": ["T1"],
-  "research_questions": [
-    "Which endpoint and request fields does the official API documentation require?"
-  ]
-}
+ProjectWorkflow._observe dispatches source/artifact/requirement/task reads and search/list. _packet builds bounded context; _evidence enforces read-only review and changed-line inspection. These are the integration seams. tools/registry.py is not the default project-mode dispatcher.
+
+ntg/project_protocol.py defines STEP and separate Coder/Reviewer action allowlists. ProjectState schema 2 stores source identities and evidence references. ntg/budget.py budgets provider-facing packets. Reuse these mechanisms.
+
+Verified historical baselines: workspaces/project_ee0095a386724cc08db03a87d02f283b/result.json (expense tracker) and workspaces/project_d9a635e45402489ba9512144cc9bbe51/result.json (two modules). Preserve historical artifacts and the --legacy path.
+
+- **REQ-001**: Index only active ProjectFiles.paths. Record tracked paths, hashes, sizes and language; parse .py files only. Exclude runtime_paths. Never crawl the NTG installation, .env, virtual environments, workspace siblings or host metadata.
+- **REQ-002**: Extract classes, sync/async functions, nested definitions, methods, imports and call sites with ast. Preserve lexical ownership and exact source locations. Never execute/import indexed code.
+- **REQ-003**: Resolve local imports, aliases, relative imports and unambiguous lexical calls conservatively. Mark external, ambiguous and dynamic relationships explicitly unresolved. A syntactic call is not a proven runtime edge.
+- **REQ-004**: Provide deterministic metadata search and incoming/outgoing relationship queries with pagination, hashes and project revision. Agents receive selected records rather than the entire index.
+- **REQ-005**: Reuse per-file extraction by content hash and parser version. Reparse changed/new files, remove deleted records, and recompute relationship resolution when the manifest changes. Candidate indexes must reflect candidate source.
+- **REQ-006**: Index hits lead to exact ProjectFiles.read operations. Metadata, signatures and docstrings do not satisfy source inspection or changed-range review requirements.
+- **REQ-007**: Parse/encoding failures produce file diagnostics and remove that file's old semantic records from the current view. Continue with other files. Existing compile validation remains authoritative.
+- **REQ-008**: Persist an optional hash-verified index artifact reference identifying source revision and index schema. Missing/stale/invalid derived caches rebuild without discarding valid approvals or falsely completing tasks.
+- **SEC-001**: Use existing guarded source/storage APIs and regular-file validation. Verify source identities before/after extraction. Reject traversal, linked escapes, foreign paths and files outside the tracked project.
+- **SEC-002**: Source/docstrings/index metadata are untrusted data, never system instructions. Index artifacts are host-owned; agents cannot write them or project_state.json through query operations.
+- **CON-001**: Add one focused module, ntg/repository.py. Use standard-library ast, tokenize, hashlib and existing helpers. No embeddings, vector database, language server, parser package, service, framework, agent, sandbox or permanent test files.
+- **CON-002**: Preserve routing/fallback, context budgets, edit guards, task scopes, compile/test evidence, integration, review and repeatability checks. The code dependency graph is separate from TaskGraph scheduling.
+- **CON-003**: Query limits are prompt/computation budgets, not artifact storage ceilings. Partial responses expose continuation and coverage diagnostics. Never label incomplete analysis complete.
+
+### Data model
+
+Use JSON-compatible dictionaries and one RepositoryIndex class. Persist extracted records, not AST objects or source bodies:
+
+```text
+schema_version: 1
+parser_version: host-selected extraction version
+python_version: interpreter major/minor
+project_revision: ProjectFiles.revision(manifest)
+manifest: relative path -> SHA-256
+files: path -> {sha256, size_bytes, language, parse_status,
+                symbols, imports, calls, diagnostics}
+relationships: resolved/unresolved import and call references
+coverage: {inventory_count, python_count, parsed_count, diagnostic_count}
 ```
 
-Ordinary local tasks such as arithmetic, expense summation and no-argument argparse help should use an empty list. Every question must be relevant to the task's implementation and acceptance requirements. Planner must stay within current application constraints; requesting research does not authorize new application capabilities.
+Symbols store id, path, source_sha256, name, qualified_name, kind, owner_id, lineno, end_lineno, col_offset and end_col_offset. IDs combine path, lexical qualified name and definition line/column, and must be paired with source hash. Moving a definition can change its ID. Include decorators in the retrievable source range. Distinguish duplicate/nested definitions and methods through lexical ownership and location.
 
-For legacy three-field task dictionaries, validation treats missing research_questions as an empty list without mutating the supplied dictionaries or changing their historical plan hashes. New strict provider schema requires the fourth field. Host validation accepts exactly the old or new shape, never arbitrary extra fields. Store/read the optional value with task.get('research_questions', []). Hash explicit questions when present. Validate questions in TaskGraph as well as Planner so direct graph construction cannot bypass bounds.
+Keep signatures compact: parameter names/kinds and bounded annotations/default representations, not complete bodies. An optional first docstring line has an explicit truncation marker. AST columns are UTF-8 byte offsets, not Python string indices.
 
-### Research output contract
+Imports store module, imported name, alias, relative level, owner and line range. Calls store enclosing symbol/module, bounded syntactic callee text, source range, resolution status, optional target_id and reason. Do not capture full argument values or unrelated source.
 
-Host ResearchResult fields:
+### Relationship rules
 
-```json
-{
-  "status": "completed",
-  "task_id": "T2",
-  "plan_sha256": "host-computed-plan-hash",
-  "questions": ["Which request fields are required?"],
-  "findings": [
-    {
-      "question_index": 0,
-      "summary": "Concise implementation guidance grounded in the retrieved document.",
-      "source_ids": ["S1"]
-    }
-  ],
-  "sources": [
-    {
-      "id": "S1",
-      "url": "https://docs.example.com/api/reference",
-      "retrieved_at": "2026-10-17T10:00:00Z",
-      "content_sha256": "host-computed-document-hash"
-    }
-  ],
-  "open_questions": [],
-  "reason": null
-}
-```
+Map pkg/mod.py to pkg.mod and pkg/__init__.py to pkg. Resolve relative imports from the importing package and level. Handle tracked namespace-package directories conservatively. Detect module/package name collisions rather than silently selecting a target. External imports remain references; do not download dependencies.
 
-The example host above is a placeholder domain, not an implementation backend or an actual retrieved source. Do not create artifacts claiming these example values were fetched.
+Resolve a direct call only when the lexical/imported target is unique and no relevant rebinding or shadowing makes it uncertain. Resolve module_alias.function only when the alias and local target are unambiguous. Function parameters/local assignments can shadow imports or definitions and must be considered.
 
-Use statuses completed, blocked and failed. Persist skipped research in task metadata as status skipped, without making an LLM or network call. Define ResearchResult.verified to require completed status, matching task/plan/question identities, one through three successful host fetch records, one through six findings, valid question indexes, nonempty source references, and coverage of every required question with no open questions. Each finding summary is at most 600 characters; source IDs must exist in the host manifest. Model output contains only findings and open_questions; status, URLs, timestamps, hashes and routing evidence come from host code. Never let the model self-certify successful retrieval.
+Record instance.method, self.method, factory()(), getattr, dynamic imports, monkey patches, conditional bindings, wildcard imports and arbitrary re-export chains conservatively as unresolved where certainty is unavailable. Keep syntactic evidence and a reason. Do not guess targets by matching method names globally.
 
-If evidence contradicts itself or does not answer a question, return an open question and block coding with research_incomplete. Do not turn an arbitrary fact into a completed finding to satisfy schema coverage. Retain version/date information in summaries when the retrieved document provides it; a fetch timestamp alone does not establish document currency.
+Cycles are valid index information. app -> helpers -> app must terminate without changing TaskGraph. These relationships do not prove runtime reachability, execution order or correctness.
 
-### Retrieval boundary
-
-Add `tools/research.py` with `ResearchTools(search_backend, allowed_hosts)`:
+### Minimal interface
 
 ```python
-await tools.search(query, limit=3)  # validated candidates: title, url
-await tools.fetch(url)             # host-issued source ID and bounded extracted text
+class RepositoryIndex:
+    def refresh(self, project): ...
+    def search(self, query, *, path=None, offset=0, limit=10): ...
+    def dependencies(self, path, *, offset=0, limit=10): ...
+    def snapshot(self): ...
+    @classmethod
+    def from_snapshot(cls, snapshot): ...
 ```
 
-search_backend is a host-injected async callable with the documented result contract, not an LLM and not a guessed public endpoint. An actual backend integration must be explicitly configured; do not invent an endpoint, scrape search-engine HTML or claim chat completions include search. With no backend, questions requiring search return research_unavailable before Coder. Existing no-research tasks continue to work without a backend. Deterministic injected backends cover offline validation. A live research claim requires a real configured backend and successfully fetched documents.
+refresh synchronizes against the verified current manifest and returns coverage. The class receives no router credentials or live ProjectState.
 
-Search receives only bounded questions and relevant public product/version names, not goal text wholesale, generated code, files, credentials or model routing history. Build queries deterministically from those questions; do not add an extra model query-planning loop. Filter candidates to a host-configured exact hostname allowlist of official technical documentation; prefer product/version-specific primary documentation. Do not accept hostname suffix lookalikes.
+search uses case-insensitive literal matching over paths, symbol names/qualified names and import/callee names. Rank exact names first, then qualified-name matches, prefixes and substrings; break ties by path, line, kind and id. Defer fuzzy/semantic search.
 
-Use async httpx with trust_env=False, follow_redirects=False, bounded streaming, at most two explicitly validated redirects and 10 seconds per request, capped by the remaining Researcher deadline. Do not forward authentication between requests. Fetch public text/html or text/plain documents only; reject binary, PDFs, downloads and compressed responses unless decoded-size limits can be enforced (request identity encoding for this first version). Extract readable HTML text using a small standard-library HTMLParser, excluding script/style content. Search results are candidates only; do not cite unfetched snippets.
+dependencies returns flat records labelled direction, relationship kind and resolution status: outgoing imports/calls and incoming resolved references for the requested file. Include unresolved outgoing references; do not claim complete incoming dynamic-call coverage.
 
-Validate resolved addresses immediately before connecting. Use a transport that connects to those validated public addresses while retaining hostname TLS verification, or a trusted egress service that enforces equivalent destination restrictions. A DNS check followed by an unrelated fresh resolver lookup is insufficient against rebinding. If this cannot be guaranteed, fail closed with research_fetch_unavailable rather than claiming SSRF-safe arbitrary URL retrieval. Keep the implementation explicit and small; never weaken address checks to make a live smoke run pass.
+Queries return project_revision, records, next_offset and coverage/diagnostics. Records include path/hash and source ranges where applicable. Default page size is 10, maximum 20; query length maximum 200 characters. Also respect existing _chars/model response budgets. Explicitly mark omitted metadata and continuation; never silently drop results. A continuation from an older index revision returns index_revision_changed and restarts at offset 0.
+
+### Agent protocol
+
+Add repo_search and repo_dependencies to STEP and the Coder/Reviewer read-only action allowlists:
+
+```json
+{
+  "action": "repo_search",
+  "path": null,
+  "start": 0,
+  "end": null,
+  "sha256": null,
+  "text": "add",
+  "note": "Locate the definition and import references",
+  "issues": []
+}
+```
+
+repo_search uses text as a literal query, optional path as a tracked-file filter and start as zero-based offset. repo_dependencies requires path, uses start as offset and text=null. Unused fields are null. Validate types/ranges on the host. Record page revision alongside continuation in host observations, and reject pagination after source changes without trusting a model-supplied revision.
+
+Example: repo_search("add") -> arithmetic.py definition/app.py import -> read arithmetic.py exact lines -> hash-guarded edit -> refresh -> compile/test -> repo_dependencies("arithmetic.py") -> inspect callers. Source paths stay plain; artifact: addresses saved host reports only.
 
 ## 2. Implementation Steps
 
-### Implementation Phase 1 — Extend task and research contracts
+### Implementation Phase 1
 
-- **GOAL-001**: Declare research needs and validate compact evidence without changing ordinary chat behavior.
-
-| Task | Description | Completed | Date |
-|---|---|---|---|
-| TASK-001 | Update ntg/types.py:plan_response_format with required research_questions for new Planner responses. Update ntg/planner_agent.py instructions and validate_plan, plus ntg/task_graph.py exact-field validation, to accept legacy three-field inputs and enforce question count, length, uniqueness and blank rejection. Preserve existing DAG validation and legacy plan hashing. | Yes | 2026-10-17 |
-| TASK-002 | Add internal research_response_format in ntg/types.py for findings and open_questions only. Add ResearchResult in ntg/researcher_agent.py with host provenance, verified and to_dict methods. Enforce IDs, coverage, lengths and the 8 KiB context bound; reject oversize results rather than cutting JSON or silently dropping sources. | Yes | 2026-10-17 |
-
-Phase completion: legacy expense-tracker plans remain valid and skip research; new plans hash explicit questions; invalid research fields or fabricated source IDs cannot verify.
-
-### Implementation Phase 2 — Retrieve and summarize
-
-Depends on Phase 1.
-
-- **GOAL-002**: Collect bounded primary documentation through one controlled interface and summarize it once.
+- GOAL-001: Build guarded inventory and deterministic per-file AST extraction.
 
 | Task | Description | Completed | Date |
-|---|---|---|---|
-| TASK-003 | Add tools/research.py implementing ResearchTools, injected search contract, exact host allowlist, public HTTPS checks, safe transport boundary, redirect and byte limits, timeouts, HTML text extraction, UTC fetch times and SHA-256 of fetched bytes. Keep it outside the Coder/ReAct filesystem registry; no model gets a general HTTP tool. | Yes | 2026-10-17 |
-| TASK-004 | Add ResearcherAgent(llm, research_tools) with async run(goal, task, plan_sha256). Validate task input, deterministically search each question, fetch up to three distinct approved documents and assign S1–S3 IDs. Use one model call with a strict summarization schema and remaining deadline. Validate references against the actual retrieval manifest. No automatic model retries beyond Router's existing transport behavior. | Yes | 2026-10-17 |
-| TASK-005 | Return stable reasons: research_unavailable, research_timeout, research_no_sources, research_incomplete, invalid_research_output, research_output_too_large and research_fetch_unavailable. Record sanitized model routing, rejected retrieval reason codes and attempted counts separately from the compact Coder payload. Propagate external CancelledError and close active HTTP responses/clients. | Yes | 2026-10-17 |
+|------|-------------|-----------|------|
+| TASK-001 | Add RepositoryIndex in ntg/repository.py. Inventory ProjectFiles.paths/manifest excluding runtime_paths. Read guarded regular-file bytes, detect Python encoding with tokenize, hash bytes and verify against the manifest. Retry a racing read once; then return source_changed without publishing mismatched records. | Yes | 2026-10-18 |
+| TASK-002 | Depends on TASK-001. Implement an ast.NodeVisitor retaining module/class/function scope, nested/async definitions, decorators, imports and calls. Catch SyntaxError, UnicodeError, LookupError, ValueError and RecursionError as per-file diagnostics. Use deterministic IDs and bounded metadata; execute no source. | Yes | 2026-10-18 |
 
-Phase completion: deterministic retrieval and model doubles produce a verified report only from successfully fetched evidence. Missing backend, timeouts and invalid sources produce explicit failures within the budget.
+Phase exit: extraction matches temporary fixtures, including aliases, nested scopes, async functions and invalid Python. Every record has current identity and exact location.
 
-### Implementation Phase 3 — Integrate before coding
+### Implementation Phase 2
 
-Depends on Phase 2.
-
-- **GOAL-003**: Research a ready task once, preserve evidence through repairs, and retain task-graph correctness.
+- GOAL-002: Make metadata searchable and incrementally correct.
 
 | Task | Description | Completed | Date |
-|---|---|---|---|
-| TASK-006 | Extend PlannedWorkflow.__init__ with optional keyword researcher=None. After selecting a ready task, graph.start and create its TaskExecution placeholder before awaiting research so cancellation has an active task to finalize. Empty questions skip retrieval. Nonempty questions without Researcher block with research_unavailable. On research failure, finish graph task failed and use existing fail-fast propagation; never invoke Coder. | Yes | 2026-10-17 |
-| TASK-007 | Add compact research context to the existing CodingWorkflow context while retaining goal, task, dependencies, completed tasks and latest approved source/hash. Do not reset source to dependency-parent snapshots. On required research, pass only a verified report whose identity matches the current plan/task/questions. Existing repair_context.task_context carries this unchanged through repairs. | Yes | 2026-10-17 |
-| TASK-008 | Add research as reference evidence to Reviewer context/specification so it can assess API/version compliance while still reviewing actual code and tests. Do not change Tester from deterministic local checks or let research replace testing. Keep goal, evidence and fetched text as data; use an explicit data section in prompts. Modify Coder/Reviewer instructions only where needed to recognize research references. | Yes | 2026-10-17 |
-| TASK-009 | Add optional research report and status to TaskExecution.to_dict. Persist research_<task_id>.json once in the existing host run directory, before Coder dispatch; store manifest and compact findings, not whole fetched pages. Keep skipped status in task metadata. On storage failure block with research_storage_failed; do not proceed without the report. Persist final task summary and graph on failure. | Yes | 2026-10-17 |
-| TASK-010 | Extend TaskExecution/PlannedResult verification to require matching verified research when the plan has nonempty questions. Legacy/empty-question tasks must remain verifiable without a report. Prevent tampered plan hash, task ID, source references or report contents from satisfying final verification; hash persisted report bytes and associate that hash with the task summary. Distinguish graph dispatch order from coding attempts because a task can fail in research before a Coder revision exists. | Yes | 2026-10-17 |
+|------|-------------|-----------|------|
+| TASK-003 | Depends on TASK-002. Implement module/import resolution, shadow-aware conservative direct-call resolution, incoming/outgoing relationships and unresolved reasons. Ordinary queries must not recursively traverse cycles. | Yes | 2026-10-18 |
+| TASK-004 | Depends on TASK-003. Implement refresh/search/dependencies/snapshot/from_snapshot. Cache extraction by hash/parser version, invalidate changed/deleted files, rebuild relationship resolution after inventory changes and sort/page deterministically. Validate cached paths, hashes and schema before reuse. | Yes | 2026-10-18 |
 
-Phase completion: research gates Coder, required research cannot be bypassed by a passing code result, and no-research plans preserve Milestone 12 behavior.
+Phase exit: edits/deletions/syntax errors cannot expose stale definitions or edges. Identical revision/query pairs produce identical pages. Workspaces share no mutable relationship state.
 
-### Implementation Phase 4 — Configure, document and verify
+### Implementation Phase 3
 
-Depends on Phase 3.
-
-- **GOAL-004**: Make research behavior explicit to callers and provide honest validation evidence.
+- GOAL-003: Integrate bounded queries with existing agents and state.
 
 | Task | Description | Completed | Date |
-|---|---|---|---|
-| TASK-011 | Update LLMCALL.py to accept or construct only an explicitly configured Researcher/retrieval backend, retain the no-research expense-tracker demo by default, and print skipped/completed/blocked research with source URLs and report paths. Keep liveness and nonzero exits. Export ResearcherAgent/ResearchResult from ntg/__init__.py. Document the injected backend contract and allowlist configuration; never add credentials to logs or source. | Yes | 2026-10-17 |
-| TASK-012 | Update README.md for research limits, backend-unavailable behavior, provenance, reference-only output, retained application scope and metadata. Run the checks below with temporary inline harnesses; add no permanent test/example files. Mark this guide Completed only after implementation and evidence justify it; clearly distinguish deterministic checks from live retrieval/model success. Use explicit UTF-8 for all documentation writes. | Yes | 2026-10-17 |
+|------|-------------|-----------|------|
+| TASK-005 | Depends on TASK-004. Extend ntg/project_protocol.py role schemas, CoderAgent.project_step, ReviewerAgent.review_project and ProjectWorkflow._observe/_evidence with read-only queries. Their metadata does not count as actual source inspection; keep all changed-range and action authorization checks. | Yes | 2026-10-18 |
+| TASK-006 | Depends on TASK-005. Manage index lifecycle in ProjectWorkflow._new/_resume/_execute_task, successful edit handling, _packet and approval/rollback. Refresh on the actual candidate before queries. Add compact revision/coverage hints and bounded metadata ranked by task paths and literal identifiers. Reuse existing _step and ntg/budget.py adaptation; never serialize the entire index. | Yes | 2026-10-18 |
+| TASK-007 | Depends on TASK-006. Save snapshots using _record. Store an optional project.repository_index reference with artifact hash/source revision/schema; active candidate references stay under active state until approval. Modify ntg/project_state.py only if validation/projection needs it. Old schema-2 states without the field remain valid. Rebuild bad derived caches while retaining strict approval/source/test artifact verification. | Yes | 2026-10-18 |
+
+Phase exit: agents find definitions, read exact code, edit, requery callers and resume with current results. Tester remains deterministic. Planner may receive a bounded approved-source inventory summary when source exists; empty initial projects remain valid.
+
+### Implementation Phase 4
+
+- GOAL-004: Verify actual repository-aware execution and document boundaries.
+
+| Task | Description | Completed | Date |
+|------|-------------|-----------|------|
+| TASK-008 | Depends on TASK-007. Run all inline cases in section 6, then real LLMCALL.py default and multi-file runs. Inspect repository operations, source hashes and final state/result. Fix workflow defects rather than application files manually. Record capacity/time pauses honestly. | Yes | 2026-10-18 |
+| TASK-009 | Depends on TASK-008. Update README.md with queries, static-analysis limits, cache/resume behavior and evidence. Mark this guide Completed only after acceptance passes. Preserve FEASIBILITY.md/history. No new CLI mode or dependency is required. | Yes | 2026-10-18 |
 
 ## 3. Alternatives
 
-- **ALT-001**: Give every agent unrestricted browsing. Rejected because it duplicates research and makes sources, cost and tool behavior hard to control.
-- **ALT-002**: Ask Researcher to answer from model memory with URLs. Rejected because remembered content is not retrieved current evidence.
-- **ALT-003**: Add research as independent generated graph nodes. Deferred; a conditional pre-Coder phase is enough and preserves current task IDs and graph semantics.
-- **ALT-004**: Build a general autonomous search loop, persistent knowledge base or browser crawler. Deferred; deterministic bounded retrieval and one summarization call are sufficient.
+- **ALT-001**: Recommended: one in-process AST index, JSON snapshots and literal metadata search backed by exact source reads. Fits existing serial orchestration and host state.
+- **ALT-002**: Reparse everything before every prompt. Defer to initial construction/cache recovery only; repeated full parsing and prompt injection waste resources.
+- **ALT-003**: Embeddings/vector database/LSP/type-driven call graphs. Defer until simpler search has measured shortcomings; these add dependencies and complexity beyond this milestone.
 
 ## 4. Dependencies
 
-- **DEP-001**: Milestone 12 TaskGraph, PlannedWorkflow, plan hashing and result verification.
-- **DEP-002**: Existing RoutingService, ChatRequest and JSON-schema validation for summarization; these do not supply external search.
-- **DEP-003**: Existing httpx plus a host-configured async search backend and controlled public-document fetch transport. Without these, required research is unavailable; local no-research tasks remain supported.
-- **DEP-004**: Existing CodingWorkflow/Reviewer handoff, workspace metadata storage, targeted repairs and local compile/execution gates.
+- **DEP-001**: Python >=3.11 ast/tokenize and existing guarded ProjectFiles/ArtifactFiles interfaces. No pyproject.toml package change.
+- **DEP-002**: ProjectWorkflow, schema-2 state, structured role validation, token admission and source/test/review hashes. Existing inline/live baselines remain valid.
 
 ## 5. Files
 
-- **FILE-001**: ntg/researcher_agent.py — new bounded retrieval orchestration, summarization and ResearchResult.
-- **FILE-002**: tools/research.py — new host-controlled retrieval interface and provenance capture.
-- **FILE-003**: ntg/types.py — task research questions and internal summary schema.
-- **FILE-004**: ntg/planner_agent.py and ntg/task_graph.py — research declaration and compatible validation.
-- **FILE-005**: ntg/planned_workflow.py — conditional research phase, metadata, failure propagation and verification.
-- **FILE-006**: ntg/coder_agent.py and ntg/reviewer_agent.py — evidence handling instructions/context only as needed; retain execution/repair contracts.
-- **FILE-007**: LLMCALL.py, ntg/__init__.py, README.md and guide.md — configuration, exports, reporting and validation record.
+- **FILE-001**: New ntg/repository.py: extraction, resolution, refresh, queries and snapshot validation.
+- **FILE-002**: ntg/project_workflow.py: candidate lifecycle, dispatch, bounded context metadata and host artifact references.
+- **FILE-003**: ntg/project_protocol.py, ntg/coder_agent.py and ntg/reviewer_agent.py: explicit read-only actions and relevant-source instructions.
+- **FILE-004**: ntg/project_state.py and ntg/__init__.py only if validation/public exports need additions. ntg/project.py remains authoritative for source operations; avoid unrelated legacy changes.
+- **FILE-005**: README.md and guide.md: usage/status/limits/evidence. LLMCALL.py uses the integrated workflow unchanged unless minimal reporting needs an addition.
 
 ## 6. Testing
 
-Use deterministic injected search/fetch/model doubles and temporary directories first. Real external requests must use an explicitly configured approved backend; do not mark fixture data as live retrieval. No permanent test files are required.
+Use inline Python harnesses and TemporaryDirectory fixtures; add no permanent test files. Injected responses verify orchestration; real provider runs separately verify model use.
 
-- **TEST-001**: Legacy and new empty-question plans perform zero search, fetch or Researcher model calls. Existing diamond scheduling, cumulative sibling preservation, compile/tests/review and final verification still pass.
-- **TEST-002**: Reject too many, duplicate, blank, nonstring and oversized questions. Verify legacy hash remains unchanged and explicit questions alter plan identity. Test direct TaskGraph construction as well as Planner parsing.
-- **TEST-003**: Required research calls Researcher once before Coder, passes compact verified findings to initial generation and every repair, and exposes reference evidence to Reviewer. Coder receives no raw page bodies or retrieval tools.
-- **TEST-004**: Reject invented source IDs, missing question coverage, empty findings, unresolved questions, oversized JSON, malformed output and model-supplied provenance fields. Recheck mutated report identity/content in final verification and artifact association.
-- **TEST-005**: Missing backend, no sources, rate limits, response timeout, summary timeout and metadata failure block Coder. Verify dependent graph tasks blocked, independent pending tasks cancelled, useful reasons persisted, no false final project and nonzero CLI exit.
-- **TEST-006**: Test private IPv4/IPv6, localhost, credentials, ports, non-HTTPS, hostname lookalikes, query secrets, redirects, DNS rebinding boundary, oversized/encoded bodies, binary types and streaming cutoff. No disallowed destination may be contacted; unsupported safe transport must fail closed.
-- **TEST-007**: Search/fetch counts, aggregate text, UTF-8 context bytes and the 60-second total are enforced even with slow readers or repeated candidates. Cancellation closes connections, unwinds the active task and propagates without orphan work.
-- **TEST-008**: Inject a document containing instructions to reveal credentials or write files. Verify roles have no such retrieval capabilities, prompts delimit data, the summary cannot contain executable tool actions, and workspace/code cannot be changed by research.
-- **TEST-009**: Persisted report timestamps, URLs and hashes must originate from actual host fetch records. No raw pages or secrets appear in task context/logs. Source failures and insufficient evidence remain visible; a citation is not treated as independent proof of factual correctness.
-- **TEST-010**: With an explicitly configured live backend, fetch at least one official technical document and produce a small source-linked report. Do not execute payment calls, use live Stripe credentials or claim Stripe integration was built. If live configuration is unavailable, record that limitation rather than claiming live success.
+- **TEST-001**: Extract top-level/nested/decorated/async functions, classes/methods, aliases/imports and calls. Assert ownership, unique IDs and exact source spans. Include non-ASCII code and valid encoding cookies.
+- **TEST-002**: Resolve two-module from arithmetic import add and package-relative/aliased imports. Shadowed names, dynamic/instance calls, wildcard imports and module collisions remain unresolved with reasons. Import cycles terminate deterministically.
+- **TEST-003**: Rename/edit a definition; old symbols/targets disappear and new records match hashes. Unchanged files are not reparsed. Remove tracked files and change local/external resolution through inventory changes; no stale edges survive.
+- **TEST-004**: Invalid syntax, invalid encoding and parser recursion failures produce diagnostics, not stale records. Other files stay searchable. py_compile still returns actual syntax failures to repairs. Partial index coverage cannot mark code correct.
+- **TEST-005**: Reject traversal, foreign paths, linked escapes, unknown files and untracked .env/metadata access. Indexing has no import side effects. Source/index text cannot grant edit rights or modify host artifacts.
+- **TEST-006**: Page over 1,000 synthetic functions/files without putting all records in a prompt. Verify stable sorting, response budgets, continuation, coverage, stale-cursor rejection and current revision. This tests indexing, not semantic success on 1,000 tasks.
+- **TEST-007**: Inject queries -> exact reads -> edit -> refreshed queries -> review. Metadata cannot bypass source inspection, stale hashes fail, candidate relationships stay separate until approval and rollback restores approved relationships. Reuse parse records across identical clones without mutable edge leakage.
+- **TEST-008**: Resume with valid/missing/stale/corrupt optional index caches. Existing schema-2 checkpoints work; derived caches rebuild. Tampered approved source or required approval/test artifacts remain rejected. Completed resume makes no new model calls.
+- **TEST-009**: Run python LLMCALL.py successfully with all existing default gates. Separately run a live goal creating arithmetic.py/add and app.py importing it and printing 5; explicitly request finding the definition and caller through repository queries before final review. Verify actual repo_search/repo_dependencies operations and current-hash source reads in artifacts, two source modules, correct execution and matching state/result/manifest identities. A green run without repository-query evidence does not prove this milestone. Resumption is allowed and must be disclosed.
+- **TEST-010**: Run system syntax checks and git diff --check; preserve legacy behavior through the existing injected baseline. Record fixture parsed-file/cache-reuse counts, result sizes and unresolved relationships. Never expose keys or credential-bearing requests.
+
+Completion requires all checks and live repository-query evidence. Change Planned -> In progress at implementation start, then Completed only after verification. API capacity failures leave live verification pending; fixtures alone cannot establish completion.
 
 ## 7. Risks & Assumptions
 
-- **RISK-001**: A Planner can omit needed questions or request unnecessary research. Instructions and validation establish a first explicit gate, not perfect semantic classification; record questions and improve from observed failures rather than add another classifier agent.
-- **RISK-002**: Official pages can be outdated, unavailable or contradictory. Record fetch times and versions where present, preserve open questions, and block insufficient required research.
-- **RISK-003**: Small summaries can omit detail, and citations can support a different claim than the model states. Keep questions narrow, preserve source links, and retain Reviewer/test gates; do not claim provenance alone proves correctness.
-- **RISK-004**: Research adds elapsed time and another failure boundary. Count it inside the existing overall deadline; do not increase repair counts or hide retrieval failures as application bugs.
-- **ASSUMPTION-001**: The first version continues to build standard-library single-file applications sequentially. Research is a capability addition, not authorization for SDK installation, paid services, browser actions or production integration.
-- **ASSUMPTION-002**: The host configures trusted documentation domains, backend access and safe transport. No paid search service or provider credential is selected automatically by this guide.
+- **RISK-001**: Python is dynamic. This index supplies syntactic evidence, not a precise runtime call graph or guaranteed semantic understanding. Unknown targets remain unknown.
+- **RISK-002**: Parsing needs memory for one source file. Surface parser/resource diagnostics and explicit partial coverage; do not truncate source before parsing. Avoid retrying the same failed hash repeatedly within a run. Catchable errors do not make catastrophic process memory exhaustion safe. Keep text search/source reads available.
+- **RISK-003**: Edits can invalidate relationships and cursors. Synchronize before queries and identify returned revisions/hashes. Metadata never authorizes a patch or approval by itself.
+- **RISK-004**: Extra metadata can waste context. Keep summaries bounded, page results and retain packet adaptation. Evaluate retrieval quality with actual tasks rather than assuming AST indexing guarantees better reasoning.
+- **ASSUMPTION-001**: Starting scope is the active tracked Python project. Importing an arbitrary existing checkout needs a separate host-controlled inventory policy; do not automatically crawl NTG or all workspaces.
+- **ASSUMPTION-002**: Existing agents, serial execution and local unsandboxed Python checks remain. Queries add no external research or shell access.
 
 ## 8. Related Specifications / Further Reading
 
-Local baseline references: ntg/planner_agent.py, ntg/task_graph.py, ntg/planned_workflow.py, ntg/coding_workflow.py, ntg/coder_agent.py, ntg/tester_agent.py, ntg/reviewer_agent.py, tools/registry.py and README.md.
+- [Adaptive implementation and verification](FEASIBILITY.md)
+- [Completed adaptive-workflow plan](plan/feature-adaptive-project-workflow-1.md)
+- [Current project workflow](ntg/project_workflow.py)
+- [Tracked source interface](ntg/project.py)
+- [Structured role protocol](ntg/project_protocol.py)
+- [Shared project state](ntg/project_state.py)
 
-This file replaces the prior completed Milestone 12 guide as the next-work specification. Milestone 13 is now implemented with the existing execution safeguards retained. The record below distinguishes deterministic checks, real retrieval, and model availability.
+The milestone is complete when agents can locate relevant code, inspect local relationships, retrieve exact source, change it safely and receive refreshed repository information without loading the entire codebase into each prompt.
 
-### Implementation and validation record — 17 October 2026
+## Implementation and verification record (2026-10-18)
 
-Added ResearcherAgent/ResearchResult, internal structured findings schema, backward-compatible research_questions validation, host-injected ResearchTools, public-IP-pinned TLS fetching, optional scheduler research gating, compact Coder/Reviewer evidence, persisted research reports and hashes, final report identity/content verification, and CLI research reporting. ResearchTools is not in the filesystem/model registry. No framework, provider subscription, permanent tests/examples or dependency was added.
+Implemented ntg/repository.py and exported RepositoryIndex from ntg. ProjectWorkflow owns candidate-aware index refresh, bounded queries and optional artifact references; STEP exposes read-only queries to Coder/Reviewer. Existing source-read, compile/test, review, task-graph and routing gates remain. No new dependency, service, agent, sandbox or permanent test file was added.
 
-Deterministic inline checks passed for legacy plan/hash preservation; invalid question rejection; empty-question skip; conditional one-time research; actual local compile/execution/review handoff; unordered diamond/source preservation; fabricated references, unresolved questions, oversized UTF-8 evidence and extra model fields; tampered report identity/content; unavailable backend; safe backend exception handling; research storage failure; dependency failure propagation; timeout and external cancellation with graph persistence. A real CodingWorkflow compile-failure/repair run reused identical research context and exact failure evidence, made no additional retrieval/model research calls, and passed final tests/review.
+Inline verification passed for extraction/locations, async/nested scopes, aliases and relative imports, parameter/pattern/attribute shadowing, ambiguous module/package names, import cycles, Unicode/encoding failures, parser recursion diagnostics, unchanged-hash reuse, edit/delete/syntax invalidation, candidate rollback, stale cursors, query response budgets, missing/corrupt cache recovery, source tamper rejection, actual Windows junction escape rejection, no import side effects, role action schemas and changed-range review enforcement. A 1,000-function fixture produced paginated bounded results; an unchanged five-file fixture reused all five files without reparsing. This measures indexing, not large-project semantic reliability. Legacy PlannedWorkflow also passed compile/execution/review and schema-1 persistence through injected responses.
 
-Mocked transport checks exercised public-address validation before connection, IP-pinned connection with original TLS hostname, disallowed redirects, URL credentials/query/port/host restrictions, body limits, binary/compressed/chunked/malformed rejection, script/style exclusion, host timestamps/content hashes and connection closure on cancellation. Request counts and aggregate text limits were checked using deterministic sources. Metadata and generated candidates stayed inside temporary directories and were cleaned up.
+Live multi-file run: workspaces/project_e735ec37fa2849b1824f110e65ceaf2e/result.json passed a one-task two-module project with real Planner/Coder/Reviewer responses. Final source project_3eb4d44868134fada4329a3464746b88 has revision e6a111dda9c07e35a2966e28d7abfdc7a6a2e9badef6c3a0a8cb47ddd7038e5f. The initial workflow used bounded source reads and did not itself choose repository queries. A subsequent explicit live Reviewer verification in the same host workflow requested repo_search and repo_dependencies, followed by exact reads of both modules; fresh compilation/execution passed. Persisted repository_query artifacts contain three search records and two dependency records, including app.py incoming references, all bound to the final revision. This was host-directed query verification, not evidence that models always choose queries autonomously. Completed resumption rebuilt the final parser-version index without new model calls and preserved source/result/state identities.
 
-Live smoke: an explicitly configured host-curated lookup returned the official Python __main__ documentation URL. The real controlled HTTPS fetch succeeded and produced bounded extracted text. The subsequent real routed model summary returned research_unavailable and a blocked/unverified result. Live model research completion is therefore not claimed. No production integration or payment request was executed. A general live search-service backend remains host-supplied through the documented injection interface, not bundled or guessed.
+Historical default expense-tracker project_ee0095a386724cc08db03a87d02f283b also resumed successfully with LLMCALL.py exit 0 and passed a fresh host integration check. Fresh default verification first exposed recursive scaffolding planning; Planner instructions now explicitly keep package initialization within concrete module leaves and restrict decomposition to the parent contract. A second fresh run paused on upstream invalid_request responses, then progressed after resumption. The run subsequently completed after resumption, including two focused repairs and final review. Capacity/safety limits were not bypassed, and generated application files were not edited manually.
 
-CLI configuration: ordinary python LLMCALL.py uses no backend and supports local no-research tasks. Applications can construct ResearchTools(search_backend, allowed_hosts), ResearcherAgent(shared_llm, tools), and PlannedWorkflow(planner, workflow, researcher=researcher). For embedding the existing demo, LLMCALL.main(researcher=researcher) accepts the configured role. Required research without a backend is deliberately blocked rather than replaced by model memory.
+
+Final default workflow verification: workspaces/project_d951217768894e98b312d6c71f9e06da/result.json is passed/verified; LLMCALL.py --resume exited 0 with T1 through T5 passed. Final source project_faa4ced5643a489b9bbaa8fbe05564b7 has revision bbe6425d8e772ac6dc28aa6e2879036b6a6646828b2ccdea378477128c60d9dd. A fresh host expense integration check passed. Completed resumption used zero model calls, validated approvals and preserved source/result/state revision agreement. The persisted index matches that source revision and reports two inventoried/parsed Python files with zero diagnostics. This was a recovered run, not uninterrupted first-attempt success. Earlier failed attempts remain available as evidence.
+
+The verification also exposed an evidence-retrieval inefficiency: small character reads of final-review artifacts could omit the actual issues. Such reads now include bounded, explicitly excerpted real review findings; an inline regression verified this without altering generated application code. The implementation retains unknown static relationships and explicit partial coverage rather than inventing dependencies or treating index metadata as correctness proof. All system files parsed and git diff --check passed. Milestone 15 is Completed.

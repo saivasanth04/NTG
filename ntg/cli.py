@@ -32,7 +32,7 @@ async def execute(args):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="NTG free-access routing")
+    parser = argparse.ArgumentParser(description="NTG multi-provider routing")
     parser.add_argument("--env", default=".env")
     parser.add_argument("--policy", default="policy.json")
     sub = parser.add_subparsers(dest="command", required=True)

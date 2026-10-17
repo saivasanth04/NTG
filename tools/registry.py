@@ -1,5 +1,5 @@
 """Validate model arguments and dispatch only the three bound operations."""
-from .filesystem import FilesystemTools, ToolError
+from .filesystem import ArtifactFiles, FilesystemTools, ToolError
 
 
 ERRORS = {
@@ -20,8 +20,9 @@ ERRORS = {
 
 
 class ToolRegistry:
-    def __init__(self, root):
-        filesystem = FilesystemTools(root)
+    def __init__(self, root, *, host_artifacts=False):
+        filesystem = ArtifactFiles(root) if host_artifacts else FilesystemTools(root)
+        self._host_artifacts = host_artifacts
         self._filesystem = filesystem
         self.tools = {
             "read_file": filesystem.read_file,
@@ -36,6 +37,20 @@ class ToolRegistry:
     def replace_file(self, path, content, expected_sha256):
         """Host-only source update; not registered as an LLM filesystem tool."""
         return self._filesystem.replace_file(path, content, expected_sha256)
+
+    def _artifacts(self):
+        if not self._host_artifacts:
+            raise ValueError("host_artifacts_required")
+        return self._filesystem
+
+    def write_json(self, path, data, expected_sha256=None):
+        return self._artifacts().write_json(path, data, expected_sha256)
+
+    def read_json(self, path):
+        return self._artifacts().read_json(path)
+
+    def file_sha256(self, path):
+        return self._artifacts().file_sha256(path)
 
     def describe(self):
         return [

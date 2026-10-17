@@ -13,7 +13,7 @@ class ReActAgent:
     RUN_TIMEOUT = 120
 
     def __init__(self, llm, tools, max_steps=10, *, name="react",
-                 system_prompt=None, max_tool_calls=None):
+                 system_prompt=None, max_tool_calls=None, model_class="general"):
         if type(max_steps) is not int or max_steps < 1:
             raise ValueError("max_steps must be a positive integer")
         if max_tool_calls is None:
@@ -29,6 +29,9 @@ class ReActAgent:
         if system_prompt is not None and (
                 not isinstance(system_prompt, str) or not system_prompt.strip()):
             raise ValueError("System prompt must be nonempty")
+        if model_class not in ("general", "fast", "reasoning", "coding"):
+            raise ValueError("invalid_model_class")
+        self.model_class = model_class
         self.llm, self.tools = llm, tools
         self.max_steps, self.max_tool_calls = max_steps, max_tool_calls
         self.name = name
@@ -87,7 +90,7 @@ class ReActAgent:
                     remaining = deadline - loop.time()
                     if remaining <= 0:
                         raise ValueError("agent_deadline_exceeded")
-                    response = await self.llm.chat(ChatRequest(
+                    response = await self.llm.chat(ChatRequest(model_class=self.model_class,
                         messages=messages,
                         max_tokens=2048,
                         deadline_seconds=min(120, remaining),

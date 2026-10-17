@@ -1,5 +1,6 @@
 """Small create-only filesystem operations; never execute generated code."""
 import os
+import json
 import hashlib
 import uuid
 import re
@@ -164,3 +165,85 @@ class FilesystemTools:
                     continue
                 entries.append({"name": entry.name, "type": kind})
         return {"path": self._relative(target), "entries": sorted(entries, key=lambda e: e["name"])}
+
+
+class ArtifactFiles(FilesystemTools):
+    """Host-only disk artifacts: streamed, atomic and independent of prompt budgets."""
+    MAX_BYTES = None
+    CHUNK_SIZE = 64 * 1024
+
+    def _regular(self, path):
+        target = self._resolve(path)
+        info = target.stat()
+        if not stat.S_ISREG(info.st_mode):
+            raise ToolError("not_a_file")
+        if info.st_nlink > 1:
+            raise ToolError("path_not_allowed")
+        return target
+
+    def file_sha256(self, path):
+        digest = hashlib.sha256()
+        with self._regular(path).open("rb") as stream:
+            for chunk in iter(lambda: stream.read(self.CHUNK_SIZE), b""):
+                digest.update(chunk)
+        self.validate_root()
+        return digest.hexdigest()
+
+    def read_json(self, path):
+        with self._regular(path).open("r", encoding="utf-8") as stream:
+            data = json.load(stream)
+        self.validate_root()
+        return data
+
+    def _atomic_write(self, path, pieces, expected_sha256=None):
+        target = self._resolve(path)
+        def unchanged():
+            if expected_sha256 is None:
+                if target.exists():
+                    raise FileExistsError(path)
+            elif self.file_sha256(path) != expected_sha256:
+                raise ToolError("source_changed")
+        unchanged()
+        temporary = target.with_name("ntg_artifact_" + uuid.uuid4().hex + ".tmp")
+        digest, written = hashlib.sha256(), 0
+        try:
+            with temporary.open("xb") as stream:
+                for piece in pieces:
+                    # iterencode may yield a large string value: bound UTF-8 buffers too.
+                    for offset in range(0, len(piece), self.CHUNK_SIZE):
+                        chunk = piece[offset:offset + self.CHUNK_SIZE].encode("utf-8")
+                        stream.write(chunk)
+                        digest.update(chunk)
+                        written += len(chunk)
+                stream.flush()
+                os.fsync(stream.fileno())
+            self.validate_root()
+            self._resolve(path)
+            unchanged()
+            if expected_sha256 is None:
+                # Atomic create-only publication: an existing artifact is never overwritten.
+                os.link(temporary, target)
+            else:
+                os.replace(temporary, target)
+        finally:
+            temporary.unlink(missing_ok=True)
+        return {"path": self._relative(target), "bytes_written": written, "sha256": digest.hexdigest()}
+
+    def write_json(self, path, data, expected_sha256=None):
+        encoder = json.JSONEncoder(ensure_ascii=False, indent=2, allow_nan=False)
+        return self._atomic_write(path, encoder.iterencode(data), expected_sha256)
+
+    def write_file(self, path, content):
+        if not isinstance(content, str):
+            raise ToolError("invalid_arguments")
+        return self._atomic_write(path, (content,))
+
+    def replace_file(self, path, content, expected_sha256):
+        return self._atomic_write(path, (content,), expected_sha256)
+
+    def read_file(self, path):
+        # Compatibility for host text captures; JSON and hashes use dedicated operations.
+        with self._regular(path).open("r", encoding="utf-8", newline="") as stream:
+            content = stream.read()
+        self.validate_root()
+        return {"path": path, "content": content}

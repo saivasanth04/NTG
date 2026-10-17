@@ -44,7 +44,7 @@ class ResearchResult:
     def verified(self):
         try:
             if (self.status != "completed" or self.reason is not None or self.open_questions
-                    or self.task_id not in {f"T{i}" for i in range(1, 7)}
+                    or not isinstance(self.task_id, str) or not re.fullmatch(r"T[1-9][0-9]*(?:\.[1-9][0-9]*)*", self.task_id)
                     or not re.fullmatch(r"[0-9a-f]{64}", self.plan_sha256)
                     or not isinstance(self.questions, list)
                     or not isinstance(self.sources, list)
@@ -88,7 +88,7 @@ class ResearcherAgent:
                 or set(task) not in ({"id", "description", "dependencies"},
                                      {"id", "description", "dependencies", "research_questions"})
                 or not isinstance(task.get("id"), str)
-                or task.get("id") not in {f"T{i}" for i in range(1, 7)}
+                or not re.fullmatch(r"T[1-9][0-9]*(?:\.[1-9][0-9]*)*", task["id"])
                 or not isinstance(task.get("dependencies"), list)
                 or not isinstance(plan_sha256, str)):
             raise ValueError("invalid_research_request")
@@ -132,7 +132,7 @@ class ResearcherAgent:
                         result.diagnostics.append("document_fetch_timeout_or_unavailable")
                 if not docs:
                     raise ResearchError("research_no_sources")
-                response = await self.llm.chat(ChatRequest(
+                response = await self.llm.chat(ChatRequest(model_class="fast",
                     messages=[{"role": "system", "content": (
                         "You are a read-only technical Researcher. Answer each question only from "
                         "the supplied retrieved documents. Return findings/open_questions JSON. "

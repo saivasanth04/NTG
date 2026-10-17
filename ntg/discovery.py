@@ -1,7 +1,5 @@
 """Explicit catalog refresh. Catalog presence never means usable quota or free access."""
-import asyncio
 import time
-from datetime import date
 from decimal import Decimal, InvalidOperation
 
 import httpx
@@ -55,8 +53,19 @@ async def list_models(client, account):
 def deployment(account, model, row, override):
     p = account.provider
     d = Deployment(account, model, listed=bool(row), checked_at=time.time())
+    # Advisory name hints rank models, never deny a provider/model an attempt.
+    name = model.casefold()
+    if any(tag in name for tag in ("coder", "code", "reasoning", "gpt-oss", "deepseek-r1", "qwq")):
+        d.model_classes.update({"coding", "reasoning"})
+    if any(tag in name for tag in ("flash", "lite", "mini", "small")):
+        d.model_classes.add("fast")
+    if any(tag in name for tag in ("safeguard", "moderation", "translate", "embedding", "rerank", "prompt-guard")):
+        # Still callable, but a product-family substring is not evidence of coding suitability.
+        d.model_classes.difference_update({"coding", "reasoning"})
     if row:
-        d.context = int(row.get("inputTokenLimit") or row.get("context_length") or row.get("context_window") or 0)
+        d.max_input = int(row.get("inputTokenLimit") or 0)
+        d.context = int(row.get("context_length") or row.get("context_window") or 0)
+        d.limit_source = "provider_catalog"
         d.max_output = int(row.get("outputTokenLimit") or row.get("top_provider", {}).get("max_completion_tokens") or 0)
         if p == "gemini":
             d.capabilities = {"chat"} if "generateContent" in row.get("supportedGenerationMethods", []) else set()
@@ -77,18 +86,23 @@ def deployment(account, model, row, override):
                 d.capabilities.add("json")
             if "structured_outputs" in params:
                 d.capabilities.add("json_schema")
-            # Explicit free variants only; exclude auto routers with opaque downstream capabilities.
+            # Informational pricing evidence only; never an inference admission gate.
             if model.endswith(":free") and zero_pricing(row.get("pricing")):
                 d.free, d.evidence = "verified", "OpenRouter catalog: explicit :free and all pricing fields zero"
     if override:
-        if not override.get("source") or not override.get("reviewed_on"):
-            raise ValueError("Model policy requires source and reviewed_on")
-        age = (date.today() - date.fromisoformat(override["reviewed_on"])).days
-        if age < 0 or age > 30:
-            return d  # stale operator evidence cannot broaden capabilities or eligibility
+        priority = override.get("priority", 0)
+        classes = override.get("model_classes", ["general"])
+        if (type(priority) is not int or not 0 <= priority <= 1000
+                or not isinstance(classes, list) or any(not isinstance(c, str) for c in classes)
+                or not set(classes) <= {"general", "fast", "reasoning", "coding"}):
+            raise ValueError("Invalid model routing metadata")
+        d.priority, d.model_classes = priority, set(classes)
         d.capabilities = set(override.get("capabilities", d.capabilities))
         d.context = int(override.get("context", d.context))
         d.max_output = int(override.get("max_output", d.max_output))
+        d.max_input = int(override.get("max_input", d.max_input))
+        d.limit_source = "operator_policy"
+        d.tokenizer_file = override.get("tokenizer_file")
         if p != "openrouter" and override.get("free_eligible") and account.free_verified:
             d.free, d.evidence = "verified", "operator verified free-only account and documented model policy"
     return d
@@ -107,12 +121,12 @@ async def discover(accounts, policy, client=None):
                 rows, status = [], "discovery_unavailable"
             lookup = {((r.get("name") if account.provider == "cloudflare" else r.get("id"))
                        or r.get("name", "")).removeprefix("models/"): r for r in rows}
-            names = account.models or list(lookup)
+            names = list(dict.fromkeys([*account.models, *lookup]))
             for model in names:
                 override = policy.get("models", {}).get(f"{account.provider}/{model}", {})
                 d = deployment(account, model, lookup.get(model), override)
-                # Explicit configuration can work without listing, but needs documented policy.
-                if d.listed or override:
+                # Explicit configuration remains attemptable even if catalog discovery fails.
+                if d.listed or override or model in account.models:
                     deployments.append(d)
             quota = {"status": "unknown"}
             if account.provider == "openrouter":
@@ -128,8 +142,10 @@ async def discover(accounts, policy, client=None):
                         if daily.get("remaining") == 0:
                             # Reset time is not guaranteed by this endpoint; do not invent capacity.
                             for item in deployments:
-                                if item.account.alias == account.alias:
-                                    item.available_after = time.time() + 3600
+                                if item.account is account and item.model.endswith(":free"):
+                                    # Recent observation, not an invented daily reset time.
+                                    item.available_after = time.time() + 60
+                                    item.available_reason = "quota_exhausted"
                     else:
                         quota = {"status": f"http_{response.status_code}"}
                 except (httpx.HTTPError, ValueError):

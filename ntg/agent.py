@@ -20,13 +20,16 @@ class Agent:
     MAX_STEPS = 6
     RUN_TIMEOUT = 120
 
-    def __init__(self, name, system_prompt, llm, *, tools=None, max_tokens=2048):
+    def __init__(self, name, system_prompt, llm, *, tools=None, max_tokens=2048, model_class="general"):
         if not isinstance(name, str) or not name.strip():
             raise ValueError("Agent name must be nonempty")
         if not isinstance(system_prompt, str) or not system_prompt.strip():
             raise ValueError("System prompt must be nonempty")
         if type(max_tokens) is not int or not 1 <= max_tokens <= 32768:
             raise ValueError("max_tokens must be an integer from 1 through 32768")
+        if model_class not in ("general", "fast", "reasoning", "coding"):
+            raise ValueError("invalid_model_class")
+        self.model_class = model_class
         self.max_tokens = max_tokens
         self.name = name
         self.system_prompt = system_prompt
@@ -49,7 +52,7 @@ class Agent:
                 {"role": "system", "content": self.system_prompt},
                 {"role": "user", "content": user_input},
             ],
-            max_tokens=self.max_tokens,
+            max_tokens=self.max_tokens, model_class=self.model_class,
             deadline_seconds=120,
         ))
 
@@ -84,7 +87,7 @@ class Agent:
         agent = ReActAgent(
             self.llm, self.tools, max_steps=self.MAX_STEPS,
             name=self.name, system_prompt=self.system_prompt,
-            max_tool_calls=self.MAX_TOOL_CALLS,
+            max_tool_calls=self.MAX_TOOL_CALLS, model_class=self.model_class,
         )
         agent.RUN_TIMEOUT = self.RUN_TIMEOUT
         return await agent.run(task, context)

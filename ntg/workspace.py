@@ -13,6 +13,12 @@ class Workspace:
     path: Path
     tools: ToolRegistry
 
+    @property
+    def artifacts(self):
+        """Host report storage; never passed to agents or registered model tools."""
+        self.tools.validate_workspace()
+        return ToolRegistry(self.path, host_artifacts=True)
+
 
 class WorkspaceManager:
     def __init__(self, base):
@@ -27,6 +33,18 @@ class WorkspaceManager:
             self._base_guard = FilesystemTools(base)
         except (OSError, ToolError) as exc:
             raise ValueError("workspace_unavailable") from exc
+
+    def open(self, project_id):
+        """Reopen a specifically selected workspace for validated checkpoint restoration."""
+        import re
+        if not isinstance(project_id, str) or not re.fullmatch(r"project_[0-9a-f]{32}", project_id):
+            raise ValueError("invalid_project_id")
+        base = self._base_guard.validate_root()
+        path = base / project_id
+        guard = FilesystemTools(path)
+        if guard.root.parent != base:
+            raise ValueError("workspace_unavailable")
+        return Workspace(project_id, guard.root, ToolRegistry(guard.root))
 
     def create(self):
         try:

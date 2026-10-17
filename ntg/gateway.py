@@ -64,7 +64,7 @@ def create_app(service=None, token=None):
     async def models(request: Request):
         return {"object": "list", "data": [{"id": "auto", "object": "model", "owned_by": "ntg"}] + [
             {"id": d.id, "object": "model", "owned_by": d.account.provider}
-            for d in request.app.state.router.deployments if d.free == "verified"]}
+            for d in request.app.state.router.deployments]}
 
     @app.post("/v1/chat/completions", dependencies=[Depends(authenticate)])
     async def chat(body: ChatRequest, request: Request):

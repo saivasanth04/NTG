@@ -96,14 +96,14 @@ class TesterAgent:
     RUN_TIMEOUT = 20
     OUTPUT_LIMIT = 32768
 
-    def __init__(self, llm=None, entrypoint="calculator.py", *, checks=None):
+    def __init__(self, llm=None, entrypoint="calculator.py", *, checks=None, project_mode=False):
         # Keep llm for API compatibility. Diagnosis deliberately uses no LLM.
         self.llm = llm
         self.entrypoint = validate_entrypoint(entrypoint)
         selected = checks if checks is not None else [
             {"name": "startup", "arguments": [], "exit_code": 0, "stdout_contains": []},
         ]
-        if not isinstance(selected, list) or not 1 <= len(selected) <= 8:
+        if not isinstance(selected, list) or not selected or (not project_mode and len(selected) > 8):
             raise ValueError("invalid_checks")
         self.checks = []
         for check in selected:
@@ -182,25 +182,33 @@ class TesterAgent:
             evidence.stderr = buffers[1].decode("utf-8", "replace")
             evidence.duration_ms = round((time.monotonic() - started) * 1000, 2)
 
-    async def run(self, workspace, specification):
+    async def run(self, workspace, specification, *, stage_hook=None):
         try:
             root, source, digest = self._source(workspace)
         except ValueError as exc:
             return TestReport(workspace.project_id, "", "blocked", None, str(exc),
                               failure_type="infrastructure")
+        if isinstance(specification, dict) and specification != {
+                "entrypoint": self.entrypoint, "source_sha256": digest}:
+            return TestReport(workspace.project_id, digest, "blocked", None,
+                              "test_artifact_mismatch", failure_type="infrastructure")
         target = str(root / self.entrypoint)
+        if stage_hook:
+            stage_hook("compiling")
         with tempfile.TemporaryDirectory(prefix="ntg_compile_") as cache:
             compilation = ExecutionEvidence(workspace.project_id, digest, [
-                sys.executable, "-B", "-X", f"pycache_prefix={cache}",
+                sys.executable, "-B", "-X", "utf8", "-X", f"pycache_prefix={cache}",
                 "-m", "py_compile", target,
             ])
             await self._execute(root, compilation)
         report = TestReport(workspace.project_id, digest, "failed", None, "",
                             compilation=compilation)
         if compilation.passed:
+            if stage_hook:
+                stage_hook("testing")
             for check in self.checks:
                 evidence = ExecutionEvidence(workspace.project_id, digest,
-                                             [sys.executable, "-B", target, *check["arguments"]])
+                                             [sys.executable, "-B", "-X", "utf8", target, *check["arguments"]])
                 await self._execute(root, evidence)
                 if report.program is None:
                     report.program = evidence
@@ -291,3 +299,55 @@ class TesterAgent:
     def _context(source, line):
         return "\n".join(f"{i+1}: {text}" for i, text in enumerate(source.splitlines())
                          if max(0, line-4) <= i < line+3)
+
+
+    async def test_project(self, project, checks=None):
+        """Run each full check sequence in a disposable filesystem copy, not approved data."""
+        from .workspace import WorkspaceManager
+        before = project.manifest(refresh=True)
+        with tempfile.TemporaryDirectory(prefix="ntg_check_project_") as temporary:
+            clone = project.clone_to(WorkspaceManager(__import__("pathlib").Path(temporary) / "workspaces").create())
+            report = await self._test_project_in_place(clone, checks)
+        if before != project.manifest(refresh=True):
+            raise ValueError("test_artifact_mismatch")
+        report["source_project_id"] = project.workspace.project_id
+        return report
+
+    async def _test_project_in_place(self, project, checks=None):
+        """Compile every tracked Python module, then run host-validated CLI checks."""
+        from .project import ProjectFiles
+        project.verify_python_inventory()
+        before = project.manifest(refresh=True)
+        revision = ProjectFiles.revision(before)
+        outputs, failed = [], False
+        with tempfile.TemporaryDirectory(prefix="ntg_project_compile_") as cache:
+            for path in sorted(p for p in before if p.endswith(".py")):
+                evidence = ExecutionEvidence(project.workspace.project_id, revision,
+                    [sys.executable, "-B", "-X", "utf8", "-X", f"pycache_prefix={cache}",
+                     "-m", "py_compile", str(project.files._regular(path))])
+                await self._execute(project.workspace.path, evidence)
+                outputs.append({"name": "compile:" + path, "passed": evidence.passed, **asdict(evidence)})
+                if not evidence.passed:
+                    failed = True
+                    break
+        if not failed:
+            selected = self.describe_checks() if checks is None else checks
+            validated = []
+            for offset in range(0, len(selected), 8):
+                validated.extend(TesterAgent(entrypoint=self.entrypoint, checks=selected[offset:offset+8]).checks)
+            for check in validated:
+                evidence = ExecutionEvidence(project.workspace.project_id, revision,
+                    [sys.executable, "-B", "-X", "utf8", str(project.files._regular(self.entrypoint)), *check["arguments"]])
+                await self._execute(project.workspace.path, evidence)
+                matches_exit = (evidence.exit_code is not None and evidence.exit_code != 0
+                                if check["exit_code"] == -1 else evidence.exit_code == check["exit_code"])
+                passed = (matches_exit and not evidence.infrastructure_error and not evidence.timed_out
+                          and not evidence.output_limited and all(t in evidence.stdout for t in check["stdout_contains"]))
+                outputs.append({"name": check["name"], "passed": passed, **asdict(evidence)})
+                failed |= not passed
+        project.verify_python_inventory()
+        after = project.manifest(refresh=True)
+        if any(after.get(path) != sha for path, sha in before.items() if path not in project.runtime_paths):
+            raise ValueError("test_artifact_mismatch")
+        return {"status": "failed" if failed else "passed", "project_revision": revision,
+                "coverage": "compile_and_cli" if checks is None or checks else "compile_only", "checks": outputs}
