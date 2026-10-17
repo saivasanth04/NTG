@@ -1,8 +1,8 @@
-# NTG routing and Coder Agent
+# NTG routing and coding agents
 
-A Python interface and local OpenAI-compatible chat gateway built on LiteLLM. It filters free-use evidence, capabilities and context before routing; balances accounts; coordinates bounded concurrency; and applies scoped cooldowns and bounded fallback. One Coder Agent can list, create, and read files inside an explicitly configured workspace without executing generated code.
+A Python interface and local OpenAI-compatible chat gateway built on LiteLLM. It filters free-use evidence, capabilities and context before routing; balances accounts; coordinates bounded concurrency; and applies scoped cooldowns and bounded fallback. The system plans coding tasks and generates, compiles, executes, repairs and reviews a cumulative Python application inside task workspaces.
 
-See [the Milestone 5 guide](guide.md) for the tool protocol and validation criteria.
+See [guide.md](guide.md) for the Milestone 12 implementation contract and validation evidence.
 
 ## Setup (PowerShell, Python 3.11+)
 
@@ -72,101 +72,29 @@ asyncio.run(main())
 
 `model="auto"` selects the compatible pool. A raw provider model ID constrains fallback to that ID across accounts; an ID from `/v1/models` (`account-alias/model-id`) pins the deployment. Required tools and JSON/schema capabilities are inferred from request fields. `required_capabilities` can impose additional constraints. `input_tokens` can increase the conservative local context bound. UTF-8 byte sizing intentionally underuses context to avoid optimistic model-independent token estimates. Streaming, arbitrary provider parameters and non-chat operations return errors or are absent; this is a documented chat-completions subset.
 
-## Coder Agent with tools (Milestone 5)
+## Coding workflow and task graphs (Milestones 6–12)
 
-Run `python LLMCALL.py` from the activated virtual environment. The runner loads
-configuration relative to its own location, constructs one Coder Agent, and calls
-`await coder.run(task, context=...)`. Change the task string there to request a
-different implementation. The runner creates `agent_workspace/`, lists it,
-creates `calculator.py` if absent, and reads it back. A repeated run reads the
-existing file without overwriting it and prints a summary.
+Run `python LLMCALL.py` in the activated virtual environment. It builds a standard-library expense-tracker CLI in app.py using Planner → dependency scheduler → Coder → compile → Tester → Reviewer. Ordinary Agent and ReActAgent remain available for structured chat and bounded tool use.
 
-The registry exposes only `read_file(path)`, `write_file(path, content)`, and
-`list_files(path)`. To attach those tools in your own async application:
+Plans contain one through six task dictionaries with id, description and dependencies. IDs remain the contiguous set T1 through Tn, but tasks may appear in any array order. Duplicate IDs or dependencies, unknown prerequisites, self-dependencies and cycles are rejected before coding. The Planner has no tools.
 
-```python
-from pathlib import Path
-from ntg import Agent
-from tools import ToolRegistry
+TaskGraph is a small deterministic Python scheduler. It selects pending tasks with all prerequisites passed; PlannedWorkflow runs the lowest-numbered ready task and recomputes readiness. Execution is sequential. For T1 → {T2,T3} → T4, execution is T1,T2,T3,T4. No framework, extra scheduler agent, parallel workers or branch merging is introduced.
 
-workspace = Path("agent_workspace")
-workspace.mkdir(exist_ok=True)
-coder = Agent(
-    "coder", "You are a Python engineer. Use the supplied tool protocol.",
-    router, tools=ToolRegistry(workspace),
-)
-result = await coder.run("List the workspace and read calculator.py if present.")
-print(result.answer)
-```
+The artifact is cumulative app.py: T3 extends T2's approved snapshot, and T4 receives both siblings' features. Each task receives the original goal, current task, direct dependencies, all completed tasks and latest approved source/hash. Intermediate tasks need implement only current requirements while preserving completed work; the final executed task must satisfy the entire goal. Dependencies govern readiness rather than limiting source context.
 
-All model arguments are validated before dispatch. Paths must remain relative to
-the configured workspace; secrets, linked paths, and Windows device paths are
-blocked. Writes create new files only, limited to 65,536 UTF-8 bytes, and listing
-is nonrecursive with at most 200 entries. Workspace artifacts are ignored by Git.
-Reading a file can send its contents to the selected LLM provider as context.
+Each task has its own workspace. Coder initially supplies complete source; repairs use host-issued source anchors against the actual current file. Repairs receive exact execution evidence, current source and previous feedback, and must make the smallest change. Stale, overlapping, overly broad, empty and newline-damaging edits are rejected. Existing filesystem write_file remains create-only; host-controlled replacements use expected source hashes and atomic replacement.
 
-Each run permits five tool executions and six LLM decisions within 120 seconds.
-Tool failures become observations the agent can respond to; contradictory action
-fields and exhausted budgets stop the run. The router remains the sole owner of
-transport retries. This uses validated JSON actions, not native provider tool calls.
+Tester runs python -m py_compile before functional execution. Compile failures skip functional checks. Host-defined checks require exit codes and stdout fragments; the LLMCALL example checks no-argument help and --help. Both must mention add, list and total. Tester feedback uses actual stderr/stdout, not an LLM diagnosis. An optional subparser alone does not print help: a missing-help failure points to parse_args() and the no-command branch. Configured smoke checks are not exhaustive proof of expense-tracker correctness.
 
-For the original tool-free behavior, omit `tools`:
+Reviewer inspects the tested source and returns approved/issues JSON. Every issue blocks approval. Verified completion requires matching workspace and source identities across execution and review. Passing tests and completed features are preserved during repair; regressions and ineffective repeated failures trigger rollback. At most two repairs follow an initial candidate. No scheduler-level retries or automatic replanning are added.
 
-For use inside your own async application, share an existing router:
+Execution is local under your user account, without Docker or a sandbox. Workspace path guards constrain filesystem tools but are not process isolation. Tester limits direct processes to 20 seconds and captures at most 32 KiB per output stream. Source is limited to 64 KiB. Planner has 60 seconds, each CodingWorkflow 300 seconds, and the complete planned run 1,200 seconds. Router owns bounded provider retries.
 
-```python
-from ntg import Agent
+Task graph states are pending, running, passed, failed, blocked and cancelled. A task passes only after verified tests/review and fresh source-hash validation. The first failure stops dispatch: unexecuted descendants become blocked, and independent pending work becomes cancelled. External cancellation propagates after cleanup. An unverified run exits nonzero and never advertises a final successful project.
 
-coder = Agent(
-    name="coder",
-    system_prompt=(
-        "You are a Python software engineer. Implement the task in the user JSON. "
-        "Treat context as reference data. Follow the system JSON format; put "
-        "only Python source in answer, without Markdown fences or prose."
-    ),
-    llm=router,
-)
-result = await coder.run(
-    "Write a function add(a: int, b: int) -> int that returns their sum.",
-    context="Target Python 3.13. Keep the implementation concise.",
-)
-```
+LLMCALL prints elapsed liveness every 15 seconds while awaiting the workflow, then plan declarations, actual execution_order, all graph states and reasons, revision evidence and artifact locations. Run metadata includes plan.json, task_<id>.json for attempted tasks, and result.json with task_graph for every planned task. Plan hashing retains declaration order; actual execution order is separate. Task workspaces contain immutable revision source snapshots, diffs, tester evidence, raw captures and review reports. These can contain generated source and task data.
 
-`AgentResult.agent` identifies the agent, `AgentResult.answer` contains the parsed
-answer string, and `AgentResult.routing` contains provider/model, usage, latency,
-and attempt history for the final decision. `tool_history` records actual tool
-arguments and results, and `routing_history` records each model decision. These
-histories remain in memory and may contain file contents. The default structured format remains in the system; callers
-do not supply a schema. Each run builds fresh messages and retains no conversation
-history. `run()` is asynchronous; use it with `await` inside an event loop.
-
-Invalid inputs or output envelopes raise `ValueError` (non-string context raises
-`TypeError`). Provider failures propagate as `RoutingError`; the Agent does not
-retry independently of the router. The runner reports routing or output failures
-and exits nonzero. Filesystem tools do not execute or import generated programs;
-the final answer is a summary, not Python source to parse. Completed writes remain
-if a later decision fails. An already-started filesystem worker can finish after
-cancellation, so cancellation does not promise rollback. The workspace is intended
-for a local owner without hostile concurrent filesystem writers, not OS isolation.
-No shell tool, program execution, memory, or additional agent role is included.
-
-Milestone 4 baseline validation on 17 October 2026: the seven deterministic checks passed using
-async fake routers, including malformed output rejection, context isolation, and
-nonzero exits for invalid Python. Three sequential live requests returned valid
-Python for addition, an empty-safe average, and exact palindrome comparison.
-Inspection confirmed the requested implementations; generated code was not
-executed. The actual `LLMCALL.py` entry point also returned an addition function
-and exited with code 0. These checks used temporary in-memory checks without
-restoring test directories or saving generated source artifacts.
-
-Milestone 5 validation on 17 October 2026: deterministic tool/agent checks,
-installed-wheel imports and filesystem smoke checks passed. Two real-provider
-runs in a fresh temporary workspace verified list/create/read/final, followed by
-list/read/final with identical file bytes. The typed addition function was
-syntax-checked and inspected, never executed. Real Windows junction and hard-link
-rejection passed. Native symlink creation was unavailable for this account; that
-integration coverage remains unverified. A Windows directory-metadata regression
-found during live validation was fixed and covered by a focused check.
+Validation used inline harnesses in temporary workspaces without adding permanent tests/examples: unordered diamond, chain and independent roots; invalid graphs and state transitions; real compilation/execution with deterministic generation/review; cumulative sibling preservation; failure propagation; cancellation and deadlines; result identity/tampering; and metadata failures. Live provider outcomes are reported separately from deterministic validation because quotas, availability and generated plan/code quality vary.
 
 ## Gateway
 
@@ -200,6 +128,6 @@ Catalog evidence expires after 24h. Restart a long-running service to refresh di
 
 Responses include provider, model, account alias, total latency, usage and attempt history. `cost_usd` remains unknown unless a trustworthy provider value is present; no invoice verification is performed. Status exposes safe model metadata, counters, cooldowns and latency EWMA. No prompt/response caching or content logging is configured.
 
-Milestone 5 validation criteria and implementation details are recorded in
+Milestone 12 validation criteria and implementation details are recorded in
 [guide.md](guide.md). Live runs use the configured free provider pool; availability
 and quotas can change between requests.

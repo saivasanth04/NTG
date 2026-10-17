@@ -1,6 +1,17 @@
 """Free-access routing and stateless agents with optional workspace tools."""
+from .task_graph import TaskGraph
 from .agent import Agent, AgentResult
 from .engine import RoutingService
+from .react_agent import ReActAgent
 from .types import ChatRequest, RoutingError
+from .workspace import Workspace, WorkspaceManager
+from .coder_agent import CoderAgent
+from .tester_agent import TesterAgent, TestReport, ExecutionEvidence
+from .reviewer_agent import ReviewerAgent, ReviewReport
+from .planner_agent import PlannerAgent, PlanResult
+from .planned_workflow import PlannedWorkflow, PlannedResult
+from .coding_workflow import CodingWorkflow, WorkflowResult
 
-__all__ = ["RoutingService", "ChatRequest", "RoutingError", "Agent", "AgentResult"]
+__all__ = ["TaskGraph", "RoutingService", "ChatRequest", "RoutingError", "Agent", "AgentResult", "ReActAgent",
+           "Workspace", "WorkspaceManager", "CoderAgent", "TesterAgent", "TestReport",
+           "ReviewerAgent", "ReviewReport", "PlannerAgent", "PlanResult", "PlannedWorkflow", "PlannedResult", "ExecutionEvidence", "CodingWorkflow", "WorkflowResult"]

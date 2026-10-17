@@ -6,6 +6,7 @@ ERRORS = {
     "unknown_tool": "Unknown tool",
     "invalid_arguments": "Invalid tool arguments",
     "path_not_allowed": "Path is not allowed",
+    "workspace_unavailable": "Workspace is unavailable",
     "not_found": "Path does not exist",
     "already_exists": "Target already exists",
     "not_a_file": "Path is not a regular file",
@@ -21,11 +22,20 @@ ERRORS = {
 class ToolRegistry:
     def __init__(self, root):
         filesystem = FilesystemTools(root)
+        self._filesystem = filesystem
         self.tools = {
             "read_file": filesystem.read_file,
             "write_file": filesystem.write_file,
             "list_files": filesystem.list_files,
         }
+
+    def validate_workspace(self):
+        """Host-only identity check; deliberately absent from the model allowlist."""
+        return self._filesystem.validate_root()
+
+    def replace_file(self, path, content, expected_sha256):
+        """Host-only source update; not registered as an LLM filesystem tool."""
+        return self._filesystem.replace_file(path, content, expected_sha256)
 
     def describe(self):
         return [

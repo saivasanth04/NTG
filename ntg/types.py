@@ -85,6 +85,82 @@ def tool_response_format():
         },
     }
 
+def review_response_format(entrypoint="calculator.py"):
+    from .project import validate_entrypoint
+    entrypoint = validate_entrypoint(entrypoint)
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "ntg_review", "strict": True,
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "approved": {"type": "boolean"},
+                    "issues": {
+                        "type": "array", "maxItems": 20,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "severity": {"type": "string", "enum": ["high", "medium", "low"]},
+                                "file": {"type": "string", "enum": [entrypoint]},
+                                "description": {"type": "string", "minLength": 1, "maxLength": 1000},
+                            },
+                            "required": ["severity", "file", "description"],
+                            "additionalProperties": False,
+                        },
+                    },
+                },
+                "required": ["approved", "issues"],
+                "additionalProperties": False,
+            },
+        },
+    }
+
+
+def repair_response_format(anchor_ids):
+    return {
+        "type": "json_schema",
+        "json_schema": {"name": "ntg_repair", "strict": True, "schema": {
+            "type": "object", "properties": {"edits": {
+                "type": "array", "minItems": 1, "maxItems": 8,
+                "items": {"type": "object", "properties": {
+                    "anchor": {"type": "string", "enum": list(anchor_ids)},
+                    "new": {"type": "string"},
+                }, "required": ["anchor", "new"], "additionalProperties": False},
+            }}, "required": ["edits"], "additionalProperties": False,
+        }},
+    }
+
+
+def plan_response_format():
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "ntg_plan", "strict": True,
+            "schema": {
+                "type": "object",
+                "properties": {"tasks": {
+                    "type": "array", "minItems": 1, "maxItems": 6,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "id": {"type": "string", "pattern": "^T[1-6]$"},
+                            "description": {"type": "string", "minLength": 1, "maxLength": 2000},
+                            "dependencies": {
+                                "type": "array", "maxItems": 5,
+                                "items": {"type": "string", "pattern": "^T[1-6]$"},
+                            },
+                        },
+                        "required": ["id", "description", "dependencies"],
+                        "additionalProperties": False,
+                    },
+                }},
+                "required": ["tasks"], "additionalProperties": False,
+            },
+        },
+    }
+
+
 class ChatRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     model: str = "auto"

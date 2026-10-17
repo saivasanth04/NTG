@@ -1,5 +1,7 @@
 """Small create-only filesystem operations; never execute generated code."""
 import os
+import hashlib
+import uuid
 import re
 import stat
 from pathlib import Path, PureWindowsPath
@@ -16,10 +18,33 @@ class FilesystemTools:
     MAX_ENTRIES = 200
 
     def __init__(self, root):
-        root = Path(root).absolute()
-        if self._linked(root.lstat()) or not root.is_dir():
-            raise ValueError("Workspace must be an existing unlinked directory")
-        self.root = root.resolve(strict=True)
+        try:
+            root = Path(root).absolute()
+            info = root.lstat()
+            if self._linked(info) or not stat.S_ISDIR(info.st_mode):
+                raise ToolError("workspace_unavailable")
+            self._root = root.resolve(strict=True)
+            info = self._root.lstat()
+            self._root_identity = (info.st_dev, info.st_ino)
+            self.validate_root()
+        except (OSError, RuntimeError) as exc:
+            raise ToolError("workspace_unavailable") from exc
+
+    @property
+    def root(self):
+        return self._root
+
+    def validate_root(self):
+        """Fail closed if the bound directory was removed, replaced or redirected."""
+        try:
+            info = self.root.lstat()
+            if (self._linked(info) or not stat.S_ISDIR(info.st_mode)
+                    or (info.st_dev, info.st_ino) != self._root_identity
+                    or self.root.resolve(strict=True) != self.root):
+                raise ToolError("workspace_unavailable")
+        except (OSError, RuntimeError) as exc:
+            raise ToolError("workspace_unavailable") from exc
+        return self.root
 
     @staticmethod
     def _linked(info):
@@ -40,6 +65,7 @@ class FilesystemTools:
     def _resolve(self, path, *, allow_root=False):
         if not isinstance(path, str) or not path or len(path) > 240:
             raise ToolError("invalid_arguments")
+        self.validate_root()
         if path == "." and allow_root:
             return self.root
         windows = PureWindowsPath(path)
@@ -90,6 +116,29 @@ class FilesystemTools:
         with target.open("xb") as stream:
             written = stream.write(encoded)
         return {"path": self._relative(target), "bytes_written": written}
+
+    def replace_file(self, path, content, expected_sha256):
+        """Host-only atomic update of an existing, hash-checked regular file."""
+        target = self._resolve(path)
+        encoded = content.encode("utf-8")
+        if len(encoded) > self.MAX_BYTES:
+            raise ToolError("too_large")
+        def unchanged():
+            current = self.read_file(path)["content"].encode("utf-8")
+            if hashlib.sha256(current).hexdigest() != expected_sha256:
+                raise ToolError("source_changed")
+        unchanged()
+        temporary = target.with_name("ntg_repair_" + uuid.uuid4().hex + ".tmp")
+        try:
+            with temporary.open("xb") as stream:
+                stream.write(encoded)
+            self.validate_root()
+            unchanged()
+            os.replace(temporary, target)
+        finally:
+            self.validate_root()
+            temporary.unlink(missing_ok=True)
+        return {"path": self._relative(target), "bytes_written": len(encoded)}
 
     def list_files(self, path):
         target = self._resolve(path, allow_root=True)
