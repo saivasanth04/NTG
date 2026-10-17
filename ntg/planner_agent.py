@@ -13,7 +13,13 @@ from .task_graph import TaskGraph
 
 def validate_plan(tasks):
     try:
-        jsonschema.validate({"tasks": tasks}, plan_response_format()["json_schema"]["schema"])
+        # Normalize only a copy for the new provider schema; preserve legacy hashes.
+        normalized = deepcopy(tasks)
+        if isinstance(normalized, list):
+            for task in normalized:
+                if isinstance(task, dict):
+                    task.setdefault("research_questions", [])
+        jsonschema.validate({"tasks": normalized}, plan_response_format()["json_schema"]["schema"])
         TaskGraph(tasks)
         return deepcopy(tasks)
     except (ValueError, TypeError, KeyError, jsonschema.ValidationError) as exc:
@@ -76,6 +82,10 @@ class PlannerAgent:
         "the required tasks JSON. IDs must be contiguous T1, T2, etc. as a set; tasks may "
         "appear in any order. Dependencies name actual prerequisites and must form an "
         "acyclic graph. Allow independent roots, branches and joins where appropriate. "
+        "Each task includes research_questions: zero to three narrow public technical "
+        "documentation questions needed for current external API/version facts. Use [] "
+        "for ordinary local standard-library tasks; do not research arithmetic or argparse. "
+        "Research does not authorize SDK installs or tasks beyond this application scope. "
         "Each description states an implementable change and "
         "observable completion condition. Each task must yield a runnable cumulative "
         "app.py snapshot, preserving completed features; no arguments must exit promptly "

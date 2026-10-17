@@ -146,12 +146,14 @@ def plan_response_format():
                         "properties": {
                             "id": {"type": "string", "pattern": "^T[1-6]$"},
                             "description": {"type": "string", "minLength": 1, "maxLength": 2000},
+                            "research_questions": {"type": "array", "maxItems": 3, "uniqueItems": True,
+                                "items": {"type": "string", "minLength": 1, "maxLength": 300}},
                             "dependencies": {
                                 "type": "array", "maxItems": 5,
                                 "items": {"type": "string", "pattern": "^T[1-6]$"},
                             },
                         },
-                        "required": ["id", "description", "dependencies"],
+                        "required": ["id", "description", "dependencies", "research_questions"],
                         "additionalProperties": False,
                     },
                 }},
@@ -190,3 +192,23 @@ class RoutingError(Exception):
     def public(self):
         return {"error": {"message": self.code.replace("_", " "), "type": "routing_error",
                           "code": self.code}, "routing": {"history": self.history}}
+
+
+def research_response_format():
+    return {"type": "json_schema", "json_schema": {
+        "name": "ntg_research", "strict": True, "schema": {
+            "type": "object", "additionalProperties": False,
+            "required": ["findings", "open_questions"],
+            "properties": {
+                "findings": {"type": "array", "maxItems": 6, "items": {
+                    "type": "object", "additionalProperties": False,
+                    "required": ["question_index", "summary", "source_ids"],
+                    "properties": {
+                        "question_index": {"type": "integer", "minimum": 0, "maximum": 2},
+                        "summary": {"type": "string", "minLength": 1, "maxLength": 600},
+                        "source_ids": {"type": "array", "minItems": 1, "maxItems": 3,
+                                       "uniqueItems": True, "items": {"type": "string", "enum": ["S1", "S2", "S3"]}},
+                    }}},
+                "open_questions": {"type": "array", "maxItems": 3,
+                                   "items": {"type": "string", "minLength": 1, "maxLength": 300}},
+            }}}}

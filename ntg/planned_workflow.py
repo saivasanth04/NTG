@@ -8,6 +8,7 @@ from .coding_workflow import WorkflowResult
 from .planner_agent import PlanResult
 from .types import RoutingError
 from .task_graph import TaskGraph
+from .researcher_agent import ResearchResult
 
 
 @dataclass
@@ -16,16 +17,36 @@ class TaskExecution:
     status: str
     result: WorkflowResult
     approved_source_sha256: str | None = None
+    research: ResearchResult | None = None
+    research_sha256: str | None = None
+    research_questions: list[str] = field(default_factory=list)
+    research_artifact: str | None = None
+
+    @property
+    def research_verified(self):
+        if not self.research_questions:
+            return (self.research is None and self.research_sha256 is None
+                    and self.research_artifact is None)
+        return (self.research is not None and self.research.verified
+                and self.research.task_id == self.task_id
+                and self.research.questions == self.research_questions
+                and self.research_artifact == f"research_{self.task_id}.json"
+                and self.research_sha256 == hashlib.sha256(json.dumps(
+                    self.research.to_dict(), ensure_ascii=False, indent=2).encode("utf-8")).hexdigest())
+
 
     @property
     def verified(self):
-        return (self.status == "passed" and self.result.review_required
+        return (self.status == "passed" and self.research_verified and self.result.review_required
                 and self.result.verified and self.approved_source_sha256 is not None
                 and self.approved_source_sha256 == self.result.revisions[-1].source_sha256)
 
     def to_dict(self):
         return {
             "task_id": self.task_id, "status": self.status,
+            "research": self.research.to_dict() if self.research else {"status": "skipped"},
+            "research_sha256": self.research_sha256,
+            "research_artifact": self.research_artifact,
             "approved_source_sha256": self.approved_source_sha256,
             "final_project_id": self.result.final_project_id,
             "reason": self.result.reason,
@@ -69,7 +90,9 @@ class PlannedResult:
             if (not isinstance(node, dict) or node.get("state") != "passed"
                     or node.get("reason") is not None
                     or node.get("dependencies") != deps
-                    or not set(deps) <= completed or not task.verified):
+                    or not set(deps) <= completed or not task.verified
+                    or task.research_questions != planned[task.task_id].get("research_questions", [])
+                    or (task.research is not None and task.research.plan_sha256 != self.plan.plan_sha256)):
                 return False
             completed.add(task.task_id)
         last = self.tasks[-1]
@@ -93,11 +116,12 @@ class PlannedResult:
 class PlannedWorkflow:
     RUN_TIMEOUT = 1200
 
-    def __init__(self, planner, workflow):
+    def __init__(self, planner, workflow, *, researcher=None):
         if (workflow.reviewer is None or workflow.entrypoint != "app.py"
                 or type(workflow.max_repairs) is not int or not 0 <= workflow.max_repairs <= 2):
             raise ValueError("unsupported_planned_workflow_configuration")
         self.planner, self.workflow = planner, workflow
+        self.researcher = researcher
 
     @staticmethod
     def _store(workspace, path, data):
@@ -194,6 +218,38 @@ class PlannedWorkflow:
                     state.execution_order.append(task["id"])
                     state.tasks.append(execution)
                     active = execution
+                    execution.research_questions = list(task.get("research_questions", []))
+                    if execution.research_questions:
+                        if self.researcher is None:
+                            execution.research = ResearchResult(
+                                "blocked", task["id"], plan.plan_sha256,
+                                execution.research_questions, reason="research_unavailable")
+                        else:
+                            execution.research = await self.researcher.run(goal, task, plan.plan_sha256)
+                        report = execution.research
+                        execution.research_artifact = f"research_{task['id']}.json"
+                        data = report.to_dict()
+                        if not self._store(metadata, execution.research_artifact, data):
+                            state.reason = "research_storage_failed"
+                        elif (report.verified and report.task_id == task["id"]
+                              and report.plan_sha256 == plan.plan_sha256
+                              and report.questions == execution.research_questions):
+                            execution.research_sha256 = hashlib.sha256(json.dumps(
+                                data, ensure_ascii=False, indent=2).encode("utf-8")).hexdigest()
+                        else:
+                            state.reason = report.reason or "invalid_research_output"
+                        if execution.research_sha256 is None:
+                            execution.status = "blocked"
+                            execution.result.reason = state.reason
+                            state.status = "blocked"
+                            # Keep active placeholder for common finalization and task metadata.
+                            break
+                        evidence = report.context()
+                        spec_data, context_data = json.loads(specification), json.loads(context)
+                        spec_data["research_evidence"] = evidence
+                        context_data["research_evidence"] = evidence
+                        specification = json.dumps(spec_data, ensure_ascii=False)
+                        context = json.dumps(context_data, ensure_ascii=False)
                     result = await self.workflow.run(specification, context=context)
                     execution.result, execution.status = result, result.status
                     if result.verified:
@@ -209,6 +265,9 @@ class PlannedWorkflow:
                     else:
                         state.status = result.status
                         state.reason = f"{task['id']}: {result.reason}"
+                    if execution.status == "passed" and not execution.verified:
+                        execution.status = "blocked"
+                        state.status, state.reason = "blocked", "task_not_verified"
                     graph.finish(task["id"], passed=execution.verified)
                     summary = {"plan_sha256": plan.plan_sha256, **execution.to_dict()}
                     stored = self._store(metadata, f"task_{task['id']}.json", summary)
@@ -220,6 +279,12 @@ class PlannedWorkflow:
                         break
                     completed.append(task.copy())
                 else:
+                    for finished in state.tasks:
+                        if finished.research_artifact:
+                            saved = metadata.tools.execute("read_file", {"path": finished.research_artifact})
+                            if (not saved["ok"] or hashlib.sha256(saved["data"]["content"].encode("utf-8")).hexdigest()
+                                    != finished.research_sha256):
+                                raise ValueError("research_artifact_mismatch")
                     state.status, state.reason = "passed", "all_tasks_tested_and_reviewed"
                     state.final_project_id = state.tasks[-1].result.final_project_id
                     state.final_source_sha256 = state.tasks[-1].approved_source_sha256
@@ -235,7 +300,7 @@ class PlannedWorkflow:
             state.status, state.reason = "failed", "cancelled"
         except ValueError as exc:
             if str(exc) not in ("workspace_unavailable", "workspace_allocation_failed",
-                                "approved_artifact_unavailable", "invalid_plan_output", "plan_storage_failed"):
+                                "approved_artifact_unavailable", "invalid_plan_output", "plan_storage_failed", "research_artifact_mismatch"):
                 raise
             state.status, state.reason = "blocked", str(exc)
         except OSError:
@@ -243,7 +308,8 @@ class PlannedWorkflow:
         if graph is not None:
             if active is not None:
                 if graph.states[active.task_id] == "running":
-                    active.status = "failed"
+                    if active.status != "blocked":
+                        active.status = "failed"
                     active.result.reason = state.reason
                     graph.finish(active.task_id, passed=False)
             if state.status != "passed":

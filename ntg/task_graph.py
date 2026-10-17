@@ -8,7 +8,8 @@ class TaskGraph:
             raise ValueError("invalid_task_count")
         self._tasks = {}
         for task in tasks:
-            if (not isinstance(task, dict) or set(task) != {"id", "description", "dependencies"}
+            if (not isinstance(task, dict) or set(task) not in ({"id", "description", "dependencies"},
+                                                    {"id", "description", "dependencies", "research_questions"})
                     or not isinstance(task["id"], str)
                     or task["id"] not in {f"T{i}" for i in range(1, 7)}
                     or not isinstance(task["description"], str) or not task["description"].strip()
@@ -16,6 +17,11 @@ class TaskGraph:
                     or not isinstance(task["dependencies"], list)
                     or any(not isinstance(d, str) for d in task["dependencies"])):
                 raise ValueError("invalid_task_fields")
+            questions = task.get("research_questions", [])
+            if (not isinstance(questions, list) or len(questions) > 3
+                    or any(not isinstance(q, str) or not q.strip() or len(q) > 300 for q in questions)
+                    or len({q.strip().casefold() for q in questions}) != len(questions)):
+                raise ValueError("invalid_research_questions")
             name = task["id"]
             if name in self._tasks:
                 raise ValueError("duplicate_task_id")

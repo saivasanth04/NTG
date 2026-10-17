@@ -12,7 +12,7 @@ async def run_with_progress(planned, goal):
     """Show liveness while preserving workflow deadlines and cancellation."""
     started = time.monotonic()
     pending = asyncio.create_task(planned.run(goal))
-    print("Running Planner -> Coder -> compile -> Tester -> Reviewer...", flush=True)
+    print("Running Planner -> optional Researcher -> Coder -> compile -> Tester -> Reviewer...", flush=True)
     try:
         while True:
             done, _ = await asyncio.wait({pending}, timeout=15)
@@ -26,7 +26,7 @@ async def run_with_progress(planned, goal):
             await asyncio.gather(pending, return_exceptions=True)
 
 
-async def main():
+async def main(*, researcher=None):
     root = Path(__file__).resolve().parent
     try:
         llm = await RoutingService.from_env(
@@ -42,7 +42,7 @@ async def main():
             WorkspaceManager(root / "workspaces"), max_repairs=2,
             reviewer=ReviewerAgent(llm, entrypoint="app.py"), entrypoint="app.py",
         )
-        result = await run_with_progress(PlannedWorkflow(PlannerAgent(llm), workflow),
+        result = await run_with_progress(PlannedWorkflow(PlannerAgent(llm), workflow, researcher=researcher),
             "Build a standard-library command-line expense tracker in app.py using "
             "argparse commands add, list, total; persist expenses in a JSON file in the "
             "current project; reject nonpositive or invalid amounts; no arguments "
@@ -66,6 +66,13 @@ async def main():
               f"reason={node['reason']}")
     for task in result.tasks:
         print(f"Task {task.task_id}: {task.status}")
+        print(f"  Research: {task.research.status if task.research else 'skipped'}")
+        if task.research:
+            print(f"    Reason: {task.research.reason}")
+            for source in task.research.sources:
+                print(f"    {source['id']}: {source['url']}")
+            if task.research_artifact:
+                print(f"    Report: {root / 'workspaces' / result.run_project_id / task.research_artifact}")
         for revision in task.result.revisions:
             project = root / "workspaces" / revision.project_id
             artifact = project / revision.source_snapshot if revision.source_snapshot else project

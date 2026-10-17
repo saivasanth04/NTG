@@ -72,6 +72,24 @@ asyncio.run(main())
 
 `model="auto"` selects the compatible pool. A raw provider model ID constrains fallback to that ID across accounts; an ID from `/v1/models` (`account-alias/model-id`) pins the deployment. Required tools and JSON/schema capabilities are inferred from request fields. `required_capabilities` can impose additional constraints. `input_tokens` can increase the conservative local context bound. UTF-8 byte sizing intentionally underuses context to avoid optimistic model-independent token estimates. Streaming, arbitrary provider parameters and non-chat operations return errors or are absent; this is a documented chat-completions subset.
 
+## Researcher Agent (Milestone 13)
+
+Planner tasks now declare `research_questions` (zero through three short questions). Ordinary local tasks use `[]`; legacy three-field plans retain their existing hashes and skip research. A ready task with questions runs Researcher once before Coder. Coder receives compact source-linked findings; its repairs reuse the same evidence. Reviewer sees the reference evidence in its specification. Tests and source/review identity checks remain mandatory.
+
+`ResearcherAgent(llm, ResearchTools(search_backend, allowed_hosts))` uses a host-injected async `search_backend(query, limit=3)` returning at most three `{"title": str, "url": str}` candidates. Import ResearchTools from `tools.research`. The backend can be an explicitly curated documentation lookup or an authorized search-service adapter; no undocumented search endpoint or provider is selected automatically. Use the same RoutingService instance when constructing agents in an application. ResearchTools is intentionally absent from the Coder/ReAct filesystem registry.
+
+Configure exact official documentation hostnames in `allowed_hosts`. Retrieval permits public HTTPS on port 443, rejects credentials, all query strings and fragments, checks DNS addresses, and connects to a checked IP while retaining original-hostname TLS certificate verification. No proxy environment is used. Redirects are revalidated. The first implementation requests HTTP/1.0/identity encoding and rejects compressed, chunked, binary, oversized or unsupported responses; unsupported sites fail visibly rather than bypass limits.
+
+Budgets per task: 60 seconds total; at most three searches and three document fetch attempts, ten seconds per retrieval request, 64 KiB per response body, 6,000 extracted characters per document and 12,000 total, one schema-constrained summary call with max_tokens 2048, and an 8 KiB compact evidence context. Model findings reference host-issued source IDs; URLs, UTC fetch times and content hashes come from retrieval. Raw pages are neither persisted nor passed to Coder. A citation establishes provenance, not independent proof of a claim.
+
+ResearchResult validates question coverage, source references and size. Missing backend, invalid evidence, unanswered questions, timeouts or storage failures block coding, block descendants and cancel independent pending work. Research cannot write files, execute commands or change task approval. Cancellation propagates and closes active connections.
+
+Pass `researcher=` to PlannedWorkflow, or to the asynchronous `LLMCALL.main(researcher=...)` entry function when embedding it. `python LLMCALL.py` remains a local expense-tracker demo with no search backend configured; local tasks need no research. If its Planner requests external evidence, it reports research_unavailable instead of guessing. Configure an authorized backend explicitly for research tasks; no extra package or credentials are added by this milestone.
+
+Run metadata adds `research_<task_id>.json` for researched tasks. Task summaries record skipped status or the report, its relative artifact path and SHA-256 of the persisted UTF-8 JSON. Final verification checks plan/task/question identities, report hash and final stored report bytes. Graph execution_order includes tasks dispatched into research even when they never reach Coder; those tasks have no generated revisions.
+
+Deterministic inline checks cover conditional research, schema/hash compatibility, fabricated-source rejection, evidence tampering, real compile/test/review handoff, failure propagation, byte/URL/redirect restrictions and cancellation. Live retrieval/model outcomes are recorded in guide.md separately from these deterministic checks. Current application scope remains standard-library single-file programs; the Stripe example does not add payment execution or production checkout integration.
+
 ## Coding workflow and task graphs (Milestones 6–12)
 
 Run `python LLMCALL.py` in the activated virtual environment. It builds a standard-library expense-tracker CLI in app.py using Planner → dependency scheduler → Coder → compile → Tester → Reviewer. Ordinary Agent and ReActAgent remain available for structured chat and bounded tool use.
